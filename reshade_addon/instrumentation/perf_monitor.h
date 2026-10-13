@@ -7,8 +7,10 @@
 #include "profiler.h"
 #include "gpu_timer.h"
 #include "../migoto/port_api.h"
+#include "../migoto/resource_memory.h"
 
 struct PerfMemory {
+    MigotoPort::ResourceMemorySnapshot addon;
     uint64_t vram_used = 0;
     uint64_t vram_budget = 0;
     uint64_t shared_used = 0;
@@ -110,6 +112,7 @@ struct PerfReportRun {
     uint32_t               gt_dropped0 = 0;
     uint32_t               gt_untimed0 = 0;
     PerfMemory             mem_start;
+    MigotoPort::ResourceMemorySnapshot addon_peak;
     bool                   have_mem_start = false;
     bool                   debug_was = false;
 };

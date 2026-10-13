@@ -164,6 +164,9 @@
     <ClInclude Include="reshade_addon\migoto\dx12_wrap.h">
       <Filter>migoto</Filter>
     </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\resource_memory.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
     <ClInclude Include="reshade_addon\migoto\dx12_dump_readback.h">
       <Filter>migoto</Filter>
     </ClInclude>

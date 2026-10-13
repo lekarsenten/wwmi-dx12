@@ -22,6 +22,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include "resource_memory.h"
 
 namespace MigotoPort {
 
@@ -88,8 +89,8 @@ protected:
 
 void WrapResourceBorn();
 void WrapResourceDied();
-void RetireDx12Resource(ID3D12Resource* res);
-void RetireReadback(ID3D12Resource* res);
+void RetireDx12Resource(ID3D12Resource* res, ResourceAllocation memory = {});
+void RetireReadback(ID3D12Resource* res, ResourceAllocation memory = {});
 void DisownBuffer(ID3D12Resource* res);
 
 struct UploadRecord {
@@ -114,14 +115,23 @@ struct WrapResource {
     uint64_t                           uploaded_seq = 0;
     uint64_t                           queued_seq = 0;
     UploadRecord                       flushed;
+    ResourceAllocation                memory;
+    void TrackMemory(ID3D12Device* device)
+    {
+        const auto desc = dx12->GetDesc();
+        memory = ResourceMemory().Created(
+            device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes,
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
+    }
     virtual ~WrapResource()
     {
         WrapResourceDied();
         if (dx12 && !foreign) DisownBuffer(dx12);
+        if (dx12) ResourceMemory().Retired(memory);
         if (dx12 && heap_type == D3D12_HEAP_TYPE_READBACK)
-            RetireReadback(dx12);
+            RetireReadback(dx12, memory);
         else if (dx12)
-            RetireDx12Resource(dx12);
+            RetireDx12Resource(dx12, memory);
     }
 };
 

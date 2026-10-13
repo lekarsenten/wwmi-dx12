@@ -63,7 +63,8 @@ struct DumpQueue {
 
 DumpQueue                    g_dq;
 std::mutex                   g_dq_mtx;
-std::vector<ID3D12Resource*> g_rb_retired;
+struct RetiredReadback { ID3D12Resource* res; ResourceAllocation memory; };
+std::vector<RetiredReadback> g_rb_retired;
 
 void LogQueueFailure(const char* what, HRESULT hr)
 {
@@ -361,15 +362,17 @@ void PreDrainFlush()
     g_pre_queue.clear();
 }
 
-void RetireReadback(ID3D12Resource* res)
+void RetireReadback(ID3D12Resource* res, ResourceAllocation memory)
 {
     std::lock_guard<std::mutex> l(g_dq_mtx);
     if (g_dq.open)
-        g_rb_retired.push_back(res);
+        g_rb_retired.push_back({ res, memory });
     else if (g_dq.stale)
-        RetireDx12Resource(res);
-    else
+        RetireDx12Resource(res, memory);
+    else {
         res->Release();
+        ResourceMemory().Released(memory);
+    }
 }
 
 static bool FlushLocked();
@@ -379,11 +382,13 @@ bool DumpReadbackFlush()
     DumpStage("Flush: wait g_dq_mtx");
     std::lock_guard<std::mutex> l(g_dq_mtx);
     const bool                  ok = FlushLocked();
-    for (ID3D12Resource* r : g_rb_retired)
-        if (ok)
-            r->Release();
-        else
-            RetireDx12Resource(r);
+    for (const auto& r : g_rb_retired) {
+        if (ok) {
+            r.res->Release();
+            ResourceMemory().Released(r.memory);
+        } else
+            RetireDx12Resource(r.res, r.memory);
+    }
     g_rb_retired.clear();
     return ok;
 }
