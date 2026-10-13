@@ -216,6 +216,7 @@
     <ClInclude Include="reshade_addon\migoto\port_api.h" />
     <ClInclude Include="reshade_addon\migoto\port_api_internal.h" />
     <ClInclude Include="reshade_addon\migoto\port_compat.h" />
+    <ClInclude Include="reshade_addon\migoto\shader_conditions.h" />
     <ClInclude Include="reshade_addon\migoto\port_keygate.h" />
     <ClInclude Include="reshade_addon\migoto\frame_analysis_driver.h" />
     <ClInclude Include="reshade_addon\migoto\frame_analysis_engine.h" />

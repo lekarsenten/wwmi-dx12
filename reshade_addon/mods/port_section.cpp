@@ -9,28 +9,7 @@ std::shared_ptr<const std::vector<CsTrig>> g_cs_trigs_snap;
 
 bool SectionReadsPipelineState(const wchar_t* fq)
 {
-    struct Ctx {
-        bool hit;
-    } c{ false };
-    PortApi::ForEachSectionKey(fq, [](const wchar_t* key, const wchar_t* val, void* user) {
-        auto* cc = (Ctx*)user;
-        if (cc->hit || !key) return;
-        (void)val;
-        std::wstring k(key);
-        for (auto& ch : k) ch = (wchar_t)towlower(ch);
-        size_t p = 0;
-        while (p < k.size() && k[p] == L' ') ++p;
-        // Strip a leading if/elif, then look for a BARE stage token.
-        if      (k.compare(p, 3, L"if ")   == 0) p += 3;
-        else if (k.compare(p, 5, L"elif ") == 0) p += 5;
-        else return;                              // not a condition line
-        while (p < k.size() && (k[p] == L' ' || k[p] == L'(' || k[p] == L'!')) ++p;
-        if (p + 2 > k.size()) return;
-        const std::wstring tok = k.substr(p, 2);
-        if (tok != L"cs" && tok != L"vs" && tok != L"ps") return;
-        const wchar_t n = (p + 2 < k.size()) ? k[p + 2] : L'\0';
-        if (n == L'\0' || n == L' ' || n == L'=' || n == L'<' || n == L'>') cc->hit = true; }, &c);
-    return c.hit;
+    return PortApi::SectionReadsShaderConditions(fq);
 }
 
 std::wstring PortComponentSection(int mod_id, int comp_index, const std::wstring& tail, const std::wstring& ns)

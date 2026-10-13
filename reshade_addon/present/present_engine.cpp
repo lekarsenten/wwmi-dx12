@@ -16,6 +16,7 @@
 #include "../migoto/dx12_wrap.h" // BackBufferRestore -- the [Present] list leaves the back buffer as it found it
 #include "../migoto/dx12_bridge.h"
 #include "../../src/gpu_queue.h"
+#include "../config.h"
 #include "../../src/gpu_progress.h"
 #include "present_parts.h"
 #include "../instrumentation/diagnostics.h"  // g_log_all_draws / g_texflip_arm -- Numpad 3
@@ -34,9 +35,18 @@ struct PresentPass {
     uint64_t                                          slot_fence[kRing] = {};
     UINT                                              slot = 0;
     bool                                              ready = false;
+    bool                                              failed = false;
+
+    void Stop(const char* operation, unsigned long error)
+    {
+        failed = true; // submitted work may still reference these allocators
+        g_faulted.store(true);
+        logger::write("PRESENT-PASS: %s failed (%08lX); stopped until restart", operation, error);
+    }
 
     bool Init(ID3D12Device* dev)
     {
+        if (failed) return false;
         if (ready) return true;
         if (!dev) return false;
         for (UINT i = 0; i < kRing; ++i)
@@ -54,9 +64,13 @@ struct PresentPass {
     }
     ID3D12GraphicsCommandList* Begin()
     {
-        if (!ready) return nullptr;
+        if (!ready || failed) return nullptr;
         slot = (UINT)(counter % kRing);
-        WaitForFence(fence.Get(), slot_fence[slot], ev, 2000); // blocks only when we are kRing frames ahead
+        const DWORD wait = WaitForFence(fence.Get(), slot_fence[slot], ev, 2000);
+        if (wait != WAIT_OBJECT_0) {
+            Stop("fence wait", wait);
+            return nullptr;
+        }
         if (FAILED(alloc[slot]->Reset())) return nullptr;
         if (FAILED(cl->Reset(alloc[slot].Get(), nullptr))) return nullptr;
         RemovalPin::OnReset(cl.Get()); // a native Reset: ReShade's reset_command_list does not fire for it
@@ -66,7 +80,7 @@ struct PresentPass {
     }
     HRESULT Submit(ID3D12CommandQueue* game_queue)
     {
-        if (!ready || !game_queue) return E_POINTER;
+        if (!ready || failed || !game_queue) return E_POINTER;
         HotPath::GpuOwnListEnd(cl.Get(), game_queue);
         MigotoPort::ListBuffersToCommon(cl.Get());
         const HRESULT hr = cl->Close();
@@ -76,7 +90,11 @@ struct PresentPass {
             (int)game_queue->GetDesc().Type, "present-pass submit");
         game_queue->ExecuteCommandLists(1, lists);
         slot_fence[slot] = ++counter;
-        game_queue->Signal(fence.Get(), slot_fence[slot]);
+        const HRESULT signal = game_queue->Signal(fence.Get(), slot_fence[slot]);
+        if (FAILED(signal)) {
+            Stop("queue signal", static_cast<unsigned long>(signal));
+            return signal;
+        }
         IbHash::Submitted(fence.Get(), slot_fence[slot]); // the hash recorded into this list completes with it
         g_gpu_timer.FrameSubmitted(fence.Get(), slot_fence[slot], game_queue);
         HotPath::GpuFrameSubmitted(fence.Get(), slot_fence[slot], game_queue);
@@ -228,6 +246,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
                 PROF(PROF_ET_Begin);
                 present_cl = g_present_pass.Begin();
             }
+            if (g_faulted) return; // no frame logic after an unsafe/failed fence wait
             if (present_cl) {
                 g_gpu_timer.PresentTick(g_d3d12_device);
                 HotPath::GpuTick();
@@ -465,6 +484,7 @@ void EngineFrameTick(command_queue* queue, swapchain* sc)
         }
         {
             PROF(PROF_ET_Presence);
+            if (g_faulted) return;
             PresenceTick(); // presence_tick.cpp
             PortApi::RunPendingPost();
         }

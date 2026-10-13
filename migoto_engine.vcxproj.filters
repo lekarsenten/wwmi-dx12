@@ -188,6 +188,9 @@
     <ClInclude Include="reshade_addon\migoto\port_keygate.h">
       <Filter>migoto</Filter>
     </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\shader_conditions.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
     <ClInclude Include="reshade_addon\migoto\frame_analysis_driver.h">
       <Filter>migoto</Filter>
     </ClInclude>

@@ -7,6 +7,7 @@
 #include "HackerDevice.h"
 #include "ShaderRegex.h"
 #include "port_keygate.h"
+#include "shader_conditions.h"
 #include "../../src/log.h"
 
 #include <atomic>
@@ -496,6 +497,20 @@ void ForEachSectionLine(const wchar_t* fq_section, void (*cb)(const wchar_t* lin
     GetIniSection(&sv, fq_section);
     if (!sv) return;
     for (const IniLine& l : *sv) cb(l.raw_line.c_str(), user);
+}
+
+bool SectionReadsShaderConditions(const wchar_t* fq_section)
+{
+    if (!g_loaded || !fq_section) return false;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    const std::wstring name(fq_section); // use the engine's canonical section name, as HasSection does
+    const auto& textures = SectionIndex();
+    if (const auto it = textures.find(name); it != textures.end())
+        return MigotoPort::ListsReadShaderConditions(&it->second->command_list, &it->second->post_command_list);
+    const auto& lists = ExplicitIndex();
+    if (const auto it = lists.find(name); it != lists.end())
+        return MigotoPort::ListsReadShaderConditions(&it->second->command_list, &it->second->post_command_list);
+    return false;
 }
 
 static void ForEachSectionName(const std::function<void(const std::wstring&)>& fn)
