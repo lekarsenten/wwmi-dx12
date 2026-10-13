@@ -58,6 +58,7 @@ void on_present_body(command_queue* queue, swapchain* sc)
     }
     ModLoader::Tick();
     if (!g_skip_engine_tick) EngineFrameTick(queue, sc);
+    if (g_faulted) return;
     StartRemovalWatchdog(sc);
     g_buffer_reloc.Sweep(sc->get_device());
     ModTexturesTick();

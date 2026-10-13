@@ -98,6 +98,8 @@ void ForEachSectionKey(const wchar_t* fq_section,
     void (*cb)(const wchar_t* key, const wchar_t* val, void* user), void* user);
 
 void ForEachSectionLine(const wchar_t* fq_section, void (*cb)(const wchar_t* line, void* user), void* user);
+// Inspect parsed if/elif expressions, including nested and linked command lists.
+bool SectionReadsShaderConditions(const wchar_t* fq_section);
 
 void ForEachSectionInNs(const wchar_t* ns, void (*cb)(const wchar_t* fq_section, void* user), void* user);
 
