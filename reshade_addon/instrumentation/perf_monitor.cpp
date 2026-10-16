@@ -60,6 +60,7 @@ double ThreadNet(const PerfThread& t)
 
 void PerfMemory::Max(const PerfMemory& o)
 {
+    addon.Max(o.addon);
     vram_used = (std::max)(vram_used, o.vram_used);
     vram_budget = (std::max)(vram_budget, o.vram_budget);
     shared_used = (std::max)(shared_used, o.shared_used);
@@ -319,6 +320,8 @@ void PerfMonitor::SampleMemory(int64_t now, int64_t freq)
         m.game_private = pmc.PrivateUsage;
         m.game_working_set = pmc.WorkingSetSize;
     }
+    m.addon = MigotoPort::ResourceMemory().Snapshot();
+    if (report_.active) report_.addon_peak.Max(m.addon);
     mem_ = m;
     if (have_mem_)
         mem_peak_.Max(m);
@@ -329,6 +332,8 @@ void PerfMonitor::SampleMemory(int64_t now, int64_t freq)
 
 void PerfMonitor::StartReport(int64_t now)
 {
+    mem_last_ = 0;
+    SampleMemory(now, prof_qpc_freq());
     PerfReportRun& r = report_;
     r.active = true;
     r.start = now;
@@ -347,6 +352,7 @@ void PerfMonitor::StartReport(int64_t now)
     r.gt_untimed0 = g_gt_untimed.load(std::memory_order_relaxed);
     PortApi::CommandCostMark();
     r.mem_start = mem_;
+    r.addon_peak = mem_.addon;
     r.have_mem_start = have_mem_;
     r.debug_was = g_debug;
     if (g_debug) SetDiagnostics(false, g_log_verbosity);
@@ -362,6 +368,8 @@ void PerfMonitor::EndReport()
 
 void PerfMonitor::FinishReport(int64_t now, int64_t freq)
 {
+    mem_last_ = 0;
+    SampleMemory(now, freq);
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t name[64];
@@ -458,6 +466,28 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
         mem_.game_private / kGB, r.have_mem_start ? m0.game_private / kGB : 0.0, mem_peak_.game_private / kGB,
         mem_.game_working_set / kGB);
     std::fprintf(f, "\n");
+
+    std::fprintf(f, "MOD RESOURCE ALLOCATIONS   now MiB / count   start MiB / count   sampled peak MiB / count\n");
+    static const char* const memory_names[] = {
+        "Active buffers", "Active textures", "Retired buffers", "Retired textures"
+    };
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto& current = mem_.addon.rows[i];
+        const auto& start = r.mem_start.addon.rows[i];
+        const auto& peak = r.addon_peak.rows[i];
+        std::fprintf(f, "  %-18s %9.2f / %-7llu %9.2f / %-7llu %9.2f / %llu\n",
+            memory_names[i], current.bytes / kMB, current.count,
+            start.bytes / kMB, start.count, peak.bytes / kMB, peak.count);
+        if (peak.unknown)
+            std::fprintf(f, "    Unknown allocation sizes (now/start/peak): %llu / %llu / %llu; excluded from MiB\n",
+                current.unknown, start.unknown, peak.unknown);
+    }
+    std::fprintf(f,
+        "  Allocation sizes for resources created by the mod scripting device. Residency may vary.\n"
+        "  Includes default, upload and readback heaps; staging textures backed by buffers count as buffers.\n"
+        "  Retired resources await release through GPU retirement/readback after wrapper destruction.\n"
+        "  Excludes game resources, shared upload/staging pools, CPU copies, descriptors and other addon caches.\n"
+        "  Each column has its own peak for this report. Samples: once a second and at start/end.\n\n");
 
     int mods = 0;
     ModLoader::GetLastStats(mods);

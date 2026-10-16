@@ -167,6 +167,9 @@ brings seeds of what was already learned (`wwmi_dx12\cache\seed-<version>.lodcac
    `wwmi_dx12_crash.log`) **before the next launch**, which starts a new log.
 3. For a slowdown, also save a performance report where it happens (**Save a 10-second performance
    report**) and send the `wwmi_dx12_perf_*.txt` file with the logs.
+   For memory growth with frame generation, save reports from the same scene and mods with frame
+   generation off and at the affected multiplier. Include the multiplier with each report. The mod
+   resource counters show active buffers/textures and resources waiting for release.
 4. Send them with what went wrong, which mods were on screen, whether they work in DX11, and your GPU:
    a [GitHub issue](https://github.com/lekarsenten/wwmi-dx12/issues), or a DM or comment on the mod's
    GameBanana page. The log names folders on your PC.

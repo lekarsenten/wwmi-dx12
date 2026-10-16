@@ -89,6 +89,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDes
         }
         WrapBuffer* sw = new WrapBuffer();
         sw->dx12 = sres;
+        sw->TrackMemory(GetDx12Bridge().device);
         sw->desc = *pDesc;
         PortNormalizeBufferDesc(sw->desc);          // match D3D11 GetDesc (see PortNormalizeBufferDesc note)
         sw->state = D3D12_RESOURCE_STATE_COPY_DEST; // READBACK is pinned here for its lifetime
@@ -121,6 +122,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDes
 
     WrapBuffer* w = new WrapBuffer();
     w->dx12 = res;
+    w->TrackMemory(GetDx12Bridge().device);
     w->state = state;
     w->desc = *pDesc;
     PortNormalizeBufferDesc(w->desc); // match D3D11 GetDesc (see PortNormalizeBufferDesc note)
@@ -170,6 +172,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC
 
     WrapTexture1D* w = new WrapTexture1D();
     w->dx12 = res;
+    w->TrackMemory(GetDx12Bridge().device);
     w->desc = *pDesc;
     if (pInitialData)
         QueueTextureUpload(w, pInitialData,
@@ -242,6 +245,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
         }
         WrapTexture2D* sw = new WrapTexture2D();
         sw->dx12 = rb;
+        sw->TrackMemory(GetDx12Bridge().device);
         sw->desc = *pDesc;
         sw->desc.Format = stage_fmt;
         sw->state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -304,6 +308,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
 
     WrapTexture2D* w = new WrapTexture2D();
     w->dx12 = res;
+    w->TrackMemory(GetDx12Bridge().device);
     w->desc = *pDesc;
     if (pInitialData)
         QueueTextureUpload(w, pInitialData,
@@ -359,6 +364,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture3D(const D3D11_TEXTURE3D_DESC
 
     WrapTexture3D* w = new WrapTexture3D();
     w->dx12 = res;
+    w->TrackMemory(GetDx12Bridge().device);
     w->desc = *pDesc;
     if (pInitialData)
         QueueTextureUpload(w, pInitialData, pDesc->MipLevels ? pDesc->MipLevels : 1);

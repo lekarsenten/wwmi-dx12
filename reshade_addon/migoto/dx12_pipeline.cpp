@@ -677,6 +677,7 @@ std::vector<PendingUpload>& Uploads()
 struct RetiredBuf {
     ID3D12Resource* res;
     uint64_t        stamp;
+    ResourceAllocation memory;
 };
 std::vector<RetiredBuf>& RetiredStaging()
 {
@@ -2335,28 +2336,31 @@ unsigned long long DispatchCalls()
 static std::mutex              g_retire_mtx;
 static std::vector<RetiredBuf> g_retired_res; // wrapper resources whose last reference dropped
 
-void RetireDx12Resource(ID3D12Resource* res)
+void RetireDx12Resource(ID3D12Resource* res, ResourceAllocation memory)
 {
     if (!res) return;
     std::lock_guard<std::mutex> l(g_retire_mtx);
-    g_retired_res.push_back({ res, GpuStamp() });
+    g_retired_res.push_back({ res, GpuStamp(), memory });
 }
 
 void UploadFrameTick()
 {
-    std::vector<ID3D12Resource*> gone;
+    std::vector<RetiredBuf> gone;
     {
         std::lock_guard<std::mutex> l(g_retire_mtx);
         size_t                      keep = 0;
         for (size_t i = 0; i < g_retired_res.size(); ++i) {
             if (GpuPassed(g_retired_res[i].stamp))
-                gone.push_back(g_retired_res[i].res);
+                gone.push_back(g_retired_res[i]);
             else
                 g_retired_res[keep++] = g_retired_res[i];
         }
         g_retired_res.resize(keep);
     }
-    for (ID3D12Resource* r : gone) r->Release();
+    for (const auto& r : gone) {
+        r.res->Release();
+        ResourceMemory().Released(r.memory);
+    }
 }
 
 } // namespace MigotoPort

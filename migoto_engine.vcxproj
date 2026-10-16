@@ -209,6 +209,7 @@
     <ClInclude Include="reshade_addon\migoto\dx12_pipeline.h" />
     <ClInclude Include="reshade_addon\migoto\dx12_pipeline_internal.h" />
     <ClInclude Include="reshade_addon\migoto\dx12_wrap.h" />
+    <ClInclude Include="reshade_addon\migoto\resource_memory.h" />
     <ClInclude Include="reshade_addon\migoto\dx12_dump_readback.h" />
     <ClInclude Include="reshade_addon\migoto\dump_watchdog.h" />
     <ClInclude Include="reshade_addon\migoto\dump_preview.h" />
