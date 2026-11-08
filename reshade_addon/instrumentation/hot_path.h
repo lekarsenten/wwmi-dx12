@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <type_traits>
 #include <windows.h>
+#include "../core/sharded_map.h"
 
 namespace reshade::api {
 struct command_list;
@@ -48,6 +49,7 @@ struct ID3D12GraphicsCommandList;
     X(build_acceleration_structure) \
     X(dispatch_rays) \
     X(push_descriptors) \
+    X(push_constants) \
     X(bind_vertex_buffers) \
     X(bind_index_buffer) \
     X(bind_render_targets) \
@@ -72,25 +74,25 @@ namespace HotPath {
 inline std::atomic<bool> g_on{ false };
 
 struct Rec;
-Rec*                     RecFor(reshade::api::command_list* cl);
-void                     HookDone(int hook, uint64_t self_ns, Rec* rec);
+Rec* RecFor(reshade::api::command_list* cl);
+void HookDone(int hook, uint64_t self_ns, Rec* rec);
 inline thread_local Rec* t_rec = nullptr;
 
 inline std::atomic<bool> g_gpu_on{ false };
 inline std::atomic<bool> g_gpu_detail{ false };
 struct GpuRec;
 GpuRec*& GpuOf(Rec* r);
-void     GpuHook(Rec* rec, int hook, reshade::api::command_list* cl);
-void     GpuListReset(Rec* rec);
-void     GpuListClose(Rec* rec, reshade::api::command_list* cl, uint32_t claimed);
-void     GpuExecuted(Rec* rec, reshade::api::command_queue* queue);
-void     GpuNoteBarriers(uint32_t count);
-void*    GpuBracketBegin(ID3D12GraphicsCommandList* cl, int bucket);
-void     GpuBracketEnd(ID3D12GraphicsCommandList* cl, void* token);
-void     GpuOwnListBegin(ID3D12GraphicsCommandList* cl);
-void     GpuOwnListEnd(ID3D12GraphicsCommandList* cl, ID3D12CommandQueue* queue);
-void     GpuFrameSubmitted(ID3D12Fence* fence, uint64_t value, ID3D12CommandQueue* queue);
-void     GpuTick();
+void GpuHook(Rec* rec, int hook, reshade::api::command_list* cl);
+void GpuListReset(Rec* rec);
+void GpuListClose(Rec* rec, reshade::api::command_list* cl, uint32_t claimed);
+void GpuExecuted(Rec* rec, reshade::api::command_queue* queue);
+void GpuNoteBarriers(uint32_t count);
+void* GpuBracketBegin(ID3D12GraphicsCommandList* cl, int bucket);
+void GpuBracketEnd(ID3D12GraphicsCommandList* cl, void* token);
+void GpuOwnListBegin(ID3D12GraphicsCommandList* cl);
+void GpuOwnListEnd(ID3D12GraphicsCommandList* cl, ID3D12CommandQueue* queue);
+void GpuFrameSubmitted(ID3D12Fence* fence, uint64_t value, ID3D12CommandQueue* queue);
+void GpuTick();
 
 void Init();
 void OnReset(reshade::api::command_list* cl);
@@ -103,8 +105,7 @@ inline reshade::api::command_list* ListArg()
 {
     return nullptr;
 }
-template <typename T, typename... R>
-inline reshade::api::command_list* ListArg(T t, R...)
+template <typename T, typename... R> inline reshade::api::command_list* ListArg(T t, R...)
 {
     if constexpr (std::is_same_v<T, reshade::api::command_list*>)
         return t;
@@ -115,12 +116,12 @@ inline reshade::api::command_list* ListArg(T t, R...)
 struct Scope;
 inline thread_local Scope* t_cur = nullptr;
 struct Scope {
-    int      k;
-    int64_t  t0 = 0;
+    int k;
+    int64_t t0 = 0;
     uint64_t child = 0;
-    Scope*   prev = nullptr;
-    Rec*     rec = nullptr;
-    Rec*     prev_rec = nullptr;
+    Scope* prev = nullptr;
+    Rec* rec = nullptr;
+    Rec* prev_rec = nullptr;
     Scope(int hook, reshade::api::command_list* cl)
         : k(g_on.load(std::memory_order_relaxed) ? hook : -1)
     {
@@ -153,10 +154,8 @@ struct Scope {
     }
 };
 
-template <auto Fn, int K>
-struct Wrap;
-template <typename R, typename... A, R (*Fn)(A...), int K>
-struct Wrap<Fn, K> {
+template <auto Fn, int K> struct Wrap;
+template <typename R, typename... A, R (*Fn)(A...), int K> struct Wrap<Fn, K> {
     static R call(A... a)
     {
         Scope s(K, ListArg(a...));
@@ -168,13 +167,13 @@ struct Wrap<Fn, K> {
 #define HP(name) (&HotPath::Wrap<&on_##name, HK_##name>::call)
 #else
 namespace HotPath {
-inline void  Init() {}
-inline void  OnReset(reshade::api::command_list*) {}
-inline void  OnClose(reshade::api::command_list*) {}
-inline void  OnExecute(reshade::api::command_queue*, reshade::api::command_list*) {}
-inline void  NoteClaimed() {}
-inline void  FrameEnd() {}
-inline void  GpuNoteBarriers(uint32_t) {}
+inline void Init() {}
+inline void OnReset(reshade::api::command_list*) {}
+inline void OnClose(reshade::api::command_list*) {}
+inline void OnExecute(reshade::api::command_queue*, reshade::api::command_list*) {}
+inline void NoteClaimed() {}
+inline void FrameEnd() {}
+inline void GpuNoteBarriers(uint32_t) {}
 inline void* GpuBracketBegin(ID3D12GraphicsCommandList*, int)
 {
     return nullptr;

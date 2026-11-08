@@ -11,16 +11,18 @@
 #include "dx12_wrap.h"
 #include "dx12_context.h"
 #include "port_toggles.h" // g_blend_write_all_rt, g_inherit_game_viewport, g_uav_barrier
-#include "port_keygate.h"
-#include "../../src/gpu_progress.h"
-#include "../../src/log.h"
-#include "../../src/fnv.h"
+#include "command_observer.h"
+#include "../core/gpu_progress.h"
+#include "../core/log.h"
+#include "../core/fnv.h"
 #include "../instrumentation/removal_pin.h" // the per-list tally of what this file records (REMOVAL-PIN)
-#include "../instrumentation/gpu_timer.h"   // GPU ms of what this file records (performance monitor)
-#include "../../src/d3d12_buffer.h"
-#include "../../src/d3d12_barrier.h"
+#include "../instrumentation/gpu_timer.h" // GPU ms of what this file records (performance monitor)
+#include "../core/d3d12_buffer.h"
+#include "../core/d3d12_barrier.h"
 #include "prof_core.h" // PROF(PL_*), ProfGpuWork: IssueDraw/IssueDispatch and the upload path
 #include "dx12_pipeline_internal.h"
+#include "dx12_skcap.h"
+#include "dxbc_link.h"
 
 // Frame analysis, for the COMPUTE half -- see the call at the end of IssueDispatch.
 #include "frame_analysis_driver.h"
@@ -59,15 +61,15 @@ enum : UINT {
 };
 
 struct Heap {
-    ID3D12DescriptorHeap*              heap = nullptr;
-    UINT                               inc = 0;
-    UINT                               size = 0;
-    UINT                               next = 0; // ring cursor
-    std::vector<UINT>                  freed;    // staging free list
-    std::vector<uint64_t>              tag;      // ring: per 256-slot block, GpuStamp() at its last write
-    std::vector<ID3D12DescriptorHeap*> more;     // staging: further blocks of `size` slots once the first is used up
-    D3D12_CPU_DESCRIPTOR_HANDLE        cpu0{};
-    D3D12_GPU_DESCRIPTOR_HANDLE        gpu0{};
+    ID3D12DescriptorHeap* heap = nullptr;
+    UINT inc = 0;
+    UINT size = 0;
+    UINT next = 0; // ring cursor
+    std::vector<UINT> freed; // staging free list
+    std::vector<uint64_t> tag; // ring: per 256-slot block, GpuStamp() at its last write
+    std::vector<ID3D12DescriptorHeap*> more; // staging: further blocks of `size` slots once the first is used up
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu0{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu0{};
 
     D3D12_CPU_DESCRIPTOR_HANDLE Cpu(UINT i) const
     {
@@ -89,30 +91,30 @@ struct Heap {
 };
 
 struct RootBind {
-    UINT          param;
-    char          stage;
-    char          kind;
-    UINT          reg;
-    UINT          space;
+    UINT param;
+    char stage;
+    char kind;
+    UINT reg;
+    UINT space;
     unsigned char sit = 0;
     unsigned char dim = 0;
 };
 
 struct RootSigEntry {
-    ID3D12RootSignature*  rs = nullptr;
+    ID3D12RootSignature* rs = nullptr;
     std::vector<RootBind> binds;
 };
 
 struct Heaps {
-    Heap                                               staging;
-    Heap                                               ring;
-    Heap                                               rtv;
-    Heap                                               dsv;
-    Heap                                               samp_staging;
-    Heap                                               samp_ring;
-    std::unordered_map<uint64_t, RootSigEntry>         rootsigs;
+    Heap staging;
+    Heap ring;
+    Heap rtv;
+    Heap dsv;
+    Heap samp_staging;
+    Heap samp_ring;
+    std::unordered_map<uint64_t, RootSigEntry> rootsigs;
     std::unordered_map<uint64_t, ID3D12PipelineState*> psos;
-    ID3D12Device*                                      dev = nullptr;
+    ID3D12Device* dev = nullptr;
 };
 Heaps& H()
 {
@@ -125,8 +127,7 @@ bool MakeHeap(Heap& h, ID3D12Device* dev, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT 
     D3D12_DESCRIPTOR_HEAP_DESC d{};
     d.Type = type;
     d.NumDescriptors = count;
-    d.Flags = shader_visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
-                             : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    d.Flags = shader_visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(dev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&h.heap)))) return false;
     h.inc = dev->GetDescriptorHandleIncrementSize(type);
     h.size = count;
@@ -213,7 +214,7 @@ void FillBlend(D3D12_BLEND_DESC& out, const D3D11_BLEND_DESC* in)
     out.IndependentBlendEnable = in->IndependentBlendEnable ? TRUE : FALSE;
     for (int i = 0; i < 8; ++i) {
         const D3D11_RENDER_TARGET_BLEND_DESC& s = in->RenderTarget[i];
-        D3D12_RENDER_TARGET_BLEND_DESC&       d = out.RenderTarget[i];
+        D3D12_RENDER_TARGET_BLEND_DESC& d = out.RenderTarget[i];
         d.BlendEnable = s.BlendEnable ? TRUE : FALSE;
         d.LogicOpEnable = FALSE;
         d.SrcBlend = Blend(s.SrcBlend);
@@ -236,8 +237,7 @@ void FillRaster(D3D12_RASTERIZER_DESC& out, const D3D11_RASTERIZER_DESC* in)
     out.DepthClipEnable = TRUE;
     out.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
     if (!in) return;
-    out.FillMode = (in->FillMode == D3D11_FILL_WIREFRAME) ? D3D12_FILL_MODE_WIREFRAME
-                                                          : D3D12_FILL_MODE_SOLID;
+    out.FillMode = (in->FillMode == D3D11_FILL_WIREFRAME) ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
     out.CullMode = (in->CullMode == D3D11_CULL_NONE) ? D3D12_CULL_MODE_NONE
         : (in->CullMode == D3D11_CULL_FRONT)         ? D3D12_CULL_MODE_FRONT
                                                      : D3D12_CULL_MODE_BACK;
@@ -259,9 +259,8 @@ void FillDepth(D3D12_DEPTH_STENCIL_DESC& out, const D3D11_DEPTH_STENCIL_DESC* in
         return;
     }
     out.DepthEnable = (in->DepthEnable && have_dsv) ? TRUE : FALSE;
-    out.DepthWriteMask = (in->DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO)
-        ? D3D12_DEPTH_WRITE_MASK_ZERO
-        : D3D12_DEPTH_WRITE_MASK_ALL;
+    out.DepthWriteMask =
+        (in->DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
     out.DepthFunc = (D3D12_COMPARISON_FUNC)in->DepthFunc;
     out.StencilEnable = (in->StencilEnable && have_dsv) ? TRUE : FALSE;
     out.StencilReadMask = in->StencilReadMask;
@@ -279,18 +278,14 @@ void FillDepth(D3D12_DEPTH_STENCIL_DESC& out, const D3D11_DEPTH_STENCIL_DESC* in
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopoType(D3D11_PRIMITIVE_TOPOLOGY t)
 {
     switch (t) {
-    case D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED:
-        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
-    case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST:
-        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    case D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
     case D3D11_PRIMITIVE_TOPOLOGY_LINELIST:
     case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP:
     case D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
-    case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
-        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
     default:
-        if (t >= D3D11_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST)
-            return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        if (t >= D3D11_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
         return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     }
 }
@@ -310,7 +305,7 @@ D3D12_SHADER_VISIBILITY Visibility(char stage)
 bool BuildRootSig(const std::vector<RootBind>& want, bool compute, RootSigEntry& out)
 {
     std::vector<D3D12_DESCRIPTOR_RANGE> ranges(want.size());
-    std::vector<D3D12_ROOT_PARAMETER>   params(want.size());
+    std::vector<D3D12_ROOT_PARAMETER> params(want.size());
     for (size_t i = 0; i < want.size(); ++i) {
         D3D12_DESCRIPTOR_RANGE& r = ranges[i];
         r.RangeType = (want[i].kind == 'u') ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV
@@ -331,25 +326,22 @@ bool BuildRootSig(const std::vector<RootBind>& want, bool compute, RootSigEntry&
     D3D12_ROOT_SIGNATURE_DESC rsd{};
     rsd.NumParameters = (UINT)params.size();
     rsd.pParameters = params.empty() ? nullptr : params.data();
-    rsd.Flags = compute ? D3D12_ROOT_SIGNATURE_FLAG_NONE
-                        : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    rsd.Flags = compute ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ID3DBlob* blob = nullptr;
     ID3DBlob* err = nullptr;
-    HRESULT   hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
     if (FAILED(hr)) {
         logger::write("PORT: root signature serialise FAILED hr=%08lX %s", (unsigned long)hr,
             err ? (const char*)err->GetBufferPointer() : "");
         if (err) err->Release();
         return false;
     }
-    hr = H().dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-        IID_PPV_ARGS(&out.rs));
+    hr = H().dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&out.rs));
     blob->Release();
     if (err) err->Release();
     if (FAILED(hr)) {
-        logger::write("PORT: CreateRootSignature FAILED hr=%08lX (%zu params)", (unsigned long)hr,
-            want.size());
+        logger::write("PORT: CreateRootSignature FAILED hr=%08lX (%zu params)", (unsigned long)hr, want.size());
         return false;
     }
     out.binds = want;
@@ -358,13 +350,12 @@ bool BuildRootSig(const std::vector<RootBind>& want, bool compute, RootSigEntry&
 
 RootSigEntry* GetRootSig(const std::vector<RootBind>& want, bool compute)
 {
-    uint64_t key = Fnv1a64(want.empty() ? "" : (const void*)want.data(),
-        want.size() * sizeof(RootBind));
+    uint64_t key = Fnv1a64(want.empty() ? "" : (const void*)want.data(), want.size() * sizeof(RootBind));
     key = Fnv1a64(&compute, sizeof(compute), key);
     auto it = H().rootsigs.find(key);
     if (it != H().rootsigs.end()) return it->second.rs ? &it->second : nullptr;
     RootSigEntry& e = H().rootsigs[key];
-    const auto    t0 = std::chrono::steady_clock::now();
+    const auto t0 = std::chrono::steady_clock::now();
     if (!BuildRootSig(want, compute, e)) return nullptr;
     logger::write("PORT: root signature built -- %zu tables, %s, in %.1f ms", want.size(),
         compute ? "compute" : "graphics", logger::ms_since(t0));
@@ -376,25 +367,24 @@ static bool Promotable(const WrapResource* r, D3D12_RESOURCE_STATES to)
 {
     if (r->state != D3D12_RESOURCE_STATE_COMMON) return false;
     const D3D12_RESOURCE_STATES tex = D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     return to != D3D12_RESOURCE_STATE_COMMON && (to & tex) == to;
 }
 
 using ListBufStates = std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>>;
-std::mutex                                                    g_list_buf_mtx;
-std::unordered_set<ID3D12Resource*>                           g_owned_bufs;
+std::mutex g_list_buf_mtx;
+std::unordered_set<ID3D12Resource*> g_owned_bufs;
 std::unordered_map<ID3D12GraphicsCommandList*, ListBufStates> g_list_buf;
-std::unordered_map<ID3D12Resource*, uint64_t>                 g_owned_writes;
-std::unordered_map<ID3D12GraphicsCommandList*, uint64_t>      g_list_recording;
-uint64_t                                                      g_list_recordings = 0;
-std::atomic<uint64_t>                                         g_upload_seq{ 0 };
+std::unordered_map<ID3D12Resource*, uint64_t> g_owned_writes;
+std::unordered_map<ID3D12GraphicsCommandList*, uint64_t> g_list_recording;
+uint64_t g_list_recordings = 0;
+std::atomic<uint64_t> g_upload_seq{ 0 };
 
 uint64_t ListRecording(ID3D12GraphicsCommandList* cl)
 {
     if (!cl) return 0;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    auto                        it = g_list_recording.find(cl);
+    auto it = g_list_recording.find(cl);
     return it == g_list_recording.end() ? 0 : it->second;
 }
 
@@ -412,7 +402,7 @@ class OwedUavBarriers {
 public:
     void Note(ID3D12GraphicsCommandList* cl, ID3D12Resource* res)
     {
-        std::lock_guard<std::mutex>   l(mtx_);
+        std::lock_guard<std::mutex> l(mtx_);
         std::vector<ID3D12Resource*>& owed = lists_[cl];
         if (std::find(owed.begin(), owed.end(), res) == owed.end()) owed.push_back(res);
     }
@@ -420,10 +410,10 @@ public:
     bool Take(ID3D12GraphicsCommandList* cl, ID3D12Resource* res)
     {
         std::lock_guard<std::mutex> l(mtx_);
-        auto                        it = lists_.find(cl);
+        auto it = lists_.find(cl);
         if (it == lists_.end()) return false;
         std::vector<ID3D12Resource*>& owed = it->second;
-        auto                          r = std::find(owed.begin(), owed.end(), res);
+        auto r = std::find(owed.begin(), owed.end(), res);
         if (r == owed.end()) return false;
         *r = owed.back();
         owed.pop_back();
@@ -444,7 +434,7 @@ public:
         std::vector<ID3D12Resource*> owed;
         {
             std::lock_guard<std::mutex> l(mtx_);
-            auto                        it = lists_.find(cl);
+            auto it = lists_.find(cl);
             if (it == lists_.end()) return;
             owed.swap(it->second);
             lists_.erase(it);
@@ -466,7 +456,7 @@ public:
     }
 
 private:
-    std::mutex                                                                     mtx_;
+    std::mutex mtx_;
     std::unordered_map<ID3D12GraphicsCommandList*, std::vector<ID3D12Resource*>> lists_;
 };
 OwedUavBarriers g_owed_uav;
@@ -475,7 +465,7 @@ bool HostHeap(WrapResource* r)
 {
     if (r->heap_type == (D3D12_HEAP_TYPE)0) {
         D3D12_HEAP_PROPERTIES hp{};
-        D3D12_HEAP_FLAGS      hf{};
+        D3D12_HEAP_FLAGS hf{};
         // Fails for reserved/tiled resources, which have no heap; DEFAULT keeps them transitionable.
         r->heap_type = SUCCEEDED(r->dx12->GetHeapProperties(&hp, &hf)) ? hp.Type : D3D12_HEAP_TYPE_DEFAULT;
     }
@@ -518,8 +508,8 @@ struct ListBufChange {
 ListBufChange SwapListBufState(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to)
 {
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    ListBufStates&              ls = g_list_buf[cl];
-    ListBufChange               c;
+    ListBufStates& ls = g_list_buf[cl];
+    ListBufChange c;
     for (auto& e : ls)
         if (e.first == res) {
             c.was = e.second;
@@ -570,8 +560,7 @@ void Transition(ID3D12GraphicsCommandList* cl, WrapResource* r, D3D12_RESOURCE_S
     if (owed) g_owed_uav.Pay(cl, r->dx12, transitioned);
 }
 
-void WriteNullDescriptor(char kind, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-    unsigned char sit, unsigned char dim)
+void WriteNullDescriptor(char kind, D3D12_CPU_DESCRIPTOR_HANDLE dst, unsigned char sit, unsigned char dim)
 {
     if (kind == 'b') {
         D3D12_CONSTANT_BUFFER_VIEW_DESC d{};
@@ -621,16 +610,16 @@ bool CbvWindow(ID3D11Buffer* cb, D3D12_GPU_VIRTUAL_ADDRESS* out_va, UINT64* out_
 {
     WrapResource* wr = AsWrapResource(cb);
     if (!wr || !wr->dx12) return false;
-    const D3D12_RESOURCE_DESC       rd = wr->dx12->GetDesc();
+    const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
     const D3D12_GPU_VIRTUAL_ADDRESS base = wr->dx12->GetGPUVirtualAddress();
 
     D3D12_GPU_VIRTUAL_ADDRESS va = base;
-    UINT64                    size = rd.Width;
-    bool                      windowed = false;
+    UINT64 size = rd.Width;
+    bool windowed = false;
     if (wr->gpu_va && wr->gpu_va >= base && wr->gpu_va < base + rd.Width) {
         windowed = true;
         va = wr->gpu_va;
-        const UINT64      remaining = rd.Width - (wr->gpu_va - base);
+        const UINT64 remaining = rd.Width - (wr->gpu_va - base);
         D3D11_BUFFER_DESC bd{};
         ((ID3D11Buffer*)cb)->GetDesc(&bd);
         const UINT64 want = bd.ByteWidth ? bd.ByteWidth : remaining;
@@ -648,7 +637,7 @@ bool CbvWindow(ID3D11Buffer* cb, D3D12_GPU_VIRTUAL_ADDRESS* out_va, UINT64* out_
 void WriteCbvDescriptor(ID3D11Buffer* cb, D3D12_CPU_DESCRIPTOR_HANDLE dst)
 {
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-    UINT64                    size = 0;
+    UINT64 size = 0;
     if (!CbvWindow(cb, &va, &size, nullptr)) {
         WriteNullDescriptor('b', dst, 0, 0);
         return;
@@ -661,16 +650,16 @@ void WriteCbvDescriptor(ID3D11Buffer* cb, D3D12_CPU_DESCRIPTOR_HANDLE dst)
 }
 
 struct PendingUpload {
-    ID3D11Resource*                                 dst = nullptr;     // our wrapper; we hold a ref until the copy is recorded
-    ID3D12Resource*                                 staging = nullptr; // a private staging buffer, or the ring (from_ring)
-    bool                                            is_texture = false;
-    bool                                            from_ring = false; // source is the upload ring: nothing to retire or release
-    UINT                                            subresources = 1;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;        // ABSOLUTE offsets into `staging`
-    UINT64                                          src_offset = 0; // buffer uploads: where in `staging` the bytes start
-    UINT64                                          bytes = 0;
-    uint64_t                                        queued_stamp = 0;
-    uint64_t                                        seq = 0;
+    ID3D11Resource* dst = nullptr; // our wrapper; we hold a ref until the copy is recorded
+    ID3D12Resource* staging = nullptr; // a private staging buffer, or the ring (from_ring)
+    bool is_texture = false;
+    bool from_ring = false; // source is the upload ring: nothing to retire or release
+    UINT subresources = 1;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts; // ABSOLUTE offsets into `staging`
+    UINT64 src_offset = 0; // buffer uploads: where in `staging` the bytes start
+    UINT64 bytes = 0;
+    uint64_t queued_stamp = 0;
+    uint64_t seq = 0;
 };
 std::vector<PendingUpload>& Uploads()
 {
@@ -679,7 +668,7 @@ std::vector<PendingUpload>& Uploads()
 }
 struct RetiredBuf {
     ID3D12Resource* res;
-    uint64_t        stamp;
+    uint64_t stamp;
 };
 std::vector<RetiredBuf>& RetiredStaging()
 {
@@ -687,19 +676,19 @@ std::vector<RetiredBuf>& RetiredStaging()
     return *v;
 }
 struct UploadRing {
-    ID3D12Resource*       res = nullptr;
-    uint8_t*              mapped = nullptr; // persistently mapped: legal for an UPLOAD heap
-    UINT64                size = 0;
-    UINT64                head = 0;
-    size_t                cur_chunk = SIZE_MAX; // the chunk the head is in; SIZE_MAX = none yet
-    std::vector<uint64_t> chunk_tag;            // per chunk: GpuStamp() at the last write; 0 = never
-    bool                  failed = false;       // creation failed once: do not retry on every write
+    ID3D12Resource* res = nullptr;
+    uint8_t* mapped = nullptr; // persistently mapped: legal for an UPLOAD heap
+    UINT64 size = 0;
+    UINT64 head = 0;
+    size_t cur_chunk = SIZE_MAX; // the chunk the head is in; SIZE_MAX = none yet
+    std::vector<uint64_t> chunk_tag; // per chunk: GpuStamp() at the last write; 0 = never
+    bool failed = false; // creation failed once: do not retry on every write
 };
 constexpr UINT64 kRingBytes = 8ull << 20; // 8 MB: ~24 writes x ~16 KB per frame x the frames in flight, with room
 constexpr UINT64 kRingChunk = 64ull << 10;
-constexpr UINT64 kRingAlign = 512;           // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
+constexpr UINT64 kRingAlign = 512; // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
 constexpr UINT64 kRingMaxWrite = 1ull << 20; // above this a write keeps its own staging buffer
-UploadRing&      Ring()
+UploadRing& Ring()
 {
     static auto* r = new UploadRing();
     return *r;
@@ -718,7 +707,7 @@ bool RingAlloc(UINT64 bytes, UINT64* out_offset)
             return false;
         }
         D3D12_RANGE none{ 0, 0 };
-        void*       p = nullptr;
+        void* p = nullptr;
         if (FAILED(r.res->Map(0, &none, &p)) || !p) {
             r.res->Release();
             r.res = nullptr;
@@ -730,14 +719,13 @@ bool RingAlloc(UINT64 bytes, UINT64* out_offset)
         r.size = kRingBytes;
         r.chunk_tag.assign((size_t)(kRingBytes / kRingChunk), 0u);
         logger::write("PORT: upload ring mapped: %llu MB in %zu chunks of %llu KB",
-            (unsigned long long)(kRingBytes >> 20), r.chunk_tag.size(),
-            (unsigned long long)(kRingChunk >> 10));
+            (unsigned long long)(kRingBytes >> 20), r.chunk_tag.size(), (unsigned long long)(kRingChunk >> 10));
     }
     UINT64 off = (r.head + (kRingAlign - 1)) & ~(kRingAlign - 1);
     if (off + bytes > r.size) off = 0; // wrap
     const uint64_t now_tag = GpuStamp();
-    const size_t   c0 = (size_t)(off / kRingChunk);
-    const size_t   c1 = (size_t)((off + bytes - 1) / kRingChunk);
+    const size_t c0 = (size_t)(off / kRingChunk);
+    const size_t c1 = (size_t)((off + bytes - 1) / kRingChunk);
     for (size_t c = c0; c <= c1; ++c) {
         if (c == r.cur_chunk && off != 0) continue; // continuing in the head's own chunk
         const uint64_t t = r.chunk_tag[c];
@@ -755,8 +743,8 @@ void RingTouch(UINT64 off, UINT64 bytes)
     UploadRing& r = Ring();
     if (!r.res || bytes == 0) return;
     const uint64_t now_tag = GpuStamp();
-    const size_t   c0 = (size_t)(off / kRingChunk);
-    const size_t   c1 = (size_t)((off + bytes - 1) / kRingChunk);
+    const size_t c0 = (size_t)(off / kRingChunk);
+    const size_t c1 = (size_t)((off + bytes - 1) / kRingChunk);
     for (size_t c = c0; c <= c1 && c < r.chunk_tag.size(); ++c) r.chunk_tag[c] = now_tag;
 }
 
@@ -766,7 +754,7 @@ std::atomic<unsigned long long> g_ring_expired{ 0 };
 
 namespace {
 thread_local ModDrawFn g_mod_draw_fn = nullptr;
-thread_local void*     g_mod_draw_user = nullptr;
+thread_local void* g_mod_draw_user = nullptr;
 } // namespace
 
 void SetModDrawCallback(ModDrawFn fn, void* user)
@@ -784,27 +772,27 @@ ModDrawFn ModDrawCallback(void** out_user)
 namespace {
 struct CbSnapshot {
     ID3D12Resource* res = nullptr;
-    uint64_t        stamp = 0;
+    uint64_t stamp = 0;
 };
 struct CbSnapshotUse {
-    ID3D12Resource*           src;
-    UINT64                    src_off;
-    UINT                      bytes;
-    uint64_t                  writes;
+    ID3D12Resource* src;
+    UINT64 src_off;
+    UINT bytes;
+    uint64_t writes;
     D3D12_GPU_VIRTUAL_ADDRESS va;
 };
-constexpr UINT64                                                           kCbSnapshotBytes = 64 * 1024;
-constexpr UINT64                                                           kCbSnapshotsPerHeap = 64;
-std::mutex                                                                 g_cb_snap_mtx;
-std::vector<CbSnapshot>                                                    g_cb_snaps;
-std::vector<ID3D12Heap*>                                                   g_cb_snap_heaps;
+constexpr UINT64 kCbSnapshotBytes = 64 * 1024;
+constexpr UINT64 kCbSnapshotsPerHeap = 64;
+std::mutex g_cb_snap_mtx;
+std::vector<CbSnapshot> g_cb_snaps;
+std::vector<ID3D12Heap*> g_cb_snap_heaps;
 std::unordered_map<ID3D12GraphicsCommandList*, std::vector<CbSnapshotUse>> g_cb_snap_uses;
-std::atomic<unsigned>                                                      g_cb_snap_logged{ 0 };
+std::atomic<unsigned> g_cb_snap_logged{ 0 };
 
 uint64_t OwnedWrites(ID3D12Resource* res)
 {
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    auto                        it = g_owned_writes.find(res);
+    auto it = g_owned_writes.find(res);
     return it == g_owned_writes.end() ? 0 : it->second;
 }
 
@@ -836,7 +824,9 @@ bool GrowCbSnapshots(ID3D12Device* dev)
     const size_t before = g_cb_snaps.size();
     for (UINT64 i = 0; i < kCbSnapshotsPerHeap; ++i) {
         ID3D12Resource* res = nullptr;
-        if (FAILED(CreatePlacedD3D12Buffer(dev, heap, i * kCbSnapshotBytes, kCbSnapshotBytes, D3D12_RESOURCE_STATE_COMMON, &res)) || !res)
+        if (FAILED(CreatePlacedD3D12Buffer(
+                dev, heap, i * kCbSnapshotBytes, kCbSnapshotBytes, D3D12_RESOURCE_STATE_COMMON, &res)) ||
+            !res)
             break;
         g_cb_snaps.push_back({ res, 0 });
     }
@@ -873,9 +863,9 @@ D3D12_RESOURCE_STATES OwnedTransition(ID3D12GraphicsCommandList* cl, ID3D12Resou
         std::lock_guard<std::mutex> l(g_list_buf_mtx);
         ++g_owned_writes[res];
     }
-    const bool          owed = g_owed_uav.Take(cl, res);
+    const bool owed = g_owed_uav.Take(cl, res);
     const ListBufChange c = SwapListBufState(cl, res, to);
-    const bool          transitioned = c.Record(cl, res, to);
+    const bool transitioned = c.Record(cl, res, to);
     if (owed) g_owed_uav.Pay(cl, res, transitioned);
     return c.was;
 }
@@ -885,7 +875,7 @@ D3D12_RESOURCE_STATES ListStateOf(ID3D12GraphicsCommandList* cl, WrapResource* r
     if (!r) return D3D12_RESOURCE_STATE_COMMON;
     if (!cl || !r->dx12 || r->dim != D3D11_RESOURCE_DIMENSION_BUFFER || !OwnedBuffer(r->dx12)) return r->state;
     std::lock_guard<std::mutex> l(g_list_buf_mtx);
-    auto                        it = g_list_buf.find(cl);
+    auto it = g_list_buf.find(cl);
     if (it == g_list_buf.end()) return D3D12_RESOURCE_STATE_COMMON;
     for (const auto& e : it->second)
         if (e.first == r->dx12) return e.second;
@@ -916,7 +906,7 @@ void ListBuffersToCommon(ID3D12GraphicsCommandList* cl)
     {
         std::lock_guard<std::mutex> l(g_list_buf_mtx);
         g_list_recording.erase(cl);
-        auto                        it = g_list_buf.find(cl);
+        auto it = g_list_buf.find(cl);
         if (it == g_list_buf.end()) return;
         st.swap(it->second);
         g_list_buf.erase(it);
@@ -931,14 +921,15 @@ void ListBuffersToCommon(ID3D12GraphicsCommandList* cl)
     if (any) RemovalPin::Ours(cl, "port-list-close");
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS StaticCbSnapshot(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, UINT64 src_off, UINT bytes)
+D3D12_GPU_VIRTUAL_ADDRESS StaticCbSnapshot(
+    ID3D12GraphicsCommandList* cl, ID3D12Resource* src, UINT64 src_off, UINT bytes)
 {
     ID3D12Device* dev = GetDx12Bridge().device;
     if (!cl || !src || !dev || !bytes) return 0;
     if (bytes > kCbSnapshotBytes) bytes = (UINT)kCbSnapshotBytes;
-    const uint64_t  writes = OwnedWrites(src);
+    const uint64_t writes = OwnedWrites(src);
     ID3D12Resource* snap = nullptr;
-    size_t          pool = 0;
+    size_t pool = 0;
     {
         std::lock_guard<std::mutex> l(g_cb_snap_mtx);
         for (const CbSnapshotUse& u : g_cb_snap_uses[cl])
@@ -951,8 +942,8 @@ D3D12_GPU_VIRTUAL_ADDRESS StaticCbSnapshot(ID3D12GraphicsCommandList* cl, ID3D12
         if (!snap) return 0;
     }
     if (pool && g_cb_snap_logged.fetch_add(1, std::memory_order_relaxed) < 16)
-        logger::write("CBSNAP: %zu snapshot buffer(s) of %llu KB -- a static root CBV of the game reads one of ours", pool,
-            (unsigned long long)(kCbSnapshotBytes / 1024));
+        logger::write("CBSNAP: %zu snapshot buffer(s) of %llu KB -- a static root CBV of the game reads one of ours",
+            pool, (unsigned long long)(kCbSnapshotBytes / 1024));
     OwnedTransition(cl, src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     cl->CopyBufferRegion(snap, 0, src, src_off, bytes);
     TransitionBarrier(cl, snap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -974,10 +965,10 @@ void TransitionResource(ID3D12GraphicsCommandList* cl, ID3D11Resource* res, D3D1
 namespace {
 struct BufCopyCs {
     std::vector<unsigned char> dxil;
-    ID3D12RootSignature*       rs = nullptr;
-    ID3D12PipelineState*       pso = nullptr;
-    bool                       failed = false;
-    bool                       Ensure(ID3D12Device* dev)
+    ID3D12RootSignature* rs = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    bool failed = false;
+    bool Ensure(ID3D12Device* dev)
     {
         if (pso) return true;
         if (failed || !dev || dxil.empty()) return false;
@@ -991,8 +982,9 @@ struct BufCopyCs {
         rsd.pParameters = rp;
         ID3DBlob* blob = nullptr;
         ID3DBlob* err = nullptr;
-        HRESULT   hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
-        if (SUCCEEDED(hr)) hr = dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs));
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+        if (SUCCEEDED(hr))
+            hr = dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs));
         if (blob) blob->Release();
         if (err) err->Release();
         if (SUCCEEDED(hr)) {
@@ -1024,15 +1016,16 @@ void SetBufCopyShader(const void* dxil, size_t bytes)
     BufCopy().dxil.assign((const unsigned char*)dxil, (const unsigned char*)dxil + bytes);
 }
 
-bool CopyBufferCs(ID3D12GraphicsCommandList* cl, WrapResource* dst, UINT64 dst_off,
-    WrapResource* src, UINT64 src_off, UINT64 bytes)
+bool CopyBufferCs(
+    ID3D12GraphicsCommandList* cl, WrapResource* dst, UINT64 dst_off, WrapResource* src, UINT64 src_off, UINT64 bytes)
 {
     const Dx12Bridge& b = GetDx12Bridge();
-    if (!cl || !dst || !src || !dst->dx12 || !src->dx12 || !bytes || (bytes & 3) || !BufCopy().Ensure(b.device)) return false;
+    if (!cl || !dst || !src || !dst->dx12 || !src->dx12 || !bytes || (bytes & 3) || !BufCopy().Ensure(b.device))
+        return false;
     for (WrapResource* r : { dst, src })
         if (r->heap_type == (D3D12_HEAP_TYPE)0) {
             D3D12_HEAP_PROPERTIES hp{};
-            D3D12_HEAP_FLAGS      hf{};
+            D3D12_HEAP_FLAGS hf{};
             r->heap_type = SUCCEEDED(r->dx12->GetHeapProperties(&hp, &hf)) ? hp.Type : D3D12_HEAP_TYPE_DEFAULT;
         }
     if (dst->heap_type != D3D12_HEAP_TYPE_DEFAULT || src->heap_type != D3D12_HEAP_TYPE_DEFAULT) return false;
@@ -1076,7 +1069,7 @@ void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t s
     PendingUpload u;
     u.bytes = bytes;
     UINT64 off = 0;
-    bool   ring = false;
+    bool ring = false;
     {
         std::lock_guard<std::mutex> l(Mtx());
         ring = RingAlloc(bytes, &off);
@@ -1093,7 +1086,7 @@ void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t s
             logger::write("PORT: upload staging FAILED (%zu bytes)", bytes);
             return;
         }
-        void*       p = nullptr;
+        void* p = nullptr;
         D3D12_RANGE none{ 0, 0 };
         if (SUCCEEDED(staging->Map(0, &none, &p)) && p) {
             memcpy(p, data, bytes);
@@ -1113,7 +1106,7 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
 {
     {
         static const bool skip = [] {
-            char   b[8] = {};
+            char b[8] = {};
             size_t n = 0;
             return getenv_s(&n, b, sizeof(b), "PORT_NO_TEXUP") == 0 && n && b[0] == '1';
         }();
@@ -1125,19 +1118,20 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     if (!b.device) return;
     PROF(PL_UploadQueue);
 
-    const D3D12_RESOURCE_DESC                       rd = wr->dx12->GetDesc();
+    const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(subresources);
-    std::vector<UINT>                               rows(subresources);
-    std::vector<UINT64>                             row_bytes(subresources);
-    UINT64                                          total = 0;
-    b.device->GetCopyableFootprints(&rd, 0, subresources, 0, layouts.data(), rows.data(),
-        row_bytes.data(), &total);
+    std::vector<UINT> rows(subresources);
+    std::vector<UINT64> row_bytes(subresources);
+    UINT64 total = 0;
+    b.device->GetCopyableFootprints(&rd, 0, subresources, 0, layouts.data(), rows.data(), row_bytes.data(), &total);
 
     if (subresources == 1 && data[0].pSysMem) {
         std::lock_guard<std::mutex> l(Mtx());
         for (auto it = Uploads().rbegin(); it != Uploads().rend(); ++it) {
-            if (it->dst != dst || !it->is_texture || !it->from_ring || it->subresources != 1 || it->staging != Ring().res) continue;
-            uint8_t*       dst_rows = Ring().mapped + it->layouts[0].Offset;
+            if (it->dst != dst || !it->is_texture || !it->from_ring || it->subresources != 1 ||
+                it->staging != Ring().res)
+                continue;
+            uint8_t* dst_rows = Ring().mapped + it->layouts[0].Offset;
             const uint8_t* src_rows = (const uint8_t*)data[0].pSysMem;
             for (UINT y = 0; y < rows[0]; ++y)
                 memcpy(dst_rows + (size_t)y * it->layouts[0].Footprint.RowPitch,
@@ -1150,23 +1144,22 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
     }
 
     ID3D12Resource* staging = nullptr;
-    uint8_t*        base = nullptr; // where layouts[i].Offset is relative to
-    UINT64          off = 0;
-    bool            ring = false;
+    uint8_t* base = nullptr; // where layouts[i].Offset is relative to
+    UINT64 off = 0;
+    bool ring = false;
     {
         std::lock_guard<std::mutex> l(Mtx());
         ring = RingAlloc(total, &off);
     }
     if (ring) {
-        b.device->GetCopyableFootprints(&rd, 0, subresources, off, layouts.data(), rows.data(),
-            row_bytes.data(), &total);
+        b.device->GetCopyableFootprints(
+            &rd, 0, subresources, off, layouts.data(), rows.data(), row_bytes.data(), &total);
         staging = Ring().res;
         base = Ring().mapped; // absolute offsets: base is the ring's start
     } else {
         staging = MakeStaging(total);
         if (!staging) {
-            logger::write("PORT: texture upload staging FAILED (%llu bytes)",
-                (unsigned long long)total);
+            logger::write("PORT: texture upload staging FAILED (%llu bytes)", (unsigned long long)total);
             return;
         }
         D3D12_RANGE none{ 0, 0 };
@@ -1176,12 +1169,11 @@ void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data,
         }
     }
     for (UINT i = 0; i < subresources; ++i) {
-        uint8_t*       dst_rows = base + layouts[i].Offset;
+        uint8_t* dst_rows = base + layouts[i].Offset;
         const uint8_t* src_rows = (const uint8_t*)data[i].pSysMem;
         if (!src_rows) continue;
         for (UINT y = 0; y < rows[i]; ++y) {
-            memcpy(dst_rows + (size_t)y * layouts[i].Footprint.RowPitch,
-                src_rows + (size_t)y * data[i].SysMemPitch,
+            memcpy(dst_rows + (size_t)y * layouts[i].Footprint.RowPitch, src_rows + (size_t)y * data[i].SysMemPitch,
                 (size_t)row_bytes[i]);
         }
     }
@@ -1222,7 +1214,7 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
 {
     if (!cl) return;
     PROF(PL_UploadFlush);
-    const uint64_t             recording = ListRecording(cl);
+    const uint64_t recording = ListRecording(cl);
     std::vector<PendingUpload> todo;
     {
         std::lock_guard<std::mutex> l(Mtx());
@@ -1231,7 +1223,7 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
         for (const PendingUpload& u : todo)
             if (WrapResource* wr = AsWrapResource(u.dst)) wr->flushed = { u.seq, cl, recording };
         // Release only what the GPU is demonstrably done with, instead of everything queued last time.
-        auto&  ret = RetiredStaging();
+        auto& ret = RetiredStaging();
         size_t keep = 0;
         for (size_t i = 0; i < ret.size(); ++i) {
             if (GpuPassed(ret[i].stamp)) {
@@ -1251,9 +1243,9 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
                 const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
                 logger::write("RINGSTALE expired #%llu: %s dst=%p %llux%u fmt=%d mips=%u, %llu B: the GPU passed its "
                               "ring stamp %llu before its copy was recorded -- unprotected while it waited",
-                    n, u.is_texture ? "texture" : "buffer", (void*)wr->dx12,
-                    (unsigned long long)rd.Width, (unsigned)rd.Height, (int)rd.Format,
-                    (unsigned)rd.MipLevels, (unsigned long long)u.bytes, (unsigned long long)u.queued_stamp);
+                    n, u.is_texture ? "texture" : "buffer", (void*)wr->dx12, (unsigned long long)rd.Width,
+                    (unsigned)rd.Height, (int)rd.Format, (unsigned)rd.MipLevels, (unsigned long long)u.bytes,
+                    (unsigned long long)u.queued_stamp);
             }
         }
         if (wr && wr->dx12) {
@@ -1282,8 +1274,8 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
         }
         std::lock_guard<std::mutex> l(Mtx());
         if (u.from_ring) {
-            const UINT64 lo = u.is_texture ? (u.layouts.empty() ? u.src_offset : u.layouts.front().Offset)
-                                           : u.src_offset;
+            const UINT64 lo =
+                u.is_texture ? (u.layouts.empty() ? u.src_offset : u.layouts.front().Offset) : u.src_offset;
             RingTouch(lo, u.bytes);
         } else {
             RetiredStaging().push_back({ u.staging, GpuStamp() });
@@ -1296,7 +1288,7 @@ void FlushPendingUploads(ID3D12GraphicsCommandList* cl)
 constexpr UINT kRingBlock = 256;
 struct RetiredHeap {
     ID3D12DescriptorHeap* heap;
-    uint64_t              tag;
+    uint64_t tag;
 };
 std::vector<RetiredHeap>& RetiredRings()
 {
@@ -1306,7 +1298,7 @@ std::vector<RetiredHeap>& RetiredRings()
 bool RingReserve(Heap& ring, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT n)
 {
     const uint64_t now = GpuStamp();
-    auto&          old = RetiredRings();
+    auto& old = RetiredRings();
     for (size_t i = 0; i < old.size();)
         if (GpuPassed(old[i].tag)) {
             old[i].heap->Release();
@@ -1322,7 +1314,7 @@ bool RingReserve(Heap& ring, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT n)
         if (start + n > ring.size) start = 0; // a run never straddles the end
         const UINT first = (start == ring.next && start % kRingBlock) ? start / kRingBlock + 1 : start / kRingBlock;
         const UINT last = (start + n - 1) / kRingBlock;
-        bool       free = start + n <= ring.size;
+        bool free = start + n <= ring.size;
         for (UINT b = first; free && b <= last; ++b)
             if (ring.tag[b] && !GpuPassed(ring.tag[b])) free = false;
         if (free) {
@@ -1331,7 +1323,7 @@ bool RingReserve(Heap& ring, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT n)
             return true;
         }
         const Heap was = ring;
-        UINT       size = ring.size * 2;
+        UINT size = ring.size * 2;
         while (size < n) size *= 2;
         if (!MakeHeap(ring, H().dev, type, size, true)) {
             ring = was;
@@ -1360,7 +1352,7 @@ bool ShaderVisibleCopy(D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_GPU_DESCRIPTOR_HAN
 {
     if (!EnsureHeaps() || !src.ptr) return false;
     std::lock_guard<std::mutex> l(Mtx());
-    Heap&                       ring = H().ring;
+    Heap& ring = H().ring;
     if (!RingReserve(ring, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1)) return false;
     const UINT slot = ring.next++;
     H().dev->CopyDescriptorsSimple(1, ring.Cpu(slot), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1378,7 +1370,7 @@ bool ShaderVisibleCopy(D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_GPU_DESCRIPTOR_HAN
 bool EnsureHeaps()
 {
     static std::atomic<ID3D12Device*> s_ready_dev{ nullptr };
-    const Dx12Bridge&                 b = GetDx12Bridge();
+    const Dx12Bridge& b = GetDx12Bridge();
     if (!b.device) return false;
     if (b.device == s_ready_dev.load(std::memory_order_acquire)) return true;
     std::lock_guard<std::mutex> l(Mtx());
@@ -1388,8 +1380,7 @@ bool EnsureHeaps()
         H().dev = b.device;
     }
     if (H().staging.heap) return true;
-    const bool ok =
-        MakeHeap(H().staging, H().dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kStagingSize, false) &&
+    const bool ok = MakeHeap(H().staging, H().dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kStagingSize, false) &&
         MakeHeap(H().ring, H().dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRingSize, true) &&
         MakeHeap(H().rtv, H().dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvSize, false) &&
         MakeHeap(H().dsv, H().dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvSize, false) &&
@@ -1399,8 +1390,8 @@ bool EnsureHeaps()
         logger::write("PORT: descriptor heap creation FAILED -- custom shaders cannot run");
         return false;
     }
-    logger::write("PORT: descriptor heaps ready (staging %u, ring %u, rtv %u, dsv %u)",
-        kStagingSize, kRingSize, kRtvSize, kDsvSize);
+    logger::write("PORT: descriptor heaps ready (staging %u, ring %u, rtv %u, dsv %u)", kStagingSize, kRingSize,
+        kRtvSize, kDsvSize);
     s_ready_dev.store(b.device, std::memory_order_release);
     return true;
 }
@@ -1410,7 +1401,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE AllocStagingDescriptor(char kind, UINT* out_slot)
     D3D12_CPU_DESCRIPTOR_HANDLE none{};
     if (!EnsureHeaps()) return none;
     std::lock_guard<std::mutex> l(Mtx());
-    Heap*                       h = StagingFor(kind);
+    Heap* h = StagingFor(kind);
     if (!h || !h->heap) return none;
     UINT slot;
     if (!h->freed.empty()) {
@@ -1419,11 +1410,11 @@ D3D12_CPU_DESCRIPTOR_HANDLE AllocStagingDescriptor(char kind, UINT* out_slot)
     } else {
         if (h->next == h->size * (UINT)(1 + h->more.size())) { // every block taken: one more
             D3D12_DESCRIPTOR_HEAP_DESC d = h->heap->GetDesc();
-            ID3D12DescriptorHeap*      nb = nullptr;
+            ID3D12DescriptorHeap* nb = nullptr;
             if (FAILED(H().dev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&nb)))) return none;
             h->more.push_back(nb);
-            logger::write("PORT: staging descriptor heap '%c' grown to %u slots (%zu live views)",
-                kind, h->size * (UINT)(1 + h->more.size()), (size_t)(h->next - h->freed.size()));
+            logger::write("PORT: staging descriptor heap '%c' grown to %u slots (%zu live views)", kind,
+                h->size * (UINT)(1 + h->more.size()), (size_t)(h->next - h->freed.size()));
         }
         slot = h->next++;
     }
@@ -1434,7 +1425,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE AllocStagingDescriptor(char kind, UINT* out_slot)
 void ReleaseStagingDescriptor(char kind, UINT slot)
 {
     std::lock_guard<std::mutex> l(Mtx());
-    Heap*                       h = StagingFor(kind);
+    Heap* h = StagingFor(kind);
     if (h && h->heap && slot < h->next) h->freed.push_back(slot);
 }
 
@@ -1445,7 +1436,7 @@ bool ReflectShader(ShaderCode& sc)
     if (sc.code.empty()) return false;
 
     ID3D12ShaderReflection* refl = nullptr;
-    HRESULT                 hr = D3DReflect(sc.code.data(), sc.code.size(), IID_PPV_ARGS(&refl));
+    HRESULT hr = D3DReflect(sc.code.data(), sc.code.size(), IID_PPV_ARGS(&refl));
     if (FAILED(hr) || !refl) {
         logger::write("PORT: D3DReflect FAILED for %c shader (%zu bytes) hr=%08lX -- root signature "
                       "cannot be derived",
@@ -1464,8 +1455,7 @@ bool ReflectShader(ShaderCode& sc)
                 if (bd.BindPoint < 16) {
                     if (ID3D12ShaderReflectionConstantBuffer* cb = refl->GetConstantBufferByName(bd.Name)) {
                         D3D12_SHADER_BUFFER_DESC cbd{};
-                        if (SUCCEEDED(cb->GetDesc(&cbd)) && cbd.Size)
-                            sc.cb_size[bd.BindPoint] = cbd.Size;
+                        if (SUCCEEDED(cb->GetDesc(&cbd)) && cbd.Size) sc.cb_size[bd.BindPoint] = cbd.Size;
                     }
                 }
                 break;
@@ -1484,8 +1474,8 @@ bool ReflectShader(ShaderCode& sc)
             }
             // An array binding occupies BindCount consecutive registers; each needs its own table entry.
             for (UINT k = 0; k < (bd.BindCount ? bd.BindCount : 1); ++k)
-                sc.regs.push_back(ShaderReg{ kind, bd.BindPoint + k, bd.Space,
-                    (unsigned char)bd.Type, (unsigned char)bd.Dimension });
+                sc.regs.push_back(
+                    ShaderReg{ kind, bd.BindPoint + k, bd.Space, (unsigned char)bd.Type, (unsigned char)bd.Dimension });
         }
     }
     refl->Release();
@@ -1507,7 +1497,7 @@ bool CollectBinds(bool compute, std::vector<RootBind>& out, UINT& n_srv_uav_cbv,
     n_srv_uav_cbv = n_samp = 0;
     const char* stages = compute ? "c" : "vhdgp";
     for (const char* s = stages; *s; ++s) {
-        const int   si = StageIndex(*s);
+        const int si = StageIndex(*s);
         ShaderCode* sc = AsShaderCode(st.shader[si]);
         if (!sc) continue;
         if (!ReflectShader(*sc)) return false;
@@ -1537,9 +1527,9 @@ namespace {
 static bool HasDescriptor(const WrapView* wv, char kind, UINT reg)
 {
     if (wv->cpu.ptr) return true;
-    static std::mutex                         m;
+    static std::mutex m;
     static std::unordered_map<unsigned, bool> seen;
-    bool                                      fresh;
+    bool fresh;
     {
         std::lock_guard<std::mutex> l(m);
         fresh = seen.emplace(((unsigned)kind << 8) | reg, true).second;
@@ -1552,14 +1542,31 @@ static bool HasDescriptor(const WrapView* wv, char kind, UINT reg)
     return false;
 }
 
+// The game's descriptor for a vs/ps register the section did not set since the draw scope opened (GameBindings); a
+// published game texture is the game's binding whenever it was published.
+bool InheritGameBinding(bool compute, const RootBind& b, bool game_view, D3D12_CPU_DESCRIPTOR_HANDLE dst)
+{
+    const Dx12Bridge* br = BridgeScope();
+    if (compute || !br || !br->game.descriptor || (b.stage != 'v' && b.stage != 'p') || b.space) return false;
+    if (b.reg >= (b.kind == 't' ? (UINT)kMaxSRV : (UINT)kMaxCB)) return false;
+    const PipeState& st = State();
+    const int si = StageIndex(b.stage);
+    const int32_t since = b.kind == 't' ? (int32_t)(st.srv_gen[si][b.reg] - br->game.srv_gen)
+                                        : (int32_t)(st.cb_gen[si][b.reg] - br->game.cb_gen);
+    if (since > 0 && !game_view) return false;
+    const ShaderCode* sc = AsShaderCode(st.shader[si]);
+    const unsigned cb_bytes = b.kind == 'b' && sc && b.reg < std::size(sc->cb_size) ? sc->cb_size[b.reg] : 0;
+    return br->game.descriptor(br->game.user, b.stage, b.kind, b.reg, cb_bytes, dst);
+}
+
 bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, bool compute)
 {
     PipeState& st = State();
     if (g_bd_trace) {
         std::string b;
-        char        tmp[64];
+        char tmp[64];
         for (const RootBind& rb : rse.binds) {
-            const int   si = StageIndex(rb.stage);
+            const int si = StageIndex(rb.stage);
             const void* bound = nullptr;
             if (rb.kind == 'b')
                 bound = (si >= 0 && rb.reg < kMaxCB) ? (void*)st.cb[si][rb.reg] : nullptr;
@@ -1567,8 +1574,7 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
                 bound = (rb.reg < kMaxUAV) ? (void*)st.uav[rb.reg] : nullptr;
             else if (rb.kind == 't')
                 bound = (si >= 0 && rb.reg < kMaxSRV) ? (void*)st.srv[si][rb.reg] : nullptr;
-            _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, " %c%c%u=%s", rb.stage, rb.kind, rb.reg,
-                bound ? "bound" : "NULL");
+            _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, " %c%c%u=%s", rb.stage, rb.kind, rb.reg, bound ? "bound" : "NULL");
             b += tmp;
         }
         logger::write("BINDDESC enter binds=%zu compute=%d --%s", rse.binds.size(), (int)compute, b.c_str());
@@ -1581,21 +1587,21 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
         UINT n_smp = 0;
         for (const RootBind& b : rse.binds) (b.kind == 's' ? n_smp : n_res)++;
         if (!RingReserve(H().ring, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, n_res) ||
-            !RingReserve(H().samp_ring, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, n_smp)) return false;
+            !RingReserve(H().samp_ring, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, n_smp))
+            return false;
     }
     ID3D12DescriptorHeap* heaps[2] = { H().ring.heap, H().samp_ring.heap };
     cl->SetDescriptorHeaps(2, heaps);
     t_heaps_changed = true;
 
     for (const RootBind& b : rse.binds) {
-        const int                         si = StageIndex(b.stage);
-        Heap&                             ring = (b.kind == 's') ? H().samp_ring : H().ring;
-        const UINT                        slot = ring.next++; // reserved above: in range and out of flight
+        const int si = StageIndex(b.stage);
+        Heap& ring = (b.kind == 's') ? H().samp_ring : H().ring;
+        const UINT slot = ring.next++; // reserved above: in range and out of flight
         const D3D12_CPU_DESCRIPTOR_HANDLE dst = ring.Cpu(slot);
         if (g_bd_trace)
-            logger::write("BINDDESC   bind param=%u %c%c%u slot=%u/%u heap=%p cpu=%zx",
-                b.param, b.stage, b.kind, b.reg, slot, ring.size,
-                (void*)ring.heap, (size_t)dst.ptr);
+            logger::write("BINDDESC   bind param=%u %c%c%u slot=%u/%u heap=%p cpu=%zx", b.param, b.stage, b.kind, b.reg,
+                slot, ring.size, (void*)ring.heap, (size_t)dst.ptr);
         // Record compute UAV registers as they are bound, for the capture to report per pass.
         if (compute && b.kind == 'u' && b.reg < 32)
             g_cs_uav_bound_mask.fetch_or(1u << b.reg, std::memory_order_relaxed);
@@ -1606,12 +1612,12 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
                 WrapResource* wr = AsWrapResource(cb);
                 Transition(cl, wr, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 WriteCbvDescriptor(cb, dst);
-            } else {
+            } else if (!InheritGameBinding(compute, b, false, dst)) {
                 WriteNullDescriptor('b', dst, b.sit, b.dim);
             }
         } else if (b.kind == 'u') {
             ID3D11UnorderedAccessView* v = (b.reg < kMaxUAV) ? st.uav[b.reg] : nullptr;
-            WrapView*                  wv = AsWrapView(v);
+            WrapView* wv = AsWrapView(v);
             if (wv && wv->wres && HasDescriptor(wv, 'u', b.reg)) {
                 Transition(cl, wv->wres, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 H().dev->CopyDescriptorsSimple(1, dst, wv->cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1620,8 +1626,8 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
             }
         } else if (b.kind == 's') {
             ID3D11SamplerState* ss = (si >= 0 && b.reg < kMaxSamp) ? st.samp[si][b.reg] : nullptr;
-            StateDesc*          sd = AsStateDesc(ss);
-            D3D12_SAMPLER_DESC  d{};
+            StateDesc* sd = AsStateDesc(ss);
+            D3D12_SAMPLER_DESC d{};
             if (sd) {
                 d.Filter = (D3D12_FILTER)sd->sampler.Filter;
                 d.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)sd->sampler.AddressU;
@@ -1643,13 +1649,17 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
             H().dev->CreateSampler(&d, dst);
         } else { // 't'
             ID3D11ShaderResourceView* v = (si >= 0 && b.reg < kMaxSRV) ? st.srv[si][b.reg] : nullptr;
-            WrapView*                 wv = AsWrapView(v);
-            if (wv && wv->wres && HasDescriptor(wv, 't', b.reg)) {
-                Transition(cl, wv->wres, compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            WrapView* wv = AsWrapView(v);
+            const bool game_view = wv && wv->wres && wv->wres->foreign && !wv->cpu.ptr;
+            const bool inherited = (!v || game_view) && InheritGameBinding(compute, b, game_view, dst);
+            if (!inherited && wv && wv->wres && HasDescriptor(wv, 't', b.reg)) {
+                Transition(cl, wv->wres,
+                    compute ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                            : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 if (wv->wres->dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
                     if (auto fn = g_texture_use_observer.load(std::memory_order_relaxed)) fn(wv->wres->dx12);
                 H().dev->CopyDescriptorsSimple(1, dst, wv->cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            } else {
+            } else if (!inherited) {
                 WriteNullDescriptor('t', dst, b.sit, b.dim);
             }
         }
@@ -1667,61 +1677,51 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
 void TraceDispatch(const RootSigEntry& rse, UINT x, UINT y, UINT z)
 {
     PipeState& st = State();
-    wchar_t    line[512];
+    wchar_t line[512];
 
     ShaderCode* cs = AsShaderCode(st.shader[5]);
-    _snwprintf_s(line, _TRUNCATE,
-        L"  LEAF dispatch groups=%u,%u,%u cs=%zu bytes binds=%zu",
-        x, y, z, cs ? cs->code.size() : (size_t)0, rse.binds.size());
-    ObserveCommand(line);
+    _snwprintf_s(line, _TRUNCATE, L"  LEAF dispatch groups=%u,%u,%u cs=%zu bytes binds=%zu", x, y, z,
+        cs ? cs->code.size() : (size_t)0, rse.binds.size());
+    g_command_observer.Observe(line);
 
     for (const RootBind& b : rse.binds) {
         const int si = StageIndex(b.stage);
         if (b.kind == 'b') {
-            ID3D11Buffer*             cb = (si >= 0 && b.reg < kMaxCB) ? st.cb[si][b.reg] : nullptr;
+            ID3D11Buffer* cb = (si >= 0 && b.reg < kMaxCB) ? st.cb[si][b.reg] : nullptr;
             D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-            UINT64                    size = 0;
-            bool                      windowed = false;
+            UINT64 size = 0;
+            bool windowed = false;
             if (cb && CbvWindow(cb, &va, &size, &windowed)) {
-                _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   %cb%u = res %p va %016llX size %llu %s",
-                    b.stage, b.reg, (void*)cb, (unsigned long long)va,
-                    (unsigned long long)size,
+                _snwprintf_s(line, _TRUNCATE, L"  LEAF   %cb%u = res %p va %016llX size %llu %s", b.stage, b.reg,
+                    (void*)cb, (unsigned long long)va, (unsigned long long)size,
                     windowed ? L"(window into game ring)" : L"(whole buffer)");
             } else {
-                _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   %cb%u = NULL DESCRIPTOR (reads as zero) cb=%p",
-                    b.stage, b.reg, (void*)cb);
+                _snwprintf_s(line, _TRUNCATE, L"  LEAF   %cb%u = NULL DESCRIPTOR (reads as zero) cb=%p", b.stage, b.reg,
+                    (void*)cb);
             }
-            ObserveCommand(line);
+            g_command_observer.Observe(line);
         } else if (b.kind == 'u') {
             ID3D11UnorderedAccessView* v = (b.reg < kMaxUAV) ? st.uav[b.reg] : nullptr;
-            WrapView*                  wv = AsWrapView(v);
+            WrapView* wv = AsWrapView(v);
             if (wv && wv->wres) {
                 // The D3D11 desc lives on the concrete WrapViewT, and `kind` is what says which one it is.
                 D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
                 if (wv->kind == 'u') ud = static_cast<const WrapUAV&>(*wv).desc;
-                _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   %cu%u = view %p res %p fmt %u first %u elems %u state %u",
-                    b.stage, b.reg, (void*)v, (void*)wv->wres->dx12,
-                    (unsigned)ud.Format,
-                    (unsigned)ud.Buffer.FirstElement,
-                    (unsigned)ud.Buffer.NumElements,
-                    (unsigned)wv->wres->state);
+                _snwprintf_s(line, _TRUNCATE, L"  LEAF   %cu%u = view %p res %p fmt %u first %u elems %u state %u",
+                    b.stage, b.reg, (void*)v, (void*)wv->wres->dx12, (unsigned)ud.Format,
+                    (unsigned)ud.Buffer.FirstElement, (unsigned)ud.Buffer.NumElements, (unsigned)wv->wres->state);
             } else {
-                _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   %cu%u = NULL DESCRIPTOR (writes discarded) uav=%p",
-                    b.stage, b.reg, (void*)v);
+                _snwprintf_s(line, _TRUNCATE, L"  LEAF   %cu%u = NULL DESCRIPTOR (writes discarded) uav=%p", b.stage,
+                    b.reg, (void*)v);
             }
-            ObserveCommand(line);
+            g_command_observer.Observe(line);
         } else if (b.kind == 't') {
             ID3D11ShaderResourceView* v = (si >= 0 && b.reg < kMaxSRV) ? st.srv[si][b.reg] : nullptr;
-            WrapView*                 wv = AsWrapView(v);
-            _snwprintf_s(line, _TRUNCATE,
-                L"  LEAF   %ct%u = %s view %p res %p",
-                b.stage, b.reg, (wv && wv->wres) ? L"srv" : L"NULL DESCRIPTOR (reads as zero)",
-                (void*)v, (void*)((wv && wv->wres) ? wv->wres->dx12 : nullptr));
-            ObserveCommand(line);
+            WrapView* wv = AsWrapView(v);
+            _snwprintf_s(line, _TRUNCATE, L"  LEAF   %ct%u = %s view %p res %p", b.stage, b.reg,
+                (wv && wv->wres) ? L"srv" : L"NULL DESCRIPTOR (reads as zero)", (void*)v,
+                (void*)((wv && wv->wres) ? wv->wres->dx12 : nullptr));
+            g_command_observer.Observe(line);
         }
     }
 }
@@ -1766,19 +1766,51 @@ static uint64_t ContentHash(InputLayoutDesc* l)
     return l->content_hash;
 }
 
-ID3D12PipelineState* GetGraphicsPso(ID3D12RootSignature* rs, DXGI_FORMAT rt_fmt[8], UINT num_rt,
-    DXGI_FORMAT ds_fmt)
+static ShaderCode* RasterizedStage(PipeState& st)
 {
-    PipeState&  st = State();
+    for (const int i : { 3, 2, 0 }) {
+        ShaderCode* s = AsShaderCode(st.shader[i]);
+        if (s && !s->code.empty()) return s;
+    }
+    return nullptr;
+}
+
+// The pixel shader as D3D12 must be given it to read what D3D11 reads after `up` (LinkPixelInputs).
+static const std::vector<uint8_t>& LinkedPixelCode(ShaderCode* up, ShaderCode* ps)
+{
+    if (!up) return ps->code;
+    static std::mutex m;
+    static std::unordered_map<uint64_t, std::vector<uint8_t>> rewritten; // (up, ps) -> the rewrite; empty = none
+    const uint64_t up_hash = ContentHash(up);
+    const uint64_t key = Fnv1a64(&up_hash, sizeof up_hash, ContentHash(ps));
+    std::lock_guard l(m);
+    auto [it, fresh] = rewritten.try_emplace(key);
+    if (fresh) {
+        std::string note;
+        const PixelLink r =
+            LinkPixelInputs(up->code.data(), up->code.size(), ps->code.data(), ps->code.size(), it->second, note);
+        if (r == PixelLink::kRewritten)
+            logger::write("PORT: ps (%zu B) relinked to its %cs (%zu B) register by register, as D3D11 links them:%s",
+                ps->code.size(), up->stage, up->code.size(), note.c_str());
+        else if (r == PixelLink::kImpossible)
+            logger::write("PORT: ps (%zu B) does not link to its %cs (%zu B) on D3D12 and cannot be relinked: %s",
+                ps->code.size(), up->stage, up->code.size(), note.c_str());
+    }
+    return it->second.empty() ? ps->code : it->second;
+}
+
+ID3D12PipelineState* GetGraphicsPso(ID3D12RootSignature* rs, DXGI_FORMAT rt_fmt[8], UINT num_rt, DXGI_FORMAT ds_fmt)
+{
+    PipeState& st = State();
     ShaderCode* vs = AsShaderCode(st.shader[0]);
     ShaderCode* hs = AsShaderCode(st.shader[1]);
     ShaderCode* ds = AsShaderCode(st.shader[2]);
     ShaderCode* gs = AsShaderCode(st.shader[3]);
     ShaderCode* ps = AsShaderCode(st.shader[4]);
     if (!vs || vs->code.empty()) return nullptr; // handled by IssueDraw's state-only path
-    StateDesc*       bl = AsStateDesc(st.blend);
-    StateDesc*       ra = AsStateDesc(st.raster);
-    StateDesc*       de = AsStateDesc(st.depth);
+    StateDesc* bl = AsStateDesc(st.blend);
+    StateDesc* ra = AsStateDesc(st.raster);
+    StateDesc* de = AsStateDesc(st.depth);
     InputLayoutDesc* il = AsInputLayout(st.layout);
 
     uint64_t key = Fnv1a64(&rs, sizeof(rs));
@@ -1812,7 +1844,10 @@ ID3D12PipelineState* GetGraphicsPso(ID3D12RootSignature* rs, DXGI_FORMAT rt_fmt[
     if (hs && !hs->code.empty()) pd.HS = { hs->code.data(), hs->code.size() };
     if (ds && !ds->code.empty()) pd.DS = { ds->code.data(), ds->code.size() };
     if (gs && !gs->code.empty()) pd.GS = { gs->code.data(), gs->code.size() };
-    if (ps && !ps->code.empty()) pd.PS = { ps->code.data(), ps->code.size() };
+    if (ps && !ps->code.empty()) {
+        const std::vector<uint8_t>& code = LinkedPixelCode(RasterizedStage(st), ps);
+        pd.PS = { code.data(), code.size() };
+    }
     FillBlend(pd.BlendState, bl ? &bl->blend : nullptr);
     FillRaster(pd.RasterizerState, ra ? &ra->raster : nullptr);
     FillDepth(pd.DepthStencilState, de ? &de->depth : nullptr, ds_fmt != DXGI_FORMAT_UNKNOWN);
@@ -1825,25 +1860,66 @@ ID3D12PipelineState* GetGraphicsPso(ID3D12RootSignature* rs, DXGI_FORMAT rt_fmt[
     if (il && !il->elems.empty()) pd.InputLayout = { il->elems.data(), (UINT)il->elems.size() };
 
     ID3D12PipelineState* pso = nullptr;
-    const auto           t0 = std::chrono::steady_clock::now();
-    HRESULT              hr = H().dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    const auto t0 = std::chrono::steady_clock::now();
+    HRESULT hr = H().dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
-        logger::write("PORT: graphics PSO FAILED hr=%08lX (vs=%zu ps=%zu gs=%zu rt=%u fmt=%d ds=%d)",
-            (unsigned long)hr, vs->code.size(), ps ? ps->code.size() : 0,
-            gs ? gs->code.size() : 0, num_rt, (int)rt_fmt[0], (int)ds_fmt);
+        logger::write("PORT: graphics PSO FAILED hr=%08lX (vs=%zu ps=%zu gs=%zu rt=%u fmt=%d ds=%d)", (unsigned long)hr,
+            vs->code.size(), ps ? ps->code.size() : 0, gs ? gs->code.size() : 0, num_rt, (int)rt_fmt[0], (int)ds_fmt);
         H().psos[key] = nullptr; // remember the failure; retrying every draw would spam and stall
         return nullptr;
     }
     H().psos[key] = pso;
-    logger::write("PORT: graphics PSO built (vs%s%s%s, %u RT fmt=%d ds=%d) in %.1f ms",
-        ps ? "+ps" : "", gs ? "+gs" : "", (hs || ds) ? "+tess" : "",
-        num_rt, (int)rt_fmt[0], (int)ds_fmt, logger::ms_since(t0));
+    logger::write("PORT: graphics PSO built (vs%s%s%s, %u RT fmt=%d ds=%d) in %.1f ms", ps ? "+ps" : "",
+        gs ? "+gs" : "", (hs || ds) ? "+tess" : "", num_rt, (int)rt_fmt[0], (int)ds_fmt, logger::ms_since(t0));
     return pso;
+}
+
+// The game's pipeline at this draw with the list's shaders in its place (GameBindings::pipeline).
+static ID3D12PipelineState* GameStatePso(const Dx12Bridge& b, ID3D12RootSignature* rs, const DXGI_FORMAT* rt_fmt,
+    UINT bound_rt, bool own_targets, DXGI_FORMAT ds_fmt)
+{
+    PipeState& st = State();
+    ModPipeline mp;
+    uint64_t key = Fnv1a64(&rs, sizeof(rs));
+    for (int i = 0; i < 5; ++i) {
+        ShaderCode* s = AsShaderCode(st.shader[i]);
+        const uint64_t h = ContentHash(s);
+        key = Fnv1a64(&h, sizeof(h), key);
+        if (!s || s->code.empty()) continue;
+        const std::vector<uint8_t>& code = i == 4 ? LinkedPixelCode(RasterizedStage(st), s) : s->code;
+        mp.code[i] = code.data();
+        mp.code_size[i] = code.size();
+    }
+    StateDesc* bl = AsStateDesc(st.blend);
+    StateDesc* ra = AsStateDesc(st.raster);
+    StateDesc* de = AsStateDesc(st.depth);
+    InputLayoutDesc* il = AsInputLayout(st.layout);
+    for (const uint64_t h : { ContentHash(bl), ContentHash(ra), ContentHash(de), ContentHash(il) })
+        key = Fnv1a64(&h, sizeof(h), key);
+    if (bl) mp.blend = &bl->blend;
+    if (ra) mp.raster = &ra->raster;
+    if (de) mp.depth = &de->depth;
+    if (il && !il->elems.empty()) {
+        mp.layout = il->elems.data();
+        mp.layout_count = (unsigned)il->elems.size();
+    }
+    mp.root_signature = rs;
+    mp.own_targets = own_targets;
+    if (own_targets) {
+        mp.num_rt = bound_rt;
+        for (UINT i = 0; i < bound_rt; ++i) mp.rt_format[i] = rt_fmt[i];
+        mp.ds_format = ds_fmt;
+        key = Fnv1a64(mp.rt_format, sizeof mp.rt_format, key);
+        key = Fnv1a64(&mp.num_rt, sizeof mp.num_rt, key);
+        key = Fnv1a64(&mp.ds_format, sizeof mp.ds_format, key);
+    }
+    mp.key = key | 1ull;
+    return b.game.pipeline(b.game.user, mp);
 }
 
 ID3D12PipelineState* GetComputePso(ID3D12RootSignature* rs)
 {
-    PipeState&  st = State();
+    PipeState& st = State();
     ShaderCode* cs = AsShaderCode(st.shader[5]);
     if (!cs || cs->code.empty()) return nullptr; // reported by IssueDispatch, which knows it is a no-op
     uint64_t key = Fnv1a64(&rs, sizeof(rs));
@@ -1860,8 +1936,8 @@ ID3D12PipelineState* GetComputePso(ID3D12RootSignature* rs)
     cd.pRootSignature = rs;
     cd.CS = { cs->code.data(), cs->code.size() };
     ID3D12PipelineState* pso = nullptr;
-    const auto           t0 = std::chrono::steady_clock::now();
-    HRESULT              hr = H().dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso));
+    const auto t0 = std::chrono::steady_clock::now();
+    HRESULT hr = H().dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
         logger::write("PORT: compute PSO FAILED hr=%08lX (%zu bytes)", (unsigned long)hr, cs->code.size());
         H().psos[key] = nullptr;
@@ -1875,9 +1951,9 @@ ID3D12PipelineState* GetComputePso(ID3D12RootSignature* rs)
 
 } // namespace
 
-static std::atomic<int>                g_present_draw_probe{ 0 };
+static std::atomic<int> g_present_draw_probe{ 0 };
 static std::atomic<unsigned long long> g_own_list_draws{ 0 };
-unsigned long long                     OwnListDrawsIssued()
+unsigned long long OwnListDrawsIssued()
 {
     return g_own_list_draws.load(std::memory_order_relaxed);
 }
@@ -1900,16 +1976,16 @@ void PresentDrawProbeFrameDone()
 static bool IssueBail(bool draw, const char* gate, const void* shader, UINT a, UINT b, UINT c)
 {
     if (!logger::enabled(1)) return false;
-    constexpr size_t   kRecent = 16;
-    static std::mutex  m;
+    constexpr size_t kRecent = 16;
+    static std::mutex m;
     static std::string recent[2][kRecent];
-    static size_t      next[2] = {};
-    char               sig[192];
+    static size_t next[2] = {};
+    char sig[192];
     _snprintf_s(sig, sizeof(sig), _TRUNCATE, "%s|%p|%u,%u,%u", gate, shader, a, b, c);
     bool changed = true;
     {
         std::lock_guard<std::mutex> l(m);
-        std::string*                ring = recent[draw ? 1 : 0];
+        std::string* ring = recent[draw ? 1 : 0];
         for (size_t i = 0; i < kRecent && changed; ++i)
             if (ring[i] == sig) changed = false;
         if (changed) {
@@ -1918,8 +1994,8 @@ static bool IssueBail(bool draw, const char* gate, const void* shader, UINT a, U
         }
     }
     if (draw && (changed || PresentDrawProbeArmed()))
-        logger::write("DRAW-BAIL %-18s vs=%p count=%u start=%u inst=%u own_list=%d -- NO Draw issued",
-            gate, shader, a, b, c, (int)GetDx12Bridge().own_list);
+        logger::write("DRAW-BAIL %-18s vs=%p count=%u start=%u inst=%u own_list=%d -- NO Draw issued", gate, shader, a,
+            b, c, (int)GetDx12Bridge().own_list);
     else if (!draw && changed)
         logger::write("DISPATCH-BAIL %-14s cs=%p groups=%u,%u,%u -- NO Dispatch issued", gate, shader, a, b, c);
     return false;
@@ -1937,44 +2013,39 @@ bool UploadPendingFor(ID3D11Resource* res)
     return false;
 }
 
-static void TracePresentDraw(const Dx12Bridge& b, const RootSigEntry& rse, bool indexed, UINT count,
-    UINT start, UINT instances, UINT num_rt, DXGI_FORMAT rt0_fmt,
-    ID3D12Resource* rt0, unsigned rt0_tracked, UINT rtv_declared,
+static void TracePresentDraw(const Dx12Bridge& b, const RootSigEntry& rse, bool indexed, UINT count, UINT start,
+    UINT instances, UINT num_rt, DXGI_FORMAT rt0_fmt, ID3D12Resource* rt0, unsigned rt0_tracked, UINT rtv_declared,
     DXGI_FORMAT ds_fmt, int vp_mode, const D3D12_VIEWPORT& vp, const D3D12_RECT& sc)
 {
     PipeState& st = State();
     logger::write("PRESENTDRAW draw tid=%lu cl=%p own_list=%d bb=%p | vs=%p hs=%p ds=%p gs=%p ps=%p "
                   "topo=%u %s count=%u start=%u inst=%u",
-        GetCurrentThreadId(), (void*)b.cl, (int)b.own_list, (void*)b.back_buffer,
-        (void*)st.shader[0], (void*)st.shader[1], (void*)st.shader[2], (void*)st.shader[3],
-        (void*)st.shader[4], (unsigned)st.topology, indexed ? "indexed" : "plain",
-        count, start, instances);
+        GetCurrentThreadId(), (void*)b.cl, (int)b.own_list, (void*)b.back_buffer, (void*)st.shader[0],
+        (void*)st.shader[1], (void*)st.shader[2], (void*)st.shader[3], (void*)st.shader[4], (unsigned)st.topology,
+        indexed ? "indexed" : "plain", count, start, instances);
     logger::write("PRESENTDRAW   rt=%u (declared %u) rt0=%p is_bb=%d fmt=%d tracked=0x%x observed=0x%x "
                   "ds_fmt=%d | vp %s %.1f,%.1f %.1fx%.1f depth %.2f..%.2f | scissor %ld,%ld..%ld,%ld",
-        num_rt, rtv_declared, (void*)rt0, (int)(rt0 && rt0 == b.back_buffer), (int)rt0_fmt,
-        rt0_tracked, rt0 ? QueryResourceState(rt0) : 0u, (int)ds_fmt,
-        vp_mode == 1 ? "SET" : (vp_mode == 2 ? "INHERITED+scissor" : "INHERITED"),
-        vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth,
-        (long)sc.left, (long)sc.top, (long)sc.right, (long)sc.bottom);
-    const StateDesc*                      bl = AsStateDesc(st.blend);
-    const StateDesc*                      ra = AsStateDesc(st.raster);
-    const StateDesc*                      de = AsStateDesc(st.depth);
+        num_rt, rtv_declared, (void*)rt0, (int)(rt0 && rt0 == b.back_buffer), (int)rt0_fmt, rt0_tracked,
+        rt0 ? QueryResourceState(rt0) : 0u, (int)ds_fmt,
+        vp_mode == 1 ? "SET" : (vp_mode == 2 ? "INHERITED+scissor" : "INHERITED"), vp.TopLeftX, vp.TopLeftY, vp.Width,
+        vp.Height, vp.MinDepth, vp.MaxDepth, (long)sc.left, (long)sc.top, (long)sc.right, (long)sc.bottom);
+    const StateDesc* bl = AsStateDesc(st.blend);
+    const StateDesc* ra = AsStateDesc(st.raster);
+    const StateDesc* de = AsStateDesc(st.depth);
     const D3D11_RENDER_TARGET_BLEND_DESC* rtb = bl ? &bl->blend.RenderTarget[0] : nullptr;
     logger::write("PRESENTDRAW   blend %s en=%d src=%d dst=%d op=%d srcA=%d dstA=%d mask=0x%x a2c=%d "
                   "factor=%.2f,%.2f,%.2f,%.2f | raster %s fill=%d cull=%d ccw=%d clip=%d scissor=%d | "
                   "depth %s en=%d func=%d | sample_mask=0x%x",
         bl ? "SET" : "default", rtb ? (int)rtb->BlendEnable : -1, rtb ? (int)rtb->SrcBlend : -1,
-        rtb ? (int)rtb->DestBlend : -1, rtb ? (int)rtb->BlendOp : -1,
-        rtb ? (int)rtb->SrcBlendAlpha : -1, rtb ? (int)rtb->DestBlendAlpha : -1,
-        rtb ? (unsigned)rtb->RenderTargetWriteMask : 0xFFu, bl ? (int)bl->blend.AlphaToCoverageEnable : -1,
-        st.blend_factor[0], st.blend_factor[1], st.blend_factor[2], st.blend_factor[3],
-        ra ? "SET" : "default", ra ? (int)ra->raster.FillMode : -1, ra ? (int)ra->raster.CullMode : -1,
-        ra ? (int)ra->raster.FrontCounterClockwise : -1, ra ? (int)ra->raster.DepthClipEnable : -1,
-        ra ? (int)ra->raster.ScissorEnable : -1,
-        de ? "SET" : "default", de ? (int)de->depth.DepthEnable : -1, de ? (int)de->depth.DepthFunc : -1,
-        (unsigned)st.sample_mask);
+        rtb ? (int)rtb->DestBlend : -1, rtb ? (int)rtb->BlendOp : -1, rtb ? (int)rtb->SrcBlendAlpha : -1,
+        rtb ? (int)rtb->DestBlendAlpha : -1, rtb ? (unsigned)rtb->RenderTargetWriteMask : 0xFFu,
+        bl ? (int)bl->blend.AlphaToCoverageEnable : -1, st.blend_factor[0], st.blend_factor[1], st.blend_factor[2],
+        st.blend_factor[3], ra ? "SET" : "default", ra ? (int)ra->raster.FillMode : -1,
+        ra ? (int)ra->raster.CullMode : -1, ra ? (int)ra->raster.FrontCounterClockwise : -1,
+        ra ? (int)ra->raster.DepthClipEnable : -1, ra ? (int)ra->raster.ScissorEnable : -1, de ? "SET" : "default",
+        de ? (int)de->depth.DepthEnable : -1, de ? (int)de->depth.DepthFunc : -1, (unsigned)st.sample_mask);
     std::string binds;
-    char        tmp[256];
+    char tmp[256];
     for (const RootBind& rb : rse.binds) {
         const int si = StageIndex(rb.stage);
         tmp[0] = 0;
@@ -1984,10 +2055,10 @@ static void TracePresentDraw(const Dx12Bridge& b, const RootSigEntry& rse, bool 
                 _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, " %ct%u=NULL", rb.stage, rb.reg);
             } else {
                 const D3D12_RESOURCE_DESC d = wv->wres->dx12->GetDesc();
-                _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, " %ct%u=%p(%llux%u f%d m%u st=0x%x%s%s)", rb.stage,
-                    rb.reg, (void*)wv->wres->dx12, (unsigned long long)d.Width, (unsigned)d.Height,
-                    (int)d.Format, (unsigned)d.MipLevels, (unsigned)wv->wres->state,
-                    UploadPendingFor(wv->res) ? " PENDING" : "", wv->cpu.ptr ? "" : " NO-DESCRIPTOR");
+                _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, " %ct%u=%p(%llux%u f%d m%u st=0x%x%s%s)", rb.stage, rb.reg,
+                    (void*)wv->wres->dx12, (unsigned long long)d.Width, (unsigned)d.Height, (int)d.Format,
+                    (unsigned)d.MipLevels, (unsigned)wv->wres->state, UploadPendingFor(wv->res) ? " PENDING" : "",
+                    wv->cpu.ptr ? "" : " NO-DESCRIPTOR");
             }
         } else if (rb.kind == 'b') {
             ID3D11Buffer* cb = (si >= 0 && rb.reg < kMaxCB) ? st.cb[si][rb.reg] : nullptr;
@@ -2012,8 +2083,8 @@ static void TracePresentDraw(const Dx12Bridge& b, const RootSigEntry& rse, bool 
         if (!wv || !wv->wres || wv->wres->shadow.size() < 16 || wv->wres->shadow.size() > 65536) continue;
         const size_t n = wv->wres->shadow.size() / 16;
         const float* f = reinterpret_cast<const float*>(wv->wres->shadow.data());
-        std::string  vals;
-        unsigned     shown = 0;
+        std::string vals;
+        unsigned shown = 0;
         for (size_t i = 0; i < n && shown < 48; ++i) {
             const float* p = f + i * 4;
             if (!p[0] && !p[1] && !p[2] && !p[3]) continue;
@@ -2021,24 +2092,35 @@ static void TracePresentDraw(const Dx12Bridge& b, const RootSigEntry& rse, bool 
             vals += tmp;
             ++shown;
         }
-        logger::write("PRESENTDRAW   %ct%u shadow: %zu float4, uploaded-matches-shadow=%d, non-zero:%s",
-            rb.stage, rb.reg, n,
+        logger::write("PRESENTDRAW   %ct%u shadow: %zu float4, uploaded-matches-shadow=%d, non-zero:%s", rb.stage,
+            rb.reg, n,
             (int)(wv->wres->uploaded.size() == wv->wres->shadow.size() &&
                 memcmp(wv->wres->uploaded.data(), wv->wres->shadow.data(), wv->wres->shadow.size()) == 0),
             vals.empty() ? " (all zero)" : vals.c_str());
     }
 }
 
-bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
-    UINT instances, UINT start_instance)
+// A vertex or index buffer the list bound that has no DX12 object yet: the draw would read zeros where its mesh is.
+static bool GeometryUnmet(bool indexed)
+{
+    PipeState& st = State();
+    for (UINT i = 0; i < st.num_vb && i < kMaxVB; ++i) {
+        const WrapResource* wr = AsWrapResource(st.vb[i]);
+        if (wr && !wr->dx12) return true;
+    }
+    const WrapResource* wr = indexed ? AsWrapResource(st.ib) : nullptr;
+    return wr && !wr->dx12;
+}
+
+bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex, UINT instances, UINT start_instance)
 {
     PROF(PL_IssueDraw);
-    Dx12Bridge  b = GetDx12Bridge(); // by value -- the same window as IssueDispatch below
+    Dx12Bridge b = GetDx12Bridge(); // by value -- the same window as IssueDispatch below
     const void* vs_dbg = (const void*)State().shader[0];
     if (!b.cl || !b.device) {
         NotImplOnce("IssueDraw (no DX12 command list bound)");
-        return IssueBail(true, !b.cl ? (b.device ? "no-cmdlist" : "no-cl+no-dev") : "no-device",
-            vs_dbg, count, start, instances);
+        return IssueBail(
+            true, !b.cl ? (b.device ? "no-cmdlist" : "no-cl+no-dev") : "no-device", vs_dbg, count, start, instances);
     }
     BridgeNoteIssue(b.cl, false, count, start, instances); // X30: is this the list the opening thread named?
     PayGameState();
@@ -2053,9 +2135,9 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
             once = true;
             logger::write("ISSUEDRAW branch: vs=%d blend=%d depth=%d raster=%d topology=%u count=%u "
                           "(vs!=0 takes the FULL-PSO path; state-only needs vs==0)",
-                (int)(AsShaderCode(st.shader[0]) != nullptr),
-                (int)(AsStateDesc(st.blend) != nullptr), (int)(AsStateDesc(st.depth) != nullptr),
-                (int)(AsStateDesc(st.raster) != nullptr), (unsigned)st.topology, count);
+                (int)(AsShaderCode(st.shader[0]) != nullptr), (int)(AsStateDesc(st.blend) != nullptr),
+                (int)(AsStateDesc(st.depth) != nullptr), (int)(AsStateDesc(st.raster) != nullptr),
+                (unsigned)st.topology, count);
         }
     }
 
@@ -2070,15 +2152,17 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
                     "varying the GAME's PSO from here is not implemented (docs\\PORT-TRANSITIONS-REMAINING.md)");
         return IssueBail(true, "state-only-not-implemented", vs_dbg, count, start, instances);
     }
+    const bool in_game_state = !b.own_list && b.game.pipeline;
 
-    DXGI_FORMAT                 rt_fmt[8] = {};
+    DXGI_FORMAT rt_fmt[8] = {};
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_h[8] = {};
-    UINT                        num_rt = 0;
-    ID3D12Resource*             probe_rt0 = nullptr; // PRESENTDRAW: the first real target, and its state BEFORE ours
-    unsigned                    probe_rt0_state = 0;
+    UINT num_rt = 0;
+    ID3D12Resource* probe_rt0 = nullptr; // PRESENTDRAW: the first real target, and its state BEFORE ours
+    unsigned probe_rt0_state = 0;
     for (UINT i = 0; i < st.num_rtv && i < kMaxRTV; ++i) {
         WrapView* wv = AsWrapView(st.rtv[i]);
-        if (!wv || !wv->wres || !wv->wres->dx12 || !wv->cpu.ptr) continue; // a published game target has no descriptor: inherited
+        if (!wv || !wv->wres || !wv->wres->dx12 || !wv->cpu.ptr)
+            continue; // a published game target has no descriptor: inherited
         if (!num_rt) {
             probe_rt0 = wv->wres->dx12;
             probe_rt0_state = (unsigned)wv->wres->state;
@@ -2096,7 +2180,7 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
         ds_fmt = dsv->wres->dx12->GetDesc().Format;
     }
     const UINT bound_rt = num_rt;
-    if (!num_rt) {
+    if (!num_rt && !in_game_state) {
         if (b.rt_format == DXGI_FORMAT_UNKNOWN) {
             NotImplOnce("IssueDraw with no render target: the addon must publish Dx12Bridge::rt_format");
             return IssueBail(true, "no-rt-no-rt_format", vs_dbg, count, start, instances);
@@ -2106,43 +2190,52 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
         if (ds_fmt == DXGI_FORMAT_UNKNOWN) ds_fmt = b.ds_format;
     }
 
-    if (st.topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) {
+    if (st.topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED && !in_game_state) {
         NotImplOnce("IssueDraw with no topology set: on DX11 the context keeps the game's, but a DX12 PSO "
                     "must state one -- the section needs `topology = ...`");
         return IssueBail(true, "no-topology", vs_dbg, count, start, instances);
     }
 
     std::vector<RootBind> want;
-    UINT                  n_res = 0;
-    UINT                  n_samp = 0;
-    if (!CollectBinds(false, want, n_res, n_samp)) return IssueBail(true, "CollectBinds", vs_dbg, count, start, instances);
+    UINT n_res = 0;
+    UINT n_samp = 0;
+    if (!CollectBinds(false, want, n_res, n_samp))
+        return IssueBail(true, "CollectBinds", vs_dbg, count, start, instances);
     RootSigEntry* rse = GetRootSig(want, false);
     if (!rse) return IssueBail(true, "GetRootSig", vs_dbg, count, start, instances);
-    ID3D12PipelineState* pso = GetGraphicsPso(rse->rs, rt_fmt, num_rt, ds_fmt);
-    if (!pso) return IssueBail(true, "GetGraphicsPso", vs_dbg, count, start, instances);
+    if (in_game_state && GeometryUnmet(indexed))
+        return IssueBail(true, "geometry-without-dx12-object", vs_dbg, count, start, instances);
+    ID3D12PipelineState* pso = in_game_state
+        ? GameStatePso(b, rse->rs, rt_fmt, bound_rt, bound_rt || dsv, dsv ? ds_fmt : DXGI_FORMAT_UNKNOWN)
+        : GetGraphicsPso(rse->rs, rt_fmt, num_rt, ds_fmt);
+    if (!pso)
+        return IssueBail(true, in_game_state ? "GameStatePso" : "GetGraphicsPso", vs_dbg, count, start, instances);
 
     b.cl->SetPipelineState(pso);
     b.cl->SetGraphicsRootSignature(rse->rs);
+    g_touched_root_sig = true;
     if (!BindDescriptors(b.cl, *rse, false)) return IssueBail(true, "BindDescriptors", vs_dbg, count, start, instances);
 
-    if (bound_rt || dsv)
+    if (bound_rt || dsv) {
         b.cl->OMSetRenderTargets(bound_rt, bound_rt ? rtv_h : nullptr, FALSE, dsv ? &dsv->cpu : nullptr);
+        g_touched_rt = true;
+    }
 
-    int            probe_vp_mode = 0; // PRESENTDRAW: 0 inherited, 1 set, 2 inherited + scissor set
+    int probe_vp_mode = 0; // PRESENTDRAW: 0 inherited, 1 set, 2 inherited + scissor set
     D3D12_VIEWPORT probe_vp{};
-    D3D12_RECT     probe_sc{};
+    D3D12_RECT probe_sc{};
     if (st.has_viewport || b.own_list || !g_inherit_game_viewport) {
         D3D12_VIEWPORT vp = st.has_viewport
-            ? D3D12_VIEWPORT{ st.viewport.TopLeftX, st.viewport.TopLeftY, st.viewport.Width,
-                  st.viewport.Height, st.viewport.MinDepth, st.viewport.MaxDepth }
+            ? D3D12_VIEWPORT{ st.viewport.TopLeftX, st.viewport.TopLeftY, st.viewport.Width, st.viewport.Height,
+                  st.viewport.MinDepth, st.viewport.MaxDepth }
             : D3D12_VIEWPORT{ 0.0f, 0.0f, (float)b.rt_width, (float)b.rt_height, 0.0f, 1.0f };
         probe_vp = vp;
         if (vp.Width > 0.0f && vp.Height > 0.0f) {
             b.cl->RSSetViewports(1, &vp);
             D3D12_RECT sc = st.has_scissor
                 ? D3D12_RECT{ st.scissor.left, st.scissor.top, st.scissor.right, st.scissor.bottom }
-                : D3D12_RECT{ (LONG)vp.TopLeftX, (LONG)vp.TopLeftY,
-                      (LONG)(vp.TopLeftX + vp.Width), (LONG)(vp.TopLeftY + vp.Height) };
+                : D3D12_RECT{ (LONG)vp.TopLeftX, (LONG)vp.TopLeftY, (LONG)(vp.TopLeftX + vp.Width),
+                      (LONG)(vp.TopLeftY + vp.Height) };
             b.cl->RSSetScissorRects(1, &sc);
             g_touched_viewport = true; // and ONLY now does the restore have anything to put back
             probe_vp_mode = 1;
@@ -2156,7 +2249,8 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
         probe_sc = sc;
     }
 
-    b.cl->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)st.topology);
+    if (st.topology != D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
+        b.cl->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)st.topology);
     if (AsStateDesc(st.blend)) {
         b.cl->OMSetBlendFactor(st.blend_factor);
         g_touched_blend = true;
@@ -2168,17 +2262,17 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
 
     if (st.num_vb) {
         D3D12_VERTEX_BUFFER_VIEW vbv[kMaxVB] = {};
-        UINT                     n = 0;
-        for (UINT i = 0; i < st.num_vb && i < kMaxVB; ++i) {
+        const UINT n = (std::min)(st.num_vb, (UINT)kMaxVB);
+        for (UINT i = 0; i < n; ++i) {
             WrapResource* wr = AsWrapResource(st.vb[i]);
-            if (!wr || !wr->dx12) continue;
+            if (!wr || !wr->dx12) continue; // a null view: the slot reads zeros, as an unbound DX11 slot does
             Transition(b.cl, wr, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-            vbv[n].BufferLocation = wr->dx12->GetGPUVirtualAddress() + st.vb_offset[i];
-            vbv[n].SizeInBytes = (UINT)(wr->dx12->GetDesc().Width - st.vb_offset[i]);
-            vbv[n].StrideInBytes = st.vb_stride[i];
-            ++n;
+            vbv[i].BufferLocation = wr->dx12->GetGPUVirtualAddress() + st.vb_offset[i];
+            vbv[i].SizeInBytes = (UINT)(wr->dx12->GetDesc().Width - st.vb_offset[i]);
+            vbv[i].StrideInBytes = st.vb_stride[i];
         }
-        if (n) b.cl->IASetVertexBuffers(0, n, vbv);
+        b.cl->IASetVertexBuffers(0, n, vbv);
+        g_touched_ia = true;
     }
     if (indexed) {
         WrapResource* wr = AsWrapResource(st.ib);
@@ -2187,22 +2281,21 @@ bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
             D3D12_INDEX_BUFFER_VIEW ibv{};
             ibv.BufferLocation = wr->dx12->GetGPUVirtualAddress() + st.ib_offset;
             ibv.SizeInBytes = (UINT)(wr->dx12->GetDesc().Width - st.ib_offset);
-            ibv.Format = (st.ib_format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R32_UINT
-                                                               : st.ib_format;
+            ibv.Format = (st.ib_format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R32_UINT : st.ib_format;
             b.cl->IASetIndexBuffer(&ibv);
+            g_touched_ia = true;
         }
     }
 
     if (PresentDrawProbeArmed() && logger::enabled(1))
-        TracePresentDraw(b, *rse, indexed, count, start, instances ? instances : 1, num_rt, rt_fmt[0],
-            probe_rt0, probe_rt0_state, st.num_rtv, ds_fmt, probe_vp_mode, probe_vp, probe_sc);
+        TracePresentDraw(b, *rse, indexed, count, start, instances ? instances : 1, num_rt, rt_fmt[0], probe_rt0,
+            probe_rt0_state, st.num_rtv, ds_fmt, probe_vp_mode, probe_vp, probe_sc);
 
     g_owed_uav.Flush(b.cl);
-    const int   gt = g_gpu_timer.Begin(b.cl, b.own_list ? GT_PresentDraw : GT_IssueDraw);
+    const int gt = g_gpu_timer.Begin(b.cl, b.own_list ? GT_PresentDraw : GT_IssueDraw);
     void* const hp = HotPath::GpuBracketBegin(b.cl, b.own_list ? GT_PresentDraw : GT_IssueDraw);
     if (indexed)
-        b.cl->DrawIndexedInstanced(count, instances ? instances : 1, start, base_vertex,
-            start_instance);
+        b.cl->DrawIndexedInstanced(count, instances ? instances : 1, start, base_vertex, start_instance);
     else
         b.cl->DrawInstanced(count, instances ? instances : 1, start, start_instance);
     HotPath::GpuBracketEnd(b.cl, hp);
@@ -2221,13 +2314,12 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
 {
     ++g_dispatch_calls;
     PROF(PL_IssueDispatch);
-    Dx12Bridge  b = GetDx12Bridge();
+    Dx12Bridge b = GetDx12Bridge();
     const void* cs_dbg = (const void*)State().shader[5];
     if (!b.cl || !b.device) {
         SkCapRecordBail(cs_dbg, x, y, z, b.device != nullptr);
         NotImplOnce("IssueDispatch (no DX12 command list bound)");
-        return DispatchBail(!b.cl ? (b.device ? "no-cmdlist" : "no-cl+no-dev") : "no-device",
-            cs_dbg, x, y, z);
+        return DispatchBail(!b.cl ? (b.device ? "no-cmdlist" : "no-cl+no-dev") : "no-device", cs_dbg, x, y, z);
     }
     BridgeNoteIssue(b.cl, true, x, y, z); // X30: is this the list the opening thread named?
     RemovalPin::Ours(b.cl, "port-dispatch");
@@ -2240,8 +2332,8 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
     }
 
     std::vector<RootBind> want;
-    UINT                  n_res = 0;
-    UINT                  n_samp = 0;
+    UINT n_res = 0;
+    UINT n_samp = 0;
     if (!CollectBinds(true, want, n_res, n_samp)) return DispatchBail("CollectBinds", cs_dbg, x, y, z);
     RootSigEntry* rse = GetRootSig(want, true);
     if (!rse) return DispatchBail("GetRootSig", cs_dbg, x, y, z);
@@ -2249,9 +2341,9 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
     if (!pso) return DispatchBail("GetComputePso", cs_dbg, x, y, z);
 
     {
-        static std::mutex                           m;
+        static std::mutex m;
         static std::unordered_map<const void*, int> seen;
-        int                                         n;
+        int n;
         {
             std::lock_guard<std::mutex> l(m);
             n = ++seen[cs_dbg];
@@ -2266,19 +2358,19 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
     const bool bd_ok = BindDescriptors(b.cl, *rse, true);
     g_bd_trace = false;
     if (!bd_ok) return DispatchBail("BindDescriptors", cs_dbg, x, y, z);
-    if (ObserverActive()) TraceDispatch(*rse, x, y, z);
+    if (g_command_observer.Active()) TraceDispatch(*rse, x, y, z);
 
     {
-        static std::mutex                           m;
+        static std::mutex m;
         static std::unordered_map<const void*, int> seen;
-        const void*                                 key = (const void*)State().shader[5];
-        int                                         n;
+        const void* key = (const void*)State().shader[5];
+        int n;
         {
             std::lock_guard<std::mutex> l(m);
             n = ++seen[key];
         }
         SkCapBeforeDispatch(b.device, b.cl, x, y, z);
-        const int   gt = g_gpu_timer.Begin(b.cl, b.own_list ? GT_PresentDispatch : GT_IssueDispatch);
+        const int gt = g_gpu_timer.Begin(b.cl, b.own_list ? GT_PresentDispatch : GT_IssueDispatch);
         void* const hp = HotPath::GpuBracketBegin(b.cl, b.own_list ? GT_PresentDispatch : GT_IssueDispatch);
         if (n <= 3) {
             logger::write("DISPATCH-PRE  cs=%p groups=%u,%u,%u (run %d)", key, x, y, z, n);
@@ -2296,10 +2388,10 @@ bool IssueDispatch(UINT x, UINT y, UINT z)
     if (FrameAnalysisArmed()) {
         uint64_t cs_id = 0;
         if (ShaderCode* sc = AsShaderCode(State().shader[5])) {
-            static std::mutex                                      idm;
+            static std::mutex idm;
             static std::unordered_map<const ShaderCode*, uint64_t> ids;
-            std::lock_guard<std::mutex>                            l(idm);
-            auto                                                   it = ids.find(sc);
+            std::lock_guard<std::mutex> l(idm);
+            auto it = ids.find(sc);
             if (it != ids.end())
                 cs_id = it->second;
             else {
@@ -2339,8 +2431,8 @@ unsigned long long DispatchCalls()
     return g_dispatch_calls.load();
 }
 
-static std::mutex                                 g_retire_mtx;
-static std::vector<RetiredBuf>                    g_retired_res; // wrapper resources whose last reference dropped
+static std::mutex g_retire_mtx;
+static std::vector<RetiredBuf> g_retired_res; // wrapper resources whose last reference dropped
 static std::atomic<void (*)(ID3D12Resource* res)> g_retire_observer{ nullptr };
 
 void SetRetireObserver(void (*fn)(ID3D12Resource* res))
@@ -2372,7 +2464,7 @@ void UploadFrameTick()
     std::vector<ID3D12Resource*> gone;
     {
         std::lock_guard<std::mutex> l(g_retire_mtx);
-        size_t                      keep = 0;
+        size_t keep = 0;
         for (size_t i = 0; i < g_retired_res.size(); ++i) {
             if (GpuPassed(g_retired_res[i].stamp))
                 gone.push_back(g_retired_res[i].res);

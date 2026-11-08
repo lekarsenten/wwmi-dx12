@@ -6,8 +6,8 @@
 #include "../mods/layout_registry.h"
 
 struct ReadSlots {
-    bool                     known[64];
-    uint32_t                 len[64];
+    bool known[64];
+    uint32_t len[64];
     std::bitset<kTexScanMax> want[64];
 };
 

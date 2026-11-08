@@ -28,7 +28,7 @@ void PortRegisterKeyBinding(const wchar_t* section, LPCWSTR ini_key, const wchar
     if (listener && section && !wcscmp(ini_key, L"Key")) {
         wstring ns;
         get_section_namespace(section, &ns);
-        listener = MigotoPort::GateKeyListener(listener, ns);
+        listener = MigotoPort::GateKeyListener(listener, ns, section);
     }
     RegisterKeyBinding(ini_key, key_name, listener, auto_repeat, down_delay, up_delay, input_disable_scope);
 }

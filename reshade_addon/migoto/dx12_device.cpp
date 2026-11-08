@@ -1,7 +1,7 @@
 // GENERATED skeleton -- real transitions live in dx12_device_impl.cpp. See dx12_device.h.
 #include "dx12_device.h"
 #include "dx12_context.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 
 namespace MigotoPort {
 

@@ -8,16 +8,16 @@ struct DrawCallInfo;
 
 namespace MigotoPort {
 
-void FrameAnalysisArm(int frames, bool char_only);
+// log_only: log.txt alone, whatever d3dx.ini's analyse_options ask for, and no hold.
+void FrameAnalysisArm(int frames, bool char_only, bool log_only);
 
 // Should this GAME draw be dumped? Our injected draws are always dumped, in both modes.
-bool           FrameAnalysisWantGameDraw(bool claimed, bool char_band);
-bool           FrameAnalysisArmed();
+bool FrameAnalysisWantGameDraw(bool claimed, bool char_band);
+bool FrameAnalysisArmed();
 const wchar_t* FrameAnalysisFolder();
 
-void FrameAnalysisAfterDraw(bool compute, DrawCallInfo* call_info,
-    unsigned long long vs_hash, unsigned long long ps_hash,
-    unsigned long long cs_hash);
+void FrameAnalysisAfterDraw(bool compute, DrawCallInfo* call_info, unsigned long long vs_hash,
+    unsigned long long ps_hash, unsigned long long cs_hash);
 
 unsigned FrameAnalysisDrawIndex();
 

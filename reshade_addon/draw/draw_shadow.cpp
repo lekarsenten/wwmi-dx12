@@ -2,85 +2,152 @@
 // See draw_parts.h.
 #include "../addon_common.h"
 #include "draw_hook.h"
-#include "../mods/claim_state.h"
+#include "../mods/character_recognition.h"
 #include "../hooks/cmd_bind_hooks.h"
 #include "../mods/layout_registry.h"
-#include "draw_ctx.h"
+#include "draw_context.h"
 #include "draw_parts.h"
 #include "draw_inject.h"
 #include <set>
+#include "draw_toggles.h"
+#include "../hooks/command_list_registry.h"
+#include "../instrumentation/diag_arms.h"
+#include "../mods/mod_set.h"
 
 using namespace reshade::api;
 
-static void ShadowRecog(int stage)
+namespace {
+struct ShadowTarget {
+    uint64_t dsv;
+    uint32_t pass;
+    float vx;
+    float vy;
+    float vw;
+    float vh;
+    bool Same(const ShadowTarget& t) const
+    {
+        return t.dsv == dsv && t.pass == pass && t.vx == vx && t.vy == vy && t.vw == vw && t.vh == vh;
+    }
+};
+
+// The depth targets the mod components were cast into this frame, so each is replaced once, and the SHADOWRECOG /
+// SHADOWDRAW watch counters.
+class ShadowCastTracker {
+public:
+    // The pass recognised to the given stage: 0 = a character depth pass, 1 = its mesh claimed, 2 = replaced.
+    void Recognised(int stage);
+    // True = this draw casts the components into the target; else `replaced` says whether an earlier one did.
+    bool Claim(const ShadowTarget& t, bool* replaced);
+    void NoteReplaced(const ShadowTarget& t, bool replaced);
+    bool WatchFresh(uint64_t key); // SHADOWDRAW: a (target, outcome) not logged in the last 120 frames
+
+private:
+    std::mutex mutex_;
+    uint32_t frame_ = 0xFFFFFFFFu;
+    std::vector<std::pair<ShadowTarget, bool>> done_; // depth targets handled this frame, and whether replaced
+    std::mutex recog_mutex_;
+    uint32_t recog_frame_ = 0xFFFFFFFFu;
+    uint32_t recog_frames_ = 0;
+    uint32_t n_pass_ = 0;
+    uint32_t n_mesh_ = 0;
+    uint32_t n_ok_ = 0;
+    std::mutex watch_mutex_;
+    std::set<uint64_t> watch_seen_;
+    uint32_t watch_frame_ = 0xFFFFFFFFu;
+};
+ShadowCastTracker g_shadow_casts;
+
+void ShadowCastTracker::Recognised(int stage)
 {
-    if (g_shadow_recog_watch.load(std::memory_order_relaxed) <= 0) return;
-    static std::mutex m;
-    static uint32_t   frame = 0xFFFFFFFFu;
-    static uint32_t   frames = 0;
-    static uint32_t   n_pass = 0;
-    static uint32_t   n_mesh = 0;
-    static uint32_t   n_ok = 0;
-    std::lock_guard   l(m);
-    if (frame != g_frame_id) {
-        frame = g_frame_id;
-        if (++frames % 120 == 0) {
+    if (g_diag_arms.shadow_recog_watch.load(std::memory_order_relaxed) <= 0) return;
+    std::lock_guard l(recog_mutex_);
+    if (recog_frame_ != g_frame_id) {
+        recog_frame_ = g_frame_id;
+        if (++recog_frames_ % 120 == 0) {
             logger::write("SHADOWRECOG last-120-frames: char-depth-passes=%u meshClaimed=%u fullyRecognised=%u"
                           "  (passes>recognised => some frames fall back to the VANILLA shadow = flicker)",
-                n_pass, n_mesh, n_ok);
-            n_pass = n_mesh = n_ok = 0;
+                n_pass_, n_mesh_, n_ok_);
+            n_pass_ = n_mesh_ = n_ok_ = 0;
         }
     }
-    ++n_pass;
-    if (stage >= 1) ++n_mesh;
-    if (stage >= 2) ++n_ok;
+    ++n_pass_;
+    if (stage >= 1) ++n_mesh_;
+    if (stage >= 2) ++n_ok_;
 }
 
-void RecogniseShadowPass(const DrawArgs& da, BoneRoots& roots, DrawClaim& dc)
+bool ShadowCastTracker::Claim(const ShadowTarget& t, bool* replaced)
 {
+    std::lock_guard l(mutex_);
+    if (frame_ != g_frame_id) {
+        frame_ = g_frame_id;
+        done_.clear();
+    }
+    for (const auto& d : done_)
+        if (d.first.Same(t)) {
+            *replaced = d.second;
+            return false;
+        }
+    done_.emplace_back(t, false);
+    return true;
+}
+
+void ShadowCastTracker::NoteReplaced(const ShadowTarget& t, bool replaced)
+{
+    std::lock_guard l(mutex_);
+    for (auto& d : done_)
+        if (d.first.Same(t)) d.second = replaced;
+}
+
+bool ShadowCastTracker::WatchFresh(uint64_t key)
+{
+    std::lock_guard l(watch_mutex_);
+    if (watch_frame_ != g_frame_id && (g_frame_id % 120) == 0) {
+        watch_frame_ = g_frame_id;
+        watch_seen_.clear();
+    } // re-report every 120 frames so a LATER failure is visible
+    return ProbeArmed() && watch_seen_.size() < 64 && watch_seen_.insert(key).second;
+}
+} // namespace
+
+void RecogniseShadowPass(DrawContext& ctx)
+{
+    const DrawArgs& da = ctx.args;
+    DrawClaim& dc = ctx.claim;
     reshade::api::command_list* const cmd_list = da.cmd_list;
-    const uint32_t                    index_count = da.index_count;
-    const uint32_t                    first_index = da.first_index;
-    const uint64_t                    vs_hash = da.vs_hash;
-    const CmdRT&                      draw_rt = da.draw_rt;
-    MergedComp*&                      mc = dc.mc;
-    MergedComp*&                      depth_claim = dc.depth_claim;
-    int&                              game_cb13_root = dc.cb13_root;
-    int&                              game_cb14_root = dc.cb14_root;
-    bool&                             is_full_shadow_pass = dc.full_shadow;
-    uint64_t&                         shadow_dsv = dc.shadow_dsv;
-    uint32_t&                         shadow_pass = dc.shadow_pass;
-    if (index_count >= 64 && !mc && g_merged_loaded && !g_shadow_vanilla) { // OFF = draw mod silhouette; ON = let game draw vanilla
-        const CmdRT& rt = draw_rt;
+    const uint32_t index_count = da.index_count;
+    const uint32_t first_index = da.first_index;
+    const uint64_t vs_hash = da.vs_hash;
+    if (index_count >= 64 && !dc.mc && Comps().Loaded() &&
+        !g_draw_toggles.shadow_vanilla) { // OFF = draw mod silhouette; ON = let game draw vanilla
+        const CmdRT& rt = da.draw_rt;
         if (rt.rtv_count == 0 && rt.has_dsv) { // depth/shadow caster
-            const int         b4r = roots.Get().b4;
-            const int         b3r = roots.Get().b3;
-            const RootCbvBind b4_cb = roots.Get().b4cb;
+            const int b4r = ctx.roots.Get().b4;
+            const int b3r = ctx.roots.Get().b3;
+            const RootCbvBind b4_cb = ctx.roots.Get().b4cb;
             // The claim recognised this depth draw (its mesh + range) and released it: that is the identity.
-            const bool char_mesh = depth_claim != nullptr;
-            ShadowRecog(char_mesh ? 1 : 0); // 1 = mesh claimed, 0 = not ours (see the counters above)
+            const bool char_mesh = dc.depth_claim != nullptr;
+            g_shadow_casts.Recognised(char_mesh ? 1 : 0); // 1 = mesh claimed, 0 = not ours (see the counters above)
             bool any_mod_onscreen = false;
-            for (int dm = 0; dm < (int)g_geomods.size(); ++dm)
-                if (ModOnScreen(dm) && ModGeomEnabled(dm)) {
+            for (int dm = 0; dm < (int)Mods().Count(); ++dm)
+                if (Mods().OnScreen(dm) && Mods().GeomEnabled(dm)) {
                     any_mod_onscreen = true;
                     break;
                 } // ENABLED mod (a disabled mod keeps its vanilla shadow)
             int shadow_comp = -1;
-            if (depth_claim)
-                shadow_comp = (int)(depth_claim - g_merged_comps.data());
-            else {
-                auto hit = g_first_to_comp.find(FirstCountKey(first_index, index_count));
-                if (hit != g_first_to_comp.end()) shadow_comp = hit->second;
-            }
-            const bool comp_range = shadow_comp >= 0 && ModOnScreen(g_merged_comps[shadow_comp].mod_id) && ModGeomEnabled(g_merged_comps[shadow_comp].mod_id);
+            if (dc.depth_claim)
+                shadow_comp = Comps().IndexOf(dc.depth_claim);
+            else
+                shadow_comp = Comps().SlotOf(first_index, index_count);
+            const bool comp_range = shadow_comp >= 0 && Mods().OnScreen(Comps().At(shadow_comp).mod_id) &&
+                Mods().GeomEnabled(Comps().At(shadow_comp).mod_id);
             if (char_mesh && any_mod_onscreen && comp_range) {
-                is_full_shadow_pass = true;
-                t_x23_shadow = 1;          // X23: the game-draw table's `shadow` column
-                shadow_dsv = rt.dsv;       // which shadow map this pass casts into (per light / per cascade)
-                shadow_pass = rt.pass_gen; // ...and which pass wrote it, in case the target is reused
-                game_cb13_root = b4r;
-                game_cb14_root = -1;
-                ShadowRecog(2); // 2 = fully recognised, this pass will be replaced
+                dc.full_shadow = true;
+                t_x23_shadow = 1; // X23: the game-draw table's `shadow` column
+                dc.shadow_dsv = rt.dsv; // which shadow map this pass casts into (per light / per cascade)
+                dc.shadow_pass = rt.pass_gen; // ...and which pass wrote it, in case the target is reused
+                dc.b4_root = b4r;
+                dc.b3_root = -1;
+                g_shadow_casts.Recognised(2); // 2 = fully recognised, this pass will be replaced
                 if (g_debug) {
                     const uint64_t k = vs_hash ^ ((uint64_t)index_count << 24);
                     if (DiagOnce("DRAW-VSCOUNT", (int)(k ^ (k >> 32)))) {
@@ -88,9 +155,9 @@ void RecogniseShadowPass(const DrawArgs& da, BoneRoots& roots, DrawClaim& dc)
                             vs_hash, first_index, index_count, b4r, b3r, (unsigned long long)b4_cb.va);
                         uint64_t dvb0 = 0;
                         {
-                            dvb0 = CmdGfx(cmd_list).vb[0].va;
+                            dvb0 = g_command_lists.Gfx(cmd_list).vb[0].va;
                         }
-                        bool d_pool = InSkinBand(dvb0);
+                        bool d_pool = g_recognition.InSkinBand(dvb0);
                         logger::trace("SKINSRC pass=DEPTHCAST idx=%u vb0=%llx inSkinPool=%d b4root=%d boneVA=%llx",
                             index_count, (unsigned long long)dvb0, (int)d_pool, b4r, (unsigned long long)b4_cb.va);
                     }
@@ -100,103 +167,50 @@ void RecogniseShadowPass(const DrawArgs& da, BoneRoots& roots, DrawClaim& dc)
     }
 }
 
-bool CastModShadows(InjectFrame& fr)
+bool CastModShadows(DrawContext& ctx)
 {
-    reshade::api::command_list* const cmd_list = fr.da.cmd_list;
-    const uint64_t                    shadow_dsv = fr.dc.shadow_dsv;
-    const uint32_t                    shadow_pass = fr.dc.shadow_pass;
-    const int                         game_cb13_root = fr.dc.cb13_root;
-    const int                         game_cb14_root = fr.dc.cb14_root;
-    auto                              restore_state = [&]() { RestoreGameState(fr); };
-    auto                              draw_comp = [&](int dm, const WwmiMod::Component* wc) { return DrawComponent(fr, dm, wc); };
+    reshade::api::command_list* const cmd_list = ctx.args.cmd_list;
+    const DrawClaim& dc = ctx.claim;
     PROF(PROF_DI_ShadowCast); // N mods x N components per depth target, all inside one game draw
-    struct ShadowTarget {
-        uint64_t dsv;
-        uint32_t pass;
-        float    vx;
-        float    vy;
-        float    vw;
-        float    vh;
-        bool     replaced;
-    };
-    auto vp_of = [&](float& x, float& y, float& w, float& h) {
-        auto& gs = CmdGfx(cmd_list);
-        if (gs.vp_count) {
-            x = gs.vp[0].TopLeftX;
-            y = gs.vp[0].TopLeftY;
-            w = gs.vp[0].Width;
-            h = gs.vp[0].Height;
-        } else {
-            x = y = w = h = 0.0f;
-        } // never set -> one region, old behaviour
-    };
-    float vx;
-    float vy;
-    float vw;
-    float vh;
-    vp_of(vx, vy, vw, vh);
-    auto same_target = [&](const ShadowTarget& t) {
-        return t.dsv == shadow_dsv && t.pass == shadow_pass && t.vx == vx && t.vy == vy && t.vw == vw && t.vh == vh;
-    };
-    static std::mutex                s_shadow_mtx;
-    static uint32_t                  s_shadow_frame = 0xFFFFFFFFu;
-    static std::vector<ShadowTarget> s_shadow_done; // depth targets handled this frame
-    bool                             cast_here = false;
-    bool                             already_replaced = false;
+    ShadowTarget target{ dc.shadow_dsv, dc.shadow_pass, 0.0f, 0.0f, 0.0f, 0.0f };
     {
-        std::lock_guard l(s_shadow_mtx);
-        if (s_shadow_frame != g_frame_id) {
-            s_shadow_frame = g_frame_id;
-            s_shadow_done.clear();
-        }
-        auto it = std::find_if(s_shadow_done.begin(), s_shadow_done.end(), same_target);
-        if (it == s_shadow_done.end()) {
-            s_shadow_done.push_back({ shadow_dsv, shadow_pass, vx, vy, vw, vh, false });
-            cast_here = true;
-            t_x23_cast = 1; // X23
-        } else
-            already_replaced = it->replaced;
+        auto& gs = g_command_lists.Gfx(cmd_list);
+        if (gs.vp_count) {
+            target.vx = gs.vp[0].TopLeftX;
+            target.vy = gs.vp[0].TopLeftY;
+            target.vw = gs.vp[0].Width;
+            target.vh = gs.vp[0].Height;
+        } // never set -> one region, old behaviour
     }
+    bool already_replaced = false;
+    const bool cast_here = g_shadow_casts.Claim(target, &already_replaced);
     if (cast_here) {
+        t_x23_cast = 1; // X23
         int comp_n = 0;
         int drew_n = 0;
-        for (int dm = 0; dm < (int)g_geomods.size(); ++dm) {
-            if (!ModOnScreen(dm)) continue;
-            if (!ModGeomEnabled(dm)) continue; // WWMI: disabled mod casts its vanilla shadow, not ours
-            for (const auto& c : g_geomods[dm].mod.comps) {
+        for (int dm = 0; dm < (int)Mods().Count(); ++dm) {
+            if (!Mods().OnScreen(dm)) continue;
+            if (!Mods().GeomEnabled(dm)) continue; // WWMI: disabled mod casts its vanilla shadow, not ours
+            for (const auto& c : Mods().At(dm).mod.comps) {
                 ++comp_n;
-                if (draw_comp(dm, &c)) ++drew_n;
+                if (DrawComponent(ctx, dm, &c)) ++drew_n;
             }
         }
         already_replaced = (drew_n > 0);
-        {
-            std::lock_guard l(s_shadow_mtx);
-            auto            it = std::find_if(s_shadow_done.begin(), s_shadow_done.end(), same_target);
-            if (it != s_shadow_done.end()) it->replaced = already_replaced;
-        }
-        if (g_shadow_recog_watch.load(std::memory_order_relaxed) > 0) {
-            static std::mutex         m;
-            static std::set<uint64_t> seen;
-            static uint32_t           s_lastf = 0xFFFFFFFFu;
-            bool                      fresh;
-            {
-                std::lock_guard l(m);
-                if (s_lastf != g_frame_id && (g_frame_id % 120) == 0) {
-                    s_lastf = g_frame_id;
-                    seen.clear();
-                } // re-report every 120 frames so a LATER failure is visible
-                const uint64_t vkey = ((uint64_t)(uint32_t)vx << 32) ^ (uint64_t)(uint32_t)vy ^ ((uint64_t)(uint32_t)vw << 16) ^ (uint64_t)(uint32_t)vh;
-                fresh = ProbeArmed() && seen.size() < 64 && seen.insert((shadow_dsv ^ ((uint64_t)shadow_pass << 32)) ^ ((uint64_t)(drew_n > 0) << 63) ^ vkey).second;
-            }
-            if (fresh) {
+        g_shadow_casts.NoteReplaced(target, already_replaced);
+        if (g_diag_arms.shadow_recog_watch.load(std::memory_order_relaxed) > 0) {
+            const uint64_t vkey = ((uint64_t)(uint32_t)target.vx << 32) ^ (uint64_t)(uint32_t)target.vy ^
+                ((uint64_t)(uint32_t)target.vw << 16) ^ (uint64_t)(uint32_t)target.vh;
+            if (g_shadow_casts.WatchFresh(
+                    (dc.shadow_dsv ^ ((uint64_t)dc.shadow_pass << 32)) ^ ((uint64_t)(drew_n > 0) << 63) ^ vkey)) {
                 logger::write("SHADOWDRAW dsv=%llx pass=%u vp=[%.0f,%.0f %.0fx%.0f] comps=%d drew=%d "
                               "cb13root=%d cb14root=%d -> %s",
-                    (unsigned long long)shadow_dsv, shadow_pass, vx, vy, vw, vh, comp_n, drew_n,
-                    game_cb13_root, game_cb14_root,
+                    (unsigned long long)dc.shadow_dsv, dc.shadow_pass, target.vx, target.vy, target.vw, target.vh,
+                    comp_n, drew_n, dc.b4_root, dc.b3_root,
                     drew_n > 0 ? "REPLACED (suppress vanilla)" : "NOT replaced (vanilla kept)");
             }
         }
     }
-    restore_state();
+    RestoreGameState(ctx);
     return already_replaced; // suppress only what we actually replaced
 }

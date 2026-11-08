@@ -1,12 +1,12 @@
 // dump_preview.cpp -- OURS. PORT-LEAF. See dump_preview.h.
 #include "dump_preview.h"
-#include "dx12_bridge.h"        // GetDx12Bridge, ObservedResourceState
-#include "dx12_wrap.h"          // AsWrapResource: the D3D11 texture their engine holds -> its DX12 resource
+#include "dx12_bridge.h" // GetDx12Bridge, ObservedResourceState
+#include "dx12_wrap.h" // AsWrapResource: the D3D11 texture their engine holds -> its DX12 resource
 #include "dx12_dump_readback.h" // DumpReadbackList: the dump's own queue, flushed by their Map(READ)
-#include "dump_watchdog.h"      // DumpStage: the preview names its position for a failure report
-#include "../../src/log.h"
-#include "../../src/d3d12_barrier.h"
-#include "../../src/d3d12_name.h"
+#include "dump_watchdog.h" // DumpStage: the preview names its position for a failure report
+#include "../core/log.h"
+#include "../core/d3d12_barrier.h"
+#include "../core/d3d12_name.h"
 #include <ScreenGrab.h>
 #include <wincodec.h>
 #include <d3d12.h>
@@ -19,12 +19,12 @@ namespace {
 std::vector<unsigned char> g_cso;
 
 struct Pass {
-    bool                  tried = false;
-    bool                  ok = false;
-    ID3D12RootSignature*  rs = nullptr;
-    ID3D12PipelineState*  pso = nullptr;
+    bool tried = false;
+    bool ok = false;
+    ID3D12RootSignature* rs = nullptr;
+    ID3D12PipelineState* pso = nullptr;
     ID3D12DescriptorHeap* heap = nullptr; // [0] = source SRV, [1] = destination UAV
-    UINT                  inc = 0;
+    UINT inc = 0;
 };
 Pass g_pass;
 
@@ -77,7 +77,8 @@ bool Init(ID3D12Device* dev)
         logger::write("DUMP PREVIEW: PSO failed");
         return false;
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pass.heap)))) {
         logger::write("DUMP PREVIEW: heap failed");
         return false;
@@ -101,8 +102,7 @@ bool IsFloatFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_BC6H_UF16:
     case DXGI_FORMAT_BC6H_SF16:
     case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-        return true;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return true;
     default: return false;
     }
 }
@@ -132,8 +132,7 @@ bool IsIntegerFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_R8_UINT:
     case DXGI_FORMAT_R8_SINT:
     case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-        return true;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return true;
     default: return false;
     }
 }
@@ -155,7 +154,7 @@ DXGI_FORMAT NoSrgb(DXGI_FORMAT f)
 void Once(const char* why)
 {
     static const char* seen[16] = {};
-    static int         n = 0; // once per reason: eight cube-map lines hid the rest
+    static int n = 0; // once per reason: eight cube-map lines hid the rest
     for (int i = 0; i < n; ++i)
         if (seen[i] == why) return;
     if (n < 16) seen[n++] = why;
@@ -169,8 +168,8 @@ void SetDumpPreviewShader(const void* cso, size_t bytes)
     g_cso.assign((const unsigned char*)cso, (const unsigned char*)cso + bytes);
 }
 
-bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Texture2D* source,
-    DXGI_FORMAT view_format, const wchar_t* path)
+bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Texture2D* source, DXGI_FORMAT view_format,
+    const wchar_t* path)
 {
     const Dx12Bridge& b = GetDx12Bridge();
     if (!dev11 || !ctx || !source || !path || !b.device) return false;
@@ -180,7 +179,7 @@ bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Textur
         Once("the source is not a DX12 resource");
         return false;
     }
-    ID3D12Resource*           src = wr->dx12;
+    ID3D12Resource* src = wr->dx12;
     const D3D12_RESOURCE_DESC sd = src->GetDesc();
     if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || sd.DepthOrArraySize != 1 || sd.SampleDesc.Count != 1) {
         Once("not a single-slice, single-sample 2D texture");
@@ -212,8 +211,8 @@ bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Textur
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.SampleDesc = { 1, 0 };
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(b.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                nullptr, IID_PPV_ARGS(&dst)))) {
+        if (FAILED(b.device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&dst)))) {
             Once("destination texture failed");
             return false;
         }
@@ -236,7 +235,7 @@ bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Textur
             return false;
         }
     }
-    WrapResource*              sw = AsWrapResource(staging);
+    WrapResource* sw = AsWrapResource(staging);
     ID3D12GraphicsCommandList* cl = DumpReadbackList();
     if (!sw || !sw->dx12 || !cl) {
         staging->Release();
@@ -262,7 +261,7 @@ bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Textur
         b.device->CreateUnorderedAccessView(dst, nullptr, &ud, u);
     }
     const D3D12_RESOURCE_STATES before = (D3D12_RESOURCE_STATES)st;
-    const bool                  need = (before & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) == 0;
+    const bool need = (before & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) == 0;
     if (need) TransitionBarrier(cl, src, before, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     ID3D12DescriptorHeap* heaps[] = { g_pass.heap };
     cl->SetDescriptorHeaps(1, heaps);

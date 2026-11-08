@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdio>
 #include <cstdint>
-#include "diag.h"
+#include "diag_gate.h"
 
 class ChainTrace {
 public:
@@ -12,12 +12,12 @@ public:
     // Every variable their engine holds, at a frame boundary.
     WWMI_DEBUG_FN void Vars(const char* when) WWMI_DEBUG_BODY();
     WWMI_DEBUG_FN void SyncGlobalObserver() WWMI_DEBUG_BODY();
-    void               SetFrame(uint32_t frame) { frame_ = frame; }
-    bool               IsOpen() const { return fp_ != nullptr; }
+    void SetFrame(uint32_t frame) { frame_ = frame; }
+    bool IsOpen() const { return fp_ != nullptr; }
 
 private:
     static void GlobalObserver(const wchar_t* line, void* user);
-    FILE*       fp_ = nullptr;
-    uint32_t    frame_ = 0;
+    FILE* fp_ = nullptr;
+    uint32_t frame_ = 0;
 };
 WWMI_DEBUG_VAR ChainTrace g_chain_trace;

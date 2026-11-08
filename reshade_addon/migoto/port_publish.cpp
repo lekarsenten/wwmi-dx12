@@ -12,12 +12,13 @@
 #include "dx12_context.h"
 #include "dx12_pipeline.h"
 #include "dx12_wrap.h"
-#include "../../src/log.h"
-#include "../../src/buffer_view_fit.h"
+#include "../core/log.h"
+#include "../core/buffer_view_fit.h"
 
 #include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace PortApi {
@@ -47,32 +48,31 @@ unsigned Crc32c(unsigned seed, const void* data, size_t n)
 }
 
 namespace {
-template <class Key, class Wrap>
-struct SlotWrappers {
+template <class Key, class Wrap> struct SlotWrappers {
     struct Slot {
-        Wrap*              current = nullptr;
+        Wrap* current = nullptr;
         std::vector<Wrap*> retired;
     };
-    std::mutex          mtx;
+    std::mutex mtx;
     std::map<Key, Slot> slots;
-    Wrap*               Get(const Key& k)
+    Wrap* Get(const Key& k)
     {
         std::lock_guard<std::mutex> l(mtx);
-        Slot&                       s = slots[k];
+        Slot& s = slots[k];
         if (!s.current) s.current = new Wrap();
         return s.current;
     }
     Wrap* Find(const Key& k)
     {
         std::lock_guard<std::mutex> l(mtx);
-        auto                        it = slots.find(k);
+        auto it = slots.find(k);
         return it == slots.end() ? nullptr : it->second.current;
     }
     Wrap* Unheld(const Key& k, const void* bound, size_t* moved_to)
     {
         std::lock_guard<std::mutex> l(mtx);
-        Slot&                       s = slots[k];
-        auto                        unheld = [&](Wrap* w) { return w->RefCount() <= (bound == (const void*)w ? 2 : 1); };
+        Slot& s = slots[k];
+        auto unheld = [&](Wrap* w) { return w->RefCount() <= (bound == (const void*)w ? 2 : 1); };
         *moved_to = 0;
         if (!s.current) s.current = new Wrap();
         if (unheld(s.current)) return s.current;
@@ -89,6 +89,7 @@ struct SlotWrappers {
     }
 };
 using StageSlot = std::pair<int, unsigned>;
+using StageSlotCopy = std::tuple<int, unsigned, unsigned>;
 
 void ForgetOverrideCandidates(ResourceHandleInfo& info)
 {
@@ -130,8 +131,8 @@ bool SetViaTarget(ResourceCopyTarget& tgt, ID3D11Resource* res, ID3D11View* view
 }
 } // namespace
 
-void PushGameVertexBuffer(unsigned slot, ID3D12Resource* res, unsigned long long gpu_va,
-    unsigned dx11_byte_width, unsigned stride, unsigned offset)
+void PushGameVertexBuffer(unsigned slot, ID3D12Resource* res, unsigned long long gpu_va, unsigned dx11_byte_width,
+    unsigned stride, unsigned offset)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
@@ -139,14 +140,14 @@ void PushGameVertexBuffer(unsigned slot, ID3D12Resource* res, unsigned long long
 
     MigotoPort::PipeState& st = MigotoPort::State();
 
-    static auto*            slots = new SlotWrappers<unsigned, MigotoPort::WrapBuffer>();
+    static auto* slots = new SlotWrappers<unsigned, MigotoPort::WrapBuffer>();
     MigotoPort::WrapBuffer* w = slots->Get(slot);
     if (w->dx12 != res) w->heap_type = (D3D12_HEAP_TYPE)0;
     w->foreign = true;
     w->dx12 = res;
     if (!res) {
         w->gpu_va = 0;
-        BindSlot(st.vb[slot], (ID3D11Buffer*)nullptr);
+        MigotoPort::BindSlot(st.vb[slot], (ID3D11Buffer*)nullptr);
         st.vb_stride[slot] = 0;
         st.vb_offset[slot] = 0;
         st.shim_vb[slot] = {};
@@ -168,7 +169,7 @@ void PushGameVertexBuffer(unsigned slot, ID3D12Resource* res, unsigned long long
     if (!hash) hash = GameConstantBufferHash(dx11_byte_width);
     RegisterGameBuffer(w, hash);
 
-    BindSlot(st.vb[slot], (ID3D11Buffer*)w);
+    MigotoPort::BindSlot(st.vb[slot], (ID3D11Buffer*)w);
     st.vb_stride[slot] = stride;
     st.vb_offset[slot] = offset;
     if (slot + 1 > st.num_vb) st.num_vb = slot + 1;
@@ -179,7 +180,7 @@ void PushGameIndexBuffer(ID3D12Resource* res, unsigned long long gpu_va_base, un
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
-    MigotoPort::PipeState&         st = MigotoPort::State();
+    MigotoPort::PipeState& st = MigotoPort::State();
     static MigotoPort::WrapBuffer* w = nullptr;
     if (!w) w = new MigotoPort::WrapBuffer();
     if (w->dx12 != res) w->heap_type = (D3D12_HEAP_TYPE)0; // foreign, as the VB wrapper above
@@ -187,7 +188,7 @@ void PushGameIndexBuffer(ID3D12Resource* res, unsigned long long gpu_va_base, un
     w->dx12 = res;
     if (!res) {
         w->gpu_va = 0;
-        BindSlot(st.ib, (ID3D11Buffer*)nullptr);
+        MigotoPort::BindSlot(st.ib, (ID3D11Buffer*)nullptr);
         st.ib_format = DXGI_FORMAT_UNKNOWN;
         st.ib_offset = 0;
         return;
@@ -201,7 +202,7 @@ void PushGameIndexBuffer(ID3D12Resource* res, unsigned long long gpu_va_base, un
     unsigned hash = GameBufferHashSearch(dx11_byte_width, 0, nullptr);
     if (!hash) hash = GameConstantBufferHash(dx11_byte_width);
     RegisterGameBuffer(w, hash);
-    BindSlot(st.ib, (ID3D11Buffer*)w);
+    MigotoPort::BindSlot(st.ib, (ID3D11Buffer*)w);
     st.ib_format = (index_bytes == 2) ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
     st.ib_offset = offset;
 }
@@ -222,8 +223,8 @@ bool PipeStateCbBound(char stage, unsigned slot)
     return MigotoPort::State().cb[si][slot] != nullptr;
 }
 
-void PushGameConstantBufferRecord(char stage, unsigned slot, ID3D12Resource* res,
-    unsigned long long gpu_va, unsigned dx11_byte_width)
+void PushGameConstantBufferRecord(
+    char stage, unsigned slot, ID3D12Resource* res, unsigned long long gpu_va, unsigned dx11_byte_width)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded || slot >= (unsigned)MigotoPort::kMaxCB) return;
@@ -231,24 +232,24 @@ void PushGameConstantBufferRecord(char stage, unsigned slot, ID3D12Resource* res
     if (si < 0) return;
     MigotoPort::PipeState& st = MigotoPort::State();
 
-    static auto*            slots = new SlotWrappers<StageSlot, MigotoPort::WrapBuffer>();
+    static auto* slots = new SlotWrappers<StageSlot, MigotoPort::WrapBuffer>();
     MigotoPort::WrapBuffer* w = slots->Get({ si, slot });
     if (!res) {
         // Forget the record, and only the record: a slot the ini has since bound keeps its buffer.
-        if (st.cb[si][slot] == (ID3D11Buffer*)w) BindSlot(st.cb[si][slot], (ID3D11Buffer*)nullptr);
+        if (st.cb[si][slot] == (ID3D11Buffer*)w) MigotoPort::BindSlot(st.cb[si][slot], (ID3D11Buffer*)nullptr);
         return;
     }
     if (w->dx12 != res) w->heap_type = (D3D12_HEAP_TYPE)0; // foreign, as the VB wrapper above
     w->foreign = true;
-    BindSlot(w->dx12, res);
+    MigotoPort::BindSlot(w->dx12, res);
     w->gpu_va = (D3D12_GPU_VIRTUAL_ADDRESS)gpu_va; // the window into the ring, not the ring
     w->desc = GameConstantBufferDesc(dx11_byte_width);
     RegisterGameBuffer(w, GameConstantBufferHash(dx11_byte_width));
-    BindSlot(st.cb[si][slot], (ID3D11Buffer*)w);
+    MigotoPort::BindSlot(st.cb[si][slot], (ID3D11Buffer*)w);
 }
 
-void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res,
-    unsigned long long gpu_va, unsigned dx11_byte_width)
+void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res, unsigned long long gpu_va,
+    unsigned dx11_byte_width, unsigned copy)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
@@ -268,25 +269,26 @@ void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res,
         return;
     }
 
-    static auto*            slots = new SlotWrappers<StageSlot, MigotoPort::WrapBuffer>();
-    size_t                  moved_to = 0;
-    MigotoPort::WrapBuffer* w = slots->Unheld({ si, slot }, MigotoPort::State().cb[si][slot], &moved_to);
+    static auto* slots = new SlotWrappers<StageSlotCopy, MigotoPort::WrapBuffer>();
+    size_t moved_to = 0;
+    MigotoPort::WrapBuffer* w = slots->Unheld({ si, slot, copy }, MigotoPort::State().cb[si][slot], &moved_to);
     if (moved_to && logger::enabled(1)) {
-        static std::mutex       m;
+        static std::mutex m;
         static std::set<size_t> seen;
-        bool                    first;
+        bool first;
         {
             std::lock_guard<std::mutex> l(m);
             first = seen.insert(((size_t)si << 40) | ((size_t)slot << 32) | moved_to).second;
         }
         if (first)
-            logger::write("PORT-CB-HELD %c%c-cb%u: a reference (a pool or resource slot) holds the buffer bound before -- "
-                          "it keeps that buffer, and the slot publishes through another wrapper (%zu for this slot)",
+            logger::write(
+                "PORT-CB-HELD %c%c-cb%u: a reference (a pool or resource slot) holds the buffer bound before -- "
+                "it keeps that buffer, and the slot publishes through another wrapper (%zu for this slot)",
                 "vhdgpc"[si], 's', slot, moved_to);
     }
     if (w->dx12 != res) w->heap_type = (D3D12_HEAP_TYPE)0; // foreign, as the VB wrapper above
     w->foreign = true;
-    BindSlot(w->dx12, res);                        // re-point it at what the game has bound NOW
+    MigotoPort::BindSlot(w->dx12, res); // re-point it at what the game has bound NOW
     w->gpu_va = (D3D12_GPU_VIRTUAL_ADDRESS)gpu_va; // the window into the ring, not the ring
     w->desc = GameConstantBufferDesc(dx11_byte_width);
 
@@ -294,9 +296,9 @@ void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res,
     RegisterGameBuffer(w, hash);
 
     if (logger::enabled(1)) {
-        static std::mutex         m;
+        static std::mutex m;
         static std::set<unsigned> seen;
-        bool                      first;
+        bool first;
         {
             std::lock_guard<std::mutex> l(m);
             first = seen.insert(((unsigned)si << 8) | slot).second;
@@ -313,8 +315,7 @@ void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res,
             logger::write("PORT-RECOG %c%c-cb%u hash=%08x -> %zu [TextureOverride] match(es), "
                           "filter_index=%.4f %s",
                 "vhdgpc"[si], 's', slot, hash, matches.size(), filter,
-                matches.empty() ? "*** NO MATCH: `if vs-cb4 == 3381.7777` will be FALSE ***"
-                                : "(recognised)");
+                matches.empty() ? "*** NO MATCH: `if vs-cb4 == 3381.7777` will be FALSE ***" : "(recognised)");
         }
     }
     SetViaTarget(tgt, (ID3D11Resource*)w, nullptr);
@@ -332,11 +333,11 @@ static D3D11_BUFFER_DESC GameComputeUavBufferDesc(unsigned byte_width)
     return d;
 }
 
-bool GetShimVertexBuffer(unsigned slot, void** out_res, unsigned long long* out_va,
-    unsigned* out_size, unsigned* out_stride, unsigned* out_state)
+bool GetShimVertexBuffer(unsigned slot, void** out_res, unsigned long long* out_va, unsigned* out_size,
+    unsigned* out_stride, unsigned* out_state)
 {
     if (slot >= (unsigned)MigotoPort::kMaxVB) return false;
-    const MigotoPort::PipeState&    st = MigotoPort::State();
+    const MigotoPort::PipeState& st = MigotoPort::State();
     const MigotoPort::ShimVbRecord& r = st.shim_vb[slot];
     if (!r.res || !r.va || !r.size) return false; // nothing substituted here
     if (out_res) *out_res = (void*)r.res;
@@ -360,11 +361,11 @@ unsigned GameBufferHashSearch(unsigned byte_width, unsigned ini_stride, bool* ou
 
     struct Found {
         unsigned hash;
-        bool     ambiguous;
+        bool ambiguous;
     };
     thread_local std::unordered_map<uint64_t, Found> t_found;
-    thread_local unsigned                            t_found_gen = ~0u;
-    const unsigned                                   gen = LoadGeneration();
+    thread_local unsigned t_found_gen = ~0u;
+    const unsigned gen = LoadGeneration();
     if (gen != t_found_gen) {
         t_found.clear();
         t_found_gen = gen;
@@ -386,7 +387,7 @@ unsigned GameBufferHashSearch(unsigned byte_width, unsigned ini_stride, bool* ou
         D3D11_BIND_INDEX_BUFFER | D3D11_BIND_SHADER_RESOURCE,
         D3D11_BIND_CONSTANT_BUFFER,
     };
-    const UINT        kStride[] = { 0u, ini_stride };
+    const UINT kStride[] = { 0u, ini_stride };
     static const UINT kMisc[] = { 0u, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
         D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS };
 
@@ -402,8 +403,9 @@ unsigned GameBufferHashSearch(unsigned byte_width, unsigned ini_stride, bool* ou
                     d.ByteWidth = byte_width;
                     d.Usage = (D3D11_USAGE)u;
                     d.BindFlags = b;
-                    d.CPUAccessFlags = (u == D3D11_USAGE_DYNAMIC) ? D3D11_CPU_ACCESS_WRITE : (u == D3D11_USAGE_STAGING) ? (D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE)
-                                                                                                                        : 0u;
+                    d.CPUAccessFlags = (u == D3D11_USAGE_DYNAMIC) ? D3D11_CPU_ACCESS_WRITE
+                        : (u == D3D11_USAGE_STAGING)              ? (D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE)
+                                                                  : 0u;
                     d.MiscFlags = m;
                     d.StructureByteStride = st;
                     const unsigned h = crc32c_hw(0, &d, sizeof(D3D11_BUFFER_DESC));
@@ -425,7 +427,7 @@ unsigned GameBufferHashSearch(unsigned byte_width, unsigned ini_stride, bool* ou
 
 namespace {
 SlotWrappers<unsigned, MigotoPort::WrapBuffer> g_gameuav_res; // slot -> stable wrapper
-SlotWrappers<unsigned, MigotoPort::WrapUAV>    g_gameuav_view;
+SlotWrappers<unsigned, MigotoPort::WrapUAV> g_gameuav_view;
 }
 
 int PushGameComputeUav(unsigned slot, ID3D12Resource* res, unsigned byte_width, unsigned long long gpu_va)
@@ -448,7 +450,7 @@ int PushGameComputeUav(unsigned slot, ID3D12Resource* res, unsigned byte_width, 
 
     if (!res) byte_width = 0; // clearing the slot: ignore whatever the caller passed
     MigotoPort::WrapBuffer* w = g_gameuav_res.Get(slot);
-    BindSlot(w->dx12, res);
+    MigotoPort::BindSlot(w->dx12, res);
     if (res) {
         w->desc = GameComputeUavBufferDesc(byte_width);
         w->foreign = true; // the GAME made this buffer; our `state` field has no authority over it
@@ -508,7 +510,7 @@ D3D11_TEXTURE2D_DESC GameTexture2DDesc(ID3D12Resource* res)
 }
 
 SlotWrappers<StageSlot, MigotoPort::WrapTexture2D> g_gametex_res;
-SlotWrappers<StageSlot, MigotoPort::WrapSRV>       g_gametex_view;
+SlotWrappers<StageSlot, MigotoPort::WrapSRV> g_gametex_view;
 
 ID3D11ShaderResourceView* PublishedTextureView(int si, unsigned slot)
 {
@@ -550,7 +552,7 @@ int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned con
     // The per-slot caches live at file scope (see above) so the guard and this step share them.
     MigotoPort::WrapTexture2D* w = g_gametex_res.Get({ si, slot });
     w->foreign = true; // the game's texture: its state is what the game's barriers say (Transition)
-    BindSlot(w->dx12, res);
+    MigotoPort::BindSlot(w->dx12, res);
     if (res) w->desc = GameTexture2DDesc(res);
 
     if (res) RegisterGameTexture2D(w, content_hash);
@@ -598,12 +600,12 @@ void PushGameDepthTarget(ID3D12Resource* res)
     if (!g_loaded) return;
 
     static MigotoPort::WrapTexture2D* w = nullptr;
-    static MigotoPort::WrapDSV*       v = nullptr;
+    static MigotoPort::WrapDSV* v = nullptr;
     if (!w) w = new MigotoPort::WrapTexture2D();
     if (!v) v = new MigotoPort::WrapDSV();
 
     w->foreign = true; // the game's depth target, as the texture slots above
-    BindSlot(w->dx12, res);
+    MigotoPort::BindSlot(w->dx12, res);
     if (res) {
         w->desc = GameTexture2DDesc(res);
         w->desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -628,13 +630,13 @@ void PushGameRenderTarget(unsigned slot, ID3D12Resource* res)
     if (!g_loaded) return;
 
     static MigotoPort::WrapTexture2D* w[8] = {};
-    static MigotoPort::WrapRTV*       v[8] = {};
+    static MigotoPort::WrapRTV* v[8] = {};
     if (!w[slot]) w[slot] = new MigotoPort::WrapTexture2D();
     if (!v[slot]) v[slot] = new MigotoPort::WrapRTV();
     MigotoPort::WrapTexture2D* wt = w[slot];
-    MigotoPort::WrapRTV*       vw = v[slot];
+    MigotoPort::WrapRTV* vw = v[slot];
 
-    BindSlot(wt->dx12, res);
+    MigotoPort::BindSlot(wt->dx12, res);
     if (res) {
         wt->desc = GameTexture2DDesc(res);
         // Say what it is, or a later BindFlags test reads a render target as a sampled texture.

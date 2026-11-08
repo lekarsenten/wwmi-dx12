@@ -9,10 +9,12 @@
 // ===========================================================================
 #include "dx12_wrap.h"
 #include "dx12_pipeline.h"
+#include "dx12_dump_readback.h"
 #include "dx12_device.h"
 #include "dx12_context.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 
+#include <algorithm>
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
@@ -36,6 +38,17 @@ void WrapResourceDied()
 {
     ++g_died;
 }
+
+WrapResource::~WrapResource()
+{
+    WrapResourceDied();
+    if (dx12 && !foreign) DisownBuffer(dx12);
+    if (dx12 && heap_type == D3D12_HEAP_TYPE_READBACK)
+        RetireReadback(dx12);
+    else if (dx12)
+        RetireDx12Resource(dx12);
+}
+
 void WrapStats(long* created, long* destroyed, long* live)
 {
     const long b = g_born.load();
@@ -59,6 +72,11 @@ std::unordered_map<ID3D12Resource*, WrapTexture2D*>& BbCache()
     static auto* m = new std::unordered_map<ID3D12Resource*, WrapTexture2D*>();
     return *m;
 }
+std::vector<ID3D12Resource*>& BbSeen()
+{
+    static auto* v = new std::vector<ID3D12Resource*>();
+    return *v;
+}
 }
 
 ID3D11Texture2D* BackBufferAsD3D11()
@@ -67,11 +85,11 @@ ID3D11Texture2D* BackBufferAsD3D11()
     if (!b.back_buffer) return nullptr;
 
     std::lock_guard<std::mutex> l(BbMtx());
-    auto*                       cache = &BbCache();
-    auto                        it = cache->find(b.back_buffer);
+    auto* cache = &BbCache();
+    auto it = cache->find(b.back_buffer);
     if (it == cache->end()) {
         const D3D12_RESOURCE_DESC rd = b.back_buffer->GetDesc();
-        WrapTexture2D*            w = new WrapTexture2D();
+        WrapTexture2D* w = new WrapTexture2D();
         b.back_buffer->AddRef(); // the wrapper holds a reference, as any COM owner would
         w->dx12 = b.back_buffer;
         w->state = b.back_buffer_state;
@@ -84,8 +102,7 @@ ID3D11Texture2D* BackBufferAsD3D11()
         w->desc.Usage = D3D11_USAGE_DEFAULT;
         w->desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         it = cache->emplace(b.back_buffer, w).first;
-        logger::write("PORT: back buffer wrapped -- %ux%u fmt=%d", (unsigned)rd.Width, rd.Height,
-            (int)rd.Format);
+        logger::write("PORT: back buffer wrapped -- %ux%u fmt=%d", (unsigned)rd.Width, rd.Height, (int)rd.Format);
     }
     it->second->AddRef();
     return it->second;
@@ -94,23 +111,35 @@ ID3D11Texture2D* BackBufferAsD3D11()
 void BackBufferForget()
 {
     std::lock_guard<std::mutex> l(BbMtx());
-    auto*                       cache = &BbCache();
+    auto* cache = &BbCache();
     for (auto& kv : *cache) {
         if (kv.second->dx12) {
             kv.second->dx12->Release();
             kv.second->dx12 = nullptr;
         } // the wrapper stays for the engine's refs; it draws nothing
     }
-    if (!cache->empty()) logger::write("PORT: back buffer wrappers released for the swap chain resize (%zu)", cache->size());
+    if (!cache->empty())
+        logger::write("PORT: back buffer wrappers released for the swap chain resize (%zu)", cache->size());
     cache->clear();
+    BbSeen().clear();
 }
 
 void BackBufferPublished(ID3D12Resource* bb, D3D12_RESOURCE_STATES state)
 {
     if (!bb) return;
     std::lock_guard<std::mutex> l(BbMtx());
-    auto                        it = BbCache().find(bb);
+    std::vector<ID3D12Resource*>& seen = BbSeen();
+    if (std::find(seen.begin(), seen.end(), bb) == seen.end()) seen.push_back(bb);
+    auto it = BbCache().find(bb);
     if (it != BbCache().end()) it->second->state = state;
+}
+
+bool IsBackBuffer(ID3D12Resource* res)
+{
+    if (!res) return false;
+    std::lock_guard<std::mutex> l(BbMtx());
+    const std::vector<ID3D12Resource*>& seen = BbSeen();
+    return std::find(seen.begin(), seen.end(), res) != seen.end();
 }
 
 void BackBufferRestore(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES to)
@@ -120,7 +149,7 @@ void BackBufferRestore(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES to)
     WrapTexture2D* w = nullptr;
     {
         std::lock_guard<std::mutex> l(BbMtx());
-        auto                        it = BbCache().find(b.back_buffer);
+        auto it = BbCache().find(b.back_buffer);
         if (it != BbCache().end()) w = it->second;
     }
     if (w && w->state != to) TransitionResource(cl, w, to); // early-outs on state == to
@@ -129,10 +158,10 @@ void BackBufferRestore(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES to)
 namespace {
 
 struct Entry {
-    WrapResource*    res = nullptr;
-    WrapView*        view = nullptr;
-    ShaderCode*      shader = nullptr;
-    StateDesc*       state = nullptr;
+    WrapResource* res = nullptr;
+    WrapView* view = nullptr;
+    ShaderCode* shader = nullptr;
+    StateDesc* state = nullptr;
     InputLayoutDesc* layout = nullptr;
 };
 std::mutex& Mtx()
@@ -146,13 +175,12 @@ std::unordered_map<const void*, Entry>& Map()
     return *m;
 }
 
-template <class T>
-T* Lookup(void* p, T* Entry::* field)
+template <class T> T* Lookup(void* p, T* Entry::* field)
 {
     if (!p) return nullptr;
     std::lock_guard<std::mutex> l(Mtx());
-    auto&                       m = Map();
-    auto                        it = m.find(p);
+    auto& m = Map();
+    auto it = m.find(p);
     return (it == m.end()) ? nullptr : it->second.*field;
 }
 

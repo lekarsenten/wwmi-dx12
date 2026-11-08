@@ -1,24 +1,26 @@
 #include "tex_encode.h"
 #include "tex_defer.h"
 #include "../addon_common.h"
-#include "../mods/claim_state.h" // g_geomods, ModOnScreen
+#include "../mods/character_recognition.h"
 #include "../migoto/dx12_wrap.h"
 #include "../migoto/dx12_pipeline.h"
-#include "../../src/d3d12_buffer.h"
-#include "../../src/log.h"
+#include "../core/d3d12_buffer.h"
+#include "../core/log.h"
 #include <d3d11.h>
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include "../addon/addon.h"
+#include "../mods/wwmi_runtime.h"
 
-TexEncoder    g_tex_encoder;
-TexEncodeTest g_tex_encode;
+TexEncoder g_tex_encoder;
+TexEncodeTest g_tex_encode_test;
 
 namespace {
 constexpr UINT kErrBytes = 256;
 constexpr UINT64 kSlotBytes = 4ull << 20; // an upload buffer: 64 block rows of the widest BC7 texture, 16384 texels
-constexpr UINT   kRowsStep = 16;          // a band's block rows come in these: whole blocks four levels down
-constexpr DWORD  kDdsHead = 148;          // magic, DDS_HEADER, DDS_HEADER_DXT10
+constexpr UINT kRowsStep = 16; // a band's block rows come in these: whole blocks four levels down
+constexpr DWORD kDdsHead = 148; // magic, DDS_HEADER, DDS_HEADER_DXT10
 
 double Psnr(uint64_t sse, double samples)
 {
@@ -27,8 +29,8 @@ double Psnr(uint64_t sse, double samples)
     return 10.0 * std::log10(255.0 * 255.0 * samples / (double)sse);
 }
 
-Microsoft::WRL::ComPtr<ID3D12Resource> MakeBuffer(ID3D12Device* dev, D3D12_HEAP_TYPE heap, UINT64 bytes,
-    D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags)
+Microsoft::WRL::ComPtr<ID3D12Resource> MakeBuffer(
+    ID3D12Device* dev, D3D12_HEAP_TYPE heap, UINT64 bytes, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags)
 {
     Microsoft::WRL::ComPtr<ID3D12Resource> r;
     if (FAILED(CreateD3D12Buffer(dev, heap, bytes, state, &r, flags))) r.Reset();
@@ -66,8 +68,8 @@ void TexEncoder::Prepare(ID3D12Device* dev)
 
 void TexEncoder::Build(ID3D12Device* dev)
 {
-    const auto                 t0 = std::chrono::steady_clock::now();
-    const std::vector<uint8_t> cso = WwmiReadFile((g_cso_dir + L"\\Bc7Half.cso").c_str());
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<uint8_t> cso = WwmiReadFile((g_addon.cso_dir + L"\\Bc7Half.cso").c_str());
 
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -88,7 +90,8 @@ void TexEncoder::Build(ID3D12Device* dev)
     Microsoft::WRL::ComPtr<ID3DBlob> blob;
     Microsoft::WRL::ComPtr<ID3DBlob> errors;
     HRESULT hr = cso.empty() ? E_FAIL : D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
-    if (SUCCEEDED(hr)) hr = dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_));
+    if (SUCCEEDED(hr))
+        hr = dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs_));
     if (SUCCEEDED(hr)) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = rs_.Get();
@@ -103,8 +106,8 @@ void TexEncoder::Build(ID3D12Device* dev)
         if (!err_) hr = E_OUTOFMEMORY;
     }
     if (FAILED(hr)) {
-        logger::write("TEXENC: the encoder could not be built, hr=%08lX%s -- no texture is re-encoded", (unsigned long)hr,
-            cso.empty() ? " (Bc7Half.cso is missing)" : "");
+        logger::write("TEXENC: the encoder could not be built, hr=%08lX%s -- no texture is re-encoded",
+            (unsigned long)hr, cso.empty() ? " (Bc7Half.cso is missing)" : "");
         failed_.store(true, std::memory_order_release);
         return;
     }
@@ -122,7 +125,8 @@ bool TexEncoder::Begin(ID3D12Device* dev, InFlight& f)
     HRESULT hr = S_OK;
     if (!f.alloc) {
         hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc));
-        if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, f.alloc.Get(), nullptr, IID_PPV_ARGS(&f.cl));
+        if (SUCCEEDED(hr))
+            hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, f.alloc.Get(), nullptr, IID_PPV_ARGS(&f.cl));
     } else {
         hr = f.alloc->Reset();
         if (SUCCEEDED(hr)) hr = f.cl->Reset(f.alloc.Get(), nullptr);
@@ -163,18 +167,19 @@ uint64_t TexEncoder::Submit(ID3D12Device* dev, ID3D12CommandQueue* queue, std::v
 
     std::vector<D3D12_RESOURCE_BARRIER> before_copy;
     std::vector<D3D12_RESOURCE_BARRIER> after_copy;
-    std::vector<size_t>                 copy_of;
+    std::vector<size_t> copy_of;
     for (size_t i = 0; i < work.size(); ++i) {
-        const Shrink&             s = work[i];
+        const Shrink& s = work[i];
         const D3D12_RESOURCE_DESC sd = s.src->GetDesc();
         const D3D12_RESOURCE_DESC dd = s.dst->GetDesc();
-        const UINT                bx = (UINT)(dd.Width / 4);
-        const UINT                by = dd.Height / 4;
-        const UINT                pitch = Bc7RowPitch(bx);
+        const UINT bx = (UINT)(dd.Width / 4);
+        const UINT by = dd.Height / 4;
+        const UINT pitch = Bc7RowPitch(bx);
         auto blocks = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, (UINT64)pitch * by, D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        UINT                        slot = 0;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu = blocks ? MigotoPort::AllocStagingDescriptor('t', &slot) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        UINT slot = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+            blocks ? MigotoPort::AllocStagingDescriptor('t', &slot) : D3D12_CPU_DESCRIPTOR_HANDLE{};
         if (!cpu.ptr) continue;
         f.srv_slots.push_back(slot);
         D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
@@ -185,13 +190,15 @@ uint64_t TexEncoder::Submit(ID3D12Device* dev, ID3D12CommandQueue* queue, std::v
         dev->CreateShaderResourceView(s.src, &vd, cpu);
         D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
         if (!MigotoPort::ShaderVisibleCopy(cpu, &gpu, nullptr, f.cl.Get())) continue;
-        const uint32_t consts[8] = { bx, by, pitch, 0, sd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, s.shift, 0, 0 };
+        const uint32_t consts[8] = { bx, by, pitch, 0, sd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, s.shift, 0,
+            0 };
         f.cl->SetComputeRoot32BitConstants(0, 8, consts, 0);
         f.cl->SetComputeRootDescriptorTable(1, gpu);
         f.cl->SetComputeRootUnorderedAccessView(2, blocks->GetGPUVirtualAddress());
         f.cl->SetComputeRootUnorderedAccessView(3, err_->GetGPUVirtualAddress());
         f.cl->Dispatch((bx + 7) / 8, (by + 7) / 8, 1);
-        before_copy.push_back(Transition(blocks.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        before_copy.push_back(
+            Transition(blocks.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
         before_copy.push_back(Transition(s.dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST));
         after_copy.push_back(Transition(s.dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON));
         copy_of.push_back(i);
@@ -200,7 +207,7 @@ uint64_t TexEncoder::Submit(ID3D12Device* dev, ID3D12CommandQueue* queue, std::v
     if (!copy_of.empty()) {
         f.cl->ResourceBarrier((UINT)before_copy.size(), before_copy.data());
         for (size_t c = 0; c < copy_of.size(); ++c) {
-            const D3D12_RESOURCE_DESC   dd = work[copy_of[c]].dst->GetDesc();
+            const D3D12_RESOURCE_DESC dd = work[copy_of[c]].dst->GetDesc();
             D3D12_TEXTURE_COPY_LOCATION from{};
             from.pResource = f.blocks[c].Get();
             from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -225,8 +232,8 @@ uint64_t TexEncoder::Submit(ID3D12Device* dev, ID3D12CommandQueue* queue, std::v
 bool TexEncoder::Open(const std::wstring& file, UINT shift, Stream* s, const char** why)
 {
     *why = nullptr;
-    const HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
-        nullptr);
+    const HANDLE h = CreateFileW(
+        file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         *why = "it did not open";
         return false;
@@ -237,7 +244,7 @@ bool TexEncoder::Open(const std::wstring& file, UINT shift, Stream* s, const cha
         return false;
     };
     uint8_t head[kDdsHead];
-    DWORD   got = 0;
+    DWORD got = 0;
     if (!ReadFile(h, head, kDdsHead, &got, nullptr) || got != kDdsHead) return fail("it is shorter than a DDS header");
     auto at = [&head](size_t o) {
         uint32_t v;
@@ -253,7 +260,8 @@ bool TexEncoder::Open(const std::wstring& file, UINT shift, Stream* s, const cha
     const UINT scale = 1u << shift;
     const UINT bx = width / 4;
     const UINT by = height / 4;
-    if (!shift || scale > kRowsStep || bx % scale || by % scale) return fail("it does not go that far down in whole blocks");
+    if (!shift || scale > kRowsStep || bx % scale || by % scale)
+        return fail("it does not go that far down in whole blocks");
     const UINT rows = (UINT)(kSlotBytes / Bc7RowPitch(bx)) / kRowsStep * kRowsStep;
     if (!rows) return fail("it is wider than a band can hold");
     s->file = h;
@@ -268,7 +276,9 @@ bool TexEncoder::Open(const std::wstring& file, UINT shift, Stream* s, const cha
 bool TexEncoder::ReadBand(const std::shared_ptr<Stream>& s, UINT band)
 {
     if (!Ready()) return false;
-    auto gone = [&] { return s->dropped.load(std::memory_order_acquire) || stop_reading_.load(std::memory_order_acquire); };
+    auto gone = [&] {
+        return s->dropped.load(std::memory_order_acquire) || stop_reading_.load(std::memory_order_acquire);
+    };
     unsigned k = 0;
     uint64_t value = 0;
     {
@@ -289,8 +299,8 @@ bool TexEncoder::ReadBand(const std::shared_ptr<Stream>& s, UINT band)
     }
     Slot& slot = ring_[k];
     if (!slot.upload) {
-        slot.upload = MakeBuffer(g_d3d12_device, D3D12_HEAP_TYPE_UPLOAD, kSlotBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
-            D3D12_RESOURCE_FLAG_NONE);
+        slot.upload = MakeBuffer(g_addon.d3d12_device, D3D12_HEAP_TYPE_UPLOAD, kSlotBytes,
+            D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
         const D3D12_RANGE none{ 0, 0 };
         if (!slot.upload || FAILED(slot.upload->Map(0, &none, reinterpret_cast<void**>(&slot.p))) || !slot.p) {
             slot.upload.Reset();
@@ -303,12 +313,13 @@ bool TexEncoder::ReadBand(const std::shared_ptr<Stream>& s, UINT band)
     const UINT row = bx * 16;
     const UINT pitch = Bc7RowPitch(bx);
     const UINT rows = (std::min)(s->rows, s->height / 4 - band * s->rows);
-    DWORD      got = 0;
-    bool       ok = true;
+    DWORD got = 0;
+    bool ok = true;
     if (row == pitch)
         ok = ReadFile(s->file, slot.p, row * rows, &got, nullptr) && got == row * rows;
     else
-        for (UINT r = 0; ok && r < rows; ++r) ok = ReadFile(s->file, slot.p + (size_t)r * pitch, row, &got, nullptr) && got == row;
+        for (UINT r = 0; ok && r < rows; ++r)
+            ok = ReadFile(s->file, slot.p + (size_t)r * pitch, row, &got, nullptr) && got == row;
     if (!ok) {
         s->failed.store(true, std::memory_order_release);
         return false;
@@ -332,29 +343,29 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
         }
     }
     if (take.empty()) return 0;
-    InFlight   f;
+    InFlight f;
     const bool open = Ready() && dev && queue && Begin(dev, f);
 
     struct InList {
-        Stream*                     s;
+        Stream* s;
         D3D12_GPU_DESCRIPTOR_HANDLE srv;
     };
     std::vector<InList> in_list;
-    std::vector<char>   recorded(take.size());
+    std::vector<char> recorded(take.size());
     for (size_t i = 0; i < take.size(); ++i) {
         const Band& b = take[i];
-        Stream&     s = *b.s;
+        Stream& s = *b.s;
         if (s.dropped.load(std::memory_order_acquire) || s.failed.load(std::memory_order_acquire)) continue;
         if (!open) {
             s.failed.store(true, std::memory_order_release);
             continue;
         }
         const D3D12_RESOURCE_DESC dd = s.dst->GetDesc();
-        const UINT                scale = 1u << s.shift;
-        const UINT                bx_in = s.width / 4;
-        const UINT                bx = bx_in / scale;
-        const UINT                pitch_in = Bc7RowPitch(bx_in);
-        const UINT                pitch = Bc7RowPitch(bx);
+        const UINT scale = 1u << s.shift;
+        const UINT bx_in = s.width / 4;
+        const UINT bx = bx_in / scale;
+        const UINT pitch_in = Bc7RowPitch(bx_in);
+        const UINT pitch = Bc7RowPitch(bx);
         auto at = std::find_if(in_list.begin(), in_list.end(), [&s](const InList& e) { return e.s == &s; });
         const bool first_in_list = at == in_list.end();
         if (first_in_list) {
@@ -365,15 +376,16 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
                 sd.Flags = D3D12_RESOURCE_FLAG_NONE;
                 D3D12_HEAP_PROPERTIES hp{};
                 hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-                if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                        IID_PPV_ARGS(&s.scratch))))
+                if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_COPY_DEST,
+                        nullptr, IID_PPV_ARGS(&s.scratch))))
                     s.scratch.Reset();
                 if (s.scratch)
-                    s.blocks = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, (UINT64)pitch * (s.rows / scale), D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                    s.blocks = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, (UINT64)pitch * (s.rows / scale),
+                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
             }
-            UINT                        srv_slot = 0;
-            D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.blocks ? MigotoPort::AllocStagingDescriptor('t', &srv_slot) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+            UINT srv_slot = 0;
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+                s.blocks ? MigotoPort::AllocStagingDescriptor('t', &srv_slot) : D3D12_CPU_DESCRIPTOR_HANDLE{};
             D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
             if (cpu.ptr) {
                 f.srv_slots.push_back(srv_slot);
@@ -394,12 +406,13 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
             at = in_list.end() - 1;
         }
         if (b.band == 0) {
-            const D3D12_RESOURCE_BARRIER open_dst = Transition(s.dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            const D3D12_RESOURCE_BARRIER open_dst =
+                Transition(s.dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
             f.cl->ResourceBarrier(1, &open_dst);
         }
-        const UINT                  r0 = b.band * s.rows;
-        const UINT                  rows_in = (std::min)(s.rows, s.height / 4 - r0);
-        const UINT                  rows = rows_in / scale;
+        const UINT r0 = b.band * s.rows;
+        const UINT rows_in = (std::min)(s.rows, s.height / 4 - r0);
+        const UINT rows = rows_in / scale;
         D3D12_TEXTURE_COPY_LOCATION band{};
         band.pResource = ring_[b.slot].upload.Get();
         band.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -412,12 +425,12 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
         into.pResource = s.scratch.Get();
         into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         f.cl->CopyTextureRegion(&into, 0, 0, 0, &band, nullptr);
-        const D3D12_RESOURCE_BARRIER pre[2] = {
-            Transition(s.scratch.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            Transition(s.blocks.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-        };
+        const D3D12_RESOURCE_BARRIER pre[2] = { Transition(s.scratch.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(s.blocks.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) };
         f.cl->ResourceBarrier(first_in_list ? 1 : 2, pre);
-        const uint32_t consts[8] = { bx, rows, pitch, 0, dd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, s.shift, 0, 0 };
+        const uint32_t consts[8] = { bx, rows, pitch, 0, dd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, s.shift, 0,
+            0 };
         f.cl->SetComputeRoot32BitConstants(0, 8, consts, 0);
         f.cl->SetComputeRootDescriptorTable(1, at->srv);
         f.cl->SetComputeRootUnorderedAccessView(2, s.blocks->GetGPUVirtualAddress());
@@ -441,7 +454,8 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
         to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         f.cl->CopyTextureRegion(&to, 0, (r0 / scale) * 4, 0, &out, nullptr);
         if (b.band + 1 == s.bands) {
-            const D3D12_RESOURCE_BARRIER close_dst = Transition(s.dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            const D3D12_RESOURCE_BARRIER close_dst =
+                Transition(s.dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
             f.cl->ResourceBarrier(1, &close_dst);
             s.done = true;
         }
@@ -496,7 +510,8 @@ bool TexEncodeTest::Ensure(ID3D12Device* dev)
     if (cl_) return true;
     if (failed_ || !dev) return false;
     HRESULT hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc_));
-    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc_.Get(), nullptr, IID_PPV_ARGS(&cl_));
+    if (SUCCEEDED(hr))
+        hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc_.Get(), nullptr, IID_PPV_ARGS(&cl_));
     if (SUCCEEDED(hr)) hr = cl_->Close();
     if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
     if (FAILED(hr)) {
@@ -520,9 +535,9 @@ void TexEncodeTest::Start(ID3D12Device* dev, ID3D12CommandQueue* queue)
         std::vector<PortApi::LoadedTexture> have;
         PortApi::LoadedTexturesOf(ns.c_str(), have);
         for (PortApi::LoadedTexture& t : have) {
-            const D3D12_RESOURCE_DESC       rd = t.dx12->GetDesc();
+            const D3D12_RESOURCE_DESC rd = t.dx12->GetDesc();
             const MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(t.res);
-            unsigned*                       skip = nullptr;
+            unsigned* skip = nullptr;
             if (!IsBc7(rd.Format))
                 skip = &skipped_.format;
             else if (rd.MipLevels > 1)
@@ -555,21 +570,23 @@ void TexEncodeTest::Start(ID3D12Device* dev, ID3D12CommandQueue* queue)
         }
     }
     if (items_.empty()) {
-        logger::write("TEXENC: nothing to encode in %u mod(s) on screen -- skipped %u not BC7, %u with mips, %u under %u px, "
-                      "%u not block-aligned at half size, %u not at rest",
-            mods_, skipped_.format, skipped_.mips, skipped_.too_small, kTexMinSide, skipped_.unaligned, skipped_.not_at_rest);
+        logger::write(
+            "TEXENC: nothing to encode in %u mod(s) on screen -- skipped %u not BC7, %u with mips, %u under %u px, "
+            "%u not block-aligned at half size, %u not at rest",
+            mods_, skipped_.format, skipped_.mips, skipped_.too_small, kTexMinSide, skipped_.unaligned,
+            skipped_.not_at_rest);
         return;
     }
 
-    const UINT   n = (UINT)items_.size();
+    const UINT n = (UINT)items_.size();
     const UINT64 err_bytes = 16ull * n;
     if (!out_ || out_->GetDesc().Width < out_bytes)
         out_ = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     err_ = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, err_bytes, D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    readback_ = MakeBuffer(dev, D3D12_HEAP_TYPE_READBACK, err_bytes + 16ull * n, D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_FLAG_NONE);
+    readback_ = MakeBuffer(
+        dev, D3D12_HEAP_TYPE_READBACK, err_bytes + 16ull * n, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
     D3D12_QUERY_HEAP_DESC qd{};
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qd.Count = 2 * n;
@@ -585,12 +602,12 @@ void TexEncodeTest::Start(ID3D12Device* dev, ID3D12CommandQueue* queue)
     cl_->SetComputeRootSignature(g_tex_encoder.RootSignature());
     cl_->SetPipelineState(g_tex_encoder.Pipeline());
     for (UINT i = 0; i < n; ++i) {
-        Item&                       it = items_[i];
+        Item& it = items_[i];
         D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
         if (!MigotoPort::ShaderVisibleCopy(it.srv, &gpu, nullptr, cl_.Get())) continue;
         const D3D12_RESOURCE_DESC rd = it.tex.dx12->GetDesc();
-        const uint32_t            consts[8] = { it.blocks_x, it.blocks_y, Bc7RowPitch(it.blocks_x), i,
-                       rd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, 1, 0, 0 };
+        const uint32_t consts[8] = { it.blocks_x, it.blocks_y, Bc7RowPitch(it.blocks_x), i,
+            rd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, 1, 0, 0 };
         cl_->SetComputeRoot32BitConstants(0, 8, consts, 0);
         cl_->SetComputeRootDescriptorTable(1, gpu);
         cl_->SetComputeRootUnorderedAccessView(2, out_->GetGPUVirtualAddress());
@@ -625,9 +642,9 @@ void TexEncodeTest::Start(ID3D12Device* dev, ID3D12CommandQueue* queue)
 void TexEncodeTest::Finish()
 {
     const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0_).count();
-    const UINT   n = (UINT)items_.size();
-    void*        p = nullptr;
-    D3D12_RANGE  all{ 0, (SIZE_T)(32ull * n) };
+    const UINT n = (UINT)items_.size();
+    void* p = nullptr;
+    D3D12_RANGE all{ 0, (SIZE_T)(32ull * n) };
     if (FAILED(readback_->Map(0, &all, &p)) || !p) {
         logger::write("TEXENC: its readback did not map");
         Release();
@@ -635,18 +652,18 @@ void TexEncodeTest::Finish()
     }
     const uint64_t* sums = (const uint64_t*)p;
     const uint64_t* ts = sums + 2ull * n;
-    double          gpu_ms = 0.0;
-    double          mpx_in = 0.0;
-    double          px_out = 0.0;
-    uint64_t        sse_rgb = 0;
-    uint64_t        sse_a = 0;
-    unsigned        done = 0;
+    double gpu_ms = 0.0;
+    double mpx_in = 0.0;
+    double px_out = 0.0;
+    uint64_t sse_rgb = 0;
+    uint64_t sse_a = 0;
+    unsigned done = 0;
     for (UINT i = 0; i < n; ++i) {
         const Item& it = items_[i];
         if (!it.recorded) continue;
         const D3D12_RESOURCE_DESC rd = it.tex.dx12->GetDesc();
-        const double              ms = ticks_per_ms_ > 0 ? (double)(ts[2 * i + 1] - ts[2 * i]) / ticks_per_ms_ : 0.0;
-        const double              out = (double)it.blocks_x * it.blocks_y * 16.0;
+        const double ms = ticks_per_ms_ > 0 ? (double)(ts[2 * i + 1] - ts[2 * i]) / ticks_per_ms_ : 0.0;
+        const double out = (double)it.blocks_x * it.blocks_y * 16.0;
         logger::write("TEXENC %llux%u %s -> %ux%u in %.2f ms on the graphics card; against a plain half-size average: "
                       "colour %.1f dB, alpha %.1f dB  [%ls]",
             (unsigned long long)rd.Width, rd.Height, rd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? "BC7 sRGB" : "BC7",
@@ -661,13 +678,14 @@ void TexEncodeTest::Finish()
     }
     D3D12_RANGE none{ 0, 0 };
     readback_->Unmap(0, &none);
-    logger::write("TEXENC: %u texture(s) of %u mod(s) on screen: %.0f Mpx read, %.0f Mpx written as BC7 in %.1f ms on the "
-                  "graphics card (%.0f Mpx written a second), %.0f ms from the request to the result; colour %.1f dB, "
-                  "alpha %.1f dB over all; skipped %u not BC7, %u with mips, %u under %u px, %u not block-aligned at half "
-                  "size, %u not at rest",
+    logger::write(
+        "TEXENC: %u texture(s) of %u mod(s) on screen: %.0f Mpx read, %.0f Mpx written as BC7 in %.1f ms on the "
+        "graphics card (%.0f Mpx written a second), %.0f ms from the request to the result; colour %.1f dB, "
+        "alpha %.1f dB over all; skipped %u not BC7, %u with mips, %u under %u px, %u not block-aligned at half "
+        "size, %u not at rest",
         done, mods_, mpx_in, px_out / 1e6, gpu_ms, gpu_ms > 0 ? px_out / 1e6 / (gpu_ms / 1000.0) : 0.0, wall_ms,
-        Psnr(sse_rgb, px_out * 3.0), Psnr(sse_a, px_out), skipped_.format, skipped_.mips, skipped_.too_small, kTexMinSide,
-        skipped_.unaligned, skipped_.not_at_rest);
+        Psnr(sse_rgb, px_out * 3.0), Psnr(sse_a, px_out), skipped_.format, skipped_.mips, skipped_.too_small,
+        kTexMinSide, skipped_.unaligned, skipped_.not_at_rest);
     Release();
 }
 
@@ -692,7 +710,7 @@ void TexEncodeTest::Tick(ID3D12CommandQueue* queue)
         return;
     }
     if (!request_.load(std::memory_order_acquire)) return;
-    ID3D12Device* dev = g_d3d12_device;
+    ID3D12Device* dev = g_addon.d3d12_device;
     if (!queue || !dev) return;
     if (!g_tex_encoder.Ready()) {
         g_tex_encoder.Prepare(dev);

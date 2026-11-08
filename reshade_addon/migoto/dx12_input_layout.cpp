@@ -19,7 +19,7 @@ namespace {
 
 class LayoutStandIn final : public ::ID3D11InputLayout {
 public:
-    Microsoft::WRL::ComPtr<ID3DBlob>      blob;
+    Microsoft::WRL::ComPtr<ID3DBlob> blob;
     std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
 
     ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&rc_); }
@@ -74,8 +74,7 @@ public:
     void Seal()
     {
         const SIZE_T bytes = elems.size() * sizeof(D3D11_INPUT_ELEMENT_DESC);
-        if (SUCCEEDED(D3DCreateBlob(bytes, &blob)) && blob)
-            memcpy(blob->GetBufferPointer(), elems.data(), bytes);
+        if (SUCCEEDED(D3DCreateBlob(bytes, &blob)) && blob) memcpy(blob->GetBufferPointer(), elems.data(), bytes);
     }
 
 private:
@@ -83,7 +82,7 @@ private:
 };
 
 struct PipelineLayout {
-    LayoutStandIn*     layout = nullptr;
+    LayoutStandIn* layout = nullptr;
     HackerInputLayout* hacker = nullptr;
 
     void Release()
@@ -93,14 +92,15 @@ struct PipelineLayout {
     }
 };
 
-static_assert(sizeof(D3D11_INPUT_ELEMENT_DESC) == offsetof(D3D11_INPUT_ELEMENT_DESC, InstanceDataStepRate) + sizeof(UINT),
+static_assert(
+    sizeof(D3D11_INPUT_ELEMENT_DESC) == offsetof(D3D11_INPUT_ELEMENT_DESC, InstanceDataStepRate) + sizeof(UINT),
     "the custom layout key copies the fields after SemanticName as bytes");
 
 std::unordered_map<unsigned long long, PipelineLayout> g_layouts;
-std::unordered_map<std::string, HackerInputLayout*>    g_custom_layouts;
-std::unordered_set<std::string>                        g_semantics;
-std::mutex                                             g_layout_mtx;
-LayoutStandIn*                                         g_current = nullptr;
+std::unordered_map<std::string, HackerInputLayout*> g_custom_layouts;
+std::unordered_set<std::string> g_semantics;
+std::mutex g_layout_mtx;
+LayoutStandIn* g_current = nullptr;
 
 } // namespace
 
@@ -118,8 +118,7 @@ void RecordInputLayout(unsigned long long pso, const InputElement* in, unsigned 
         d.Format = (DXGI_FORMAT)in[i].format;
         d.InputSlot = in[i].buffer_binding;
         d.AlignedByteOffset = in[i].offset;
-        d.InputSlotClass = in[i].instance_step_rate ? D3D11_INPUT_PER_INSTANCE_DATA
-                                                    : D3D11_INPUT_PER_VERTEX_DATA;
+        d.InputSlotClass = in[i].instance_step_rate ? D3D11_INPUT_PER_INSTANCE_DATA : D3D11_INPUT_PER_VERTEX_DATA;
         d.InstanceDataStepRate = in[i].instance_step_rate;
         L->elems.push_back(d);
     }
@@ -136,7 +135,7 @@ void RecordInputLayout(unsigned long long pso, const InputElement* in, unsigned 
 void SetCurrentInputLayout(unsigned long long pso)
 {
     std::lock_guard<std::mutex> l(g_layout_mtx);
-    auto                        it = g_layouts.find(pso);
+    auto it = g_layouts.find(pso);
     g_current = (it != g_layouts.end()) ? it->second.layout : nullptr;
 }
 
@@ -153,15 +152,14 @@ unsigned DescribeInputLayout(unsigned long long pso, char* buf, unsigned n)
     if (!buf || !n) return 0;
     buf[0] = 0;
     std::lock_guard<std::mutex> l(g_layout_mtx);
-    auto                        it = g_layouts.find(pso);
+    auto it = g_layouts.find(pso);
     if (it == g_layouts.end() || !it->second.layout) return 0;
     const auto& el = it->second.layout->elems;
-    unsigned    off = 0;
+    unsigned off = 0;
     for (size_t i = 0; i < el.size() && off + 64 < n; ++i) {
-        const int w = _snprintf_s(buf + off, n - off, _TRUNCATE, "%s%s%u@s%u+%u:f%u%s",
-            i ? " " : "", el[i].SemanticName ? el[i].SemanticName : "?",
-            el[i].SemanticIndex, el[i].InputSlot, el[i].AlignedByteOffset,
-            (unsigned)el[i].Format,
+        const int w = _snprintf_s(buf + off, n - off, _TRUNCATE, "%s%s%u@s%u+%u:f%u%s", i ? " " : "",
+            el[i].SemanticName ? el[i].SemanticName : "?", el[i].SemanticIndex, el[i].InputSlot,
+            el[i].AlignedByteOffset, (unsigned)el[i].Format,
             el[i].InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA ? "/inst" : "");
         if (w < 0) break;
         off += (unsigned)w;
@@ -172,7 +170,7 @@ unsigned DescribeInputLayout(unsigned long long pso, char* buf, unsigned n)
 HackerInputLayout* HackerInputLayoutOf(unsigned long long pso)
 {
     std::lock_guard<std::mutex> l(g_layout_mtx);
-    auto                        it = g_layouts.find(pso);
+    auto it = g_layouts.find(pso);
     if (!pso || it == g_layouts.end() || !it->second.layout || it->second.layout->elems.empty()) return nullptr;
     PipelineLayout& P = it->second;
     if (!P.hacker) {
@@ -192,10 +190,11 @@ HackerInputLayout* NewHackerInputLayout(const D3D11_INPUT_ELEMENT_DESC* elements
         const D3D11_INPUT_ELEMENT_DESC& d = elements[i];
         key += d.SemanticName ? d.SemanticName : "";
         key += '\0';
-        key.append(reinterpret_cast<const char*>(&d.SemanticIndex), sizeof(d) - offsetof(D3D11_INPUT_ELEMENT_DESC, SemanticIndex));
+        key.append(reinterpret_cast<const char*>(&d.SemanticIndex),
+            sizeof(d) - offsetof(D3D11_INPUT_ELEMENT_DESC, SemanticIndex));
     }
     std::lock_guard<std::mutex> l(g_layout_mtx);
-    HackerInputLayout*&         H = g_custom_layouts[key];
+    HackerInputLayout*& H = g_custom_layouts[key];
     if (!H) {
         auto* L = new LayoutStandIn();
         L->elems.assign(elements, elements + count);

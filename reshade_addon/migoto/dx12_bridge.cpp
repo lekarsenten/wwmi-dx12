@@ -1,25 +1,27 @@
 // See dx12_bridge.h.
 #include "dx12_bridge.h"
 #include "port_toggles.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 #include <mutex>
 #include <vector>
 #include <atomic>
 
 namespace MigotoPort {
 
-static Dx12Bridge                           s_bridge;
-static std::vector<unsigned long>           s_owner_stack;    // X30: which thread's scope held the global before
-static std::mutex                           s_bridge_mtx;     // guards s_bridge and s_owner_stack
-static std::atomic<unsigned long>           s_owner_tid{ 0 }; // X30: the thread whose scope set the global bridge last (0 = none open)
-static std::atomic<unsigned>                s_depth{ 0 };
-static std::atomic<unsigned long long>      s_displaced{ 0 };
-static std::atomic<unsigned long long>      s_wrong_draw{ 0 };
-static std::atomic<unsigned long long>      s_wrong_disp{ 0 };
-static thread_local Dx12Bridge              t_bridge; // X30: this thread's innermost open scope
-static thread_local std::vector<Dx12Bridge> t_stack;  // X30: what this thread's scopes were built from
-static thread_local unsigned                t_depth = 0;
-static thread_local bool                    t_game_state_owed = false;
+static Dx12Bridge s_bridge;
+static std::vector<unsigned long> s_owner_stack; // X30: which thread's scope held the global before
+static std::mutex s_bridge_mtx; // guards s_bridge and s_owner_stack
+static std::atomic<unsigned long> s_owner_tid{
+    0
+}; // X30: the thread whose scope set the global bridge last (0 = none open)
+static std::atomic<unsigned> s_depth{ 0 };
+static std::atomic<unsigned long long> s_displaced{ 0 };
+static std::atomic<unsigned long long> s_wrong_draw{ 0 };
+static std::atomic<unsigned long long> s_wrong_disp{ 0 };
+static thread_local Dx12Bridge t_bridge; // X30: this thread's innermost open scope
+static thread_local std::vector<Dx12Bridge> t_stack; // X30: what this thread's scopes were built from
+static thread_local unsigned t_depth = 0;
+static thread_local bool t_game_state_owed = false;
 
 static std::atomic<unsigned long long> s_foreign_cl{ 0 };
 
@@ -44,8 +46,7 @@ const Dx12Bridge& GetDx12Bridge()
         if (n <= 12 || (n % 5000) == 0)
             logger::write("X33 FOREIGN-LIST #%llu: thread %lu has no scope open and the global bridge names cl=%p, "
                           "published by thread %lu -- handing it no list instead",
-                n, tid, (void*)view.cl,
-                view.owner_tid);
+                n, tid, (void*)view.cl, view.owner_tid);
         view.cl = nullptr;
     }
     return view;
@@ -117,6 +118,30 @@ void BridgePop()
         s_owner_tid.store(0, std::memory_order_relaxed);
 }
 
+void BridgeSetTargets(DXGI_FORMAT rt_format, DXGI_FORMAT ds_format)
+{
+    if (!t_depth) return;
+    t_bridge.rt_format = rt_format;
+    t_bridge.ds_format = ds_format;
+}
+
+void BridgeSetBackBuffer(ID3D12Resource* bb)
+{
+    if (!t_depth) return;
+    t_bridge.back_buffer = bb;
+    t_bridge.back_buffer_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+}
+
+void BridgeSetGameBindings(const GameBindings& game)
+{
+    if (t_depth) t_bridge.game = game;
+}
+
+const Dx12Bridge* BridgeScope()
+{
+    return t_depth ? &t_bridge : nullptr;
+}
+
 unsigned BridgeDepth()
 {
     return s_depth.load(std::memory_order_relaxed);
@@ -126,12 +151,12 @@ bool BridgeNoteIssue(ID3D12GraphicsCommandList* cl, bool dispatch, unsigned a, u
 {
     if (!t_depth || !t_bridge.cl || cl == t_bridge.cl) return false;
     std::atomic<unsigned long long>& ctr = dispatch ? s_wrong_disp : s_wrong_draw;
-    const unsigned long long         n = ctr.fetch_add(1, std::memory_order_relaxed) + 1;
+    const unsigned long long n = ctr.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n <= 12 || (n % 5000) == 0)
         logger::write("X30 WRONG-LIST %s #%llu: thread %lu's scope named cl=%p but the engine records onto cl=%p "
                       "(%s %u,%u,%u)",
-            dispatch ? "DISPATCH" : "DRAW", n, GetCurrentThreadId(),
-            (void*)t_bridge.cl, (void*)cl, dispatch ? "groups" : "count,start,instances", a, b, c);
+            dispatch ? "DISPATCH" : "DRAW", n, GetCurrentThreadId(), (void*)t_bridge.cl, (void*)cl,
+            dispatch ? "groups" : "count,start,instances", a, b, c);
     return true;
 }
 
@@ -165,7 +190,7 @@ unsigned QueryResourceState(void* res)
 }
 
 static std::wstring s_dump_dir; // written once at config load, before any capture can run
-void                SetDumpDir(const wchar_t* dir)
+void SetDumpDir(const wchar_t* dir)
 {
     s_dump_dir = dir ? dir : L"";
 }
@@ -175,7 +200,7 @@ const std::wstring& DumpDir()
 }
 
 static std::atomic<unsigned long long> s_vb_null_unbinds{ 0 };
-unsigned long long                     VbNullUnbinds()
+unsigned long long VbNullUnbinds()
 {
     return s_vb_null_unbinds.load(std::memory_order_relaxed);
 }
@@ -188,7 +213,7 @@ static thread_local unsigned t_emit_n = 0;
 static thread_local uint32_t t_emit_x = 0;
 static thread_local uint32_t t_emit_y = 0;
 static thread_local uint32_t t_emit_z = 0;
-void                         NoteEmittedDispatch(uint32_t x, uint32_t y, uint32_t z)
+void NoteEmittedDispatch(uint32_t x, uint32_t y, uint32_t z)
 {
     ++t_emit_n;
     t_emit_x = x;
@@ -213,7 +238,7 @@ unsigned TakeEmittedDispatch(uint32_t* x, uint32_t* y, uint32_t* z)
 static std::atomic<unsigned> s_vb_calls{ 0 };
 static std::atomic<unsigned> s_vb_nonnull{ 0 };
 static std::atomic<uint64_t> s_vb_last_ps{ 0 };
-void                         NoteVbBind(const void* state, int nonnull)
+void NoteVbBind(const void* state, int nonnull)
 {
     s_vb_calls.fetch_add(1, std::memory_order_relaxed);
     if (nonnull) {

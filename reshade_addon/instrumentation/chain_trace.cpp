@@ -1,6 +1,7 @@
 // chain_trace.cpp -- the H3 chain trace (see chain_trace.h).
 #include "../addon_common.h"
 #include "chain_trace.h"
+#include "../migoto/port_api.h"
 
 ChainTrace g_chain_trace;
 
@@ -15,9 +16,10 @@ void ChainTrace::Open()
         wchar_t* slash = wcsrchr(exe, L'\\');
         if (slash) {
             *slash = 0;
-            _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s"
-                                                    L"\\"
-                                                    L"wwmi_dx12_chain_trace.log",
+            _snwprintf_s(path, MAX_PATH, _TRUNCATE,
+                L"%s"
+                L"\\"
+                L"wwmi_dx12_chain_trace.log",
                 exe);
         }
     }
@@ -62,10 +64,12 @@ void ChainTrace::Vars(const char* when)
 {
     if (!fp_) return;
     fprintf(fp_, "--- f%u %s: all engine variables ---%c", frame_, when, kLF);
-    PortApi::ForEachVariable([](const wchar_t* fq, float v, bool persist, void* user) {
-        FILE* fp = static_cast<FILE*>(user);
-        if (fp) _fprintf_l(fp, "    %-70ls = %g%s%c", logger::utf8_locale(), fq ? fq : L"?", v,
-            persist ? "  (persist)" : "", kLF);
-    },
+    PortApi::ForEachVariable(
+        [](const wchar_t* fq, float v, bool persist, void* user) {
+            FILE* fp = static_cast<FILE*>(user);
+            if (fp)
+                _fprintf_l(fp, "    %-70ls = %g%s%c", logger::utf8_locale(), fq ? fq : L"?", v,
+                    persist ? "  (persist)" : "", kLF);
+        },
         fp_);
 }

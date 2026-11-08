@@ -32,13 +32,13 @@ extern bool (*g_query_reloc)(unsigned long long res, unsigned long long* new_va,
 
 // D3D11 limits, so the state block holds exactly what a DX11 context could.
 enum : unsigned {
-    kStages = 6,                                                // v h d g p c  (index order matches StageIndex below)
+    kStages = 6, // v h d g p c  (index order matches StageIndex below)
     kMaxCB = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, // 14
-    kMaxSRV = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,     // 128
-    kMaxUAV = D3D11_PS_CS_UAV_REGISTER_COUNT,                   // 8
-    kMaxSamp = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT,           // 16
-    kMaxRTV = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,           // 8
-    kMaxVB = D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT,         // 32
+    kMaxSRV = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, // 128
+    kMaxUAV = D3D11_PS_CS_UAV_REGISTER_COUNT, // 8
+    kMaxSamp = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, // 16
+    kMaxRTV = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, // 8
+    kMaxVB = D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, // 32
 };
 
 inline int StageIndex(char stage)
@@ -55,117 +55,116 @@ inline int StageIndex(char stage)
 }
 
 struct ShimVbRecord {
-    ID3D12Resource*           res = nullptr; // identity + copy source; used only while this frame runs
+    ID3D12Resource* res = nullptr; // identity + copy source; used only while this frame runs
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-    UINT                      size = 0;
-    UINT                      stride = 0;
+    UINT size = 0;
+    UINT stride = 0;
 };
 
 struct LayoutOverride {
-    unsigned long long              pso = 0;
+    unsigned long long pso = 0;
     const D3D11_INPUT_ELEMENT_DESC* elements = nullptr;
-    UINT                            count = 0;
+    UINT count = 0;
 };
 
 struct PipeState {
-    ID3D11DeviceChild*         shader[kStages] = {};
-    ID3D11Buffer*              cb[kStages][kMaxCB] = {};
-    ID3D11ShaderResourceView*  srv[kStages][kMaxSRV] = {};
-    uint32_t                   srv_gen[kStages][kMaxSRV] = {};
-    ID3D11SamplerState*        samp[kStages][kMaxSamp] = {};
+    ID3D11DeviceChild* shader[kStages] = {};
+    ID3D11Buffer* cb[kStages][kMaxCB] = {};
+    uint32_t cb_gen[kStages][kMaxCB] = {};
+    ID3D11ShaderResourceView* srv[kStages][kMaxSRV] = {};
+    uint32_t srv_gen[kStages][kMaxSRV] = {};
+    ID3D11SamplerState* samp[kStages][kMaxSamp] = {};
     ID3D11UnorderedAccessView* uav[kMaxUAV] = {}; // CS uses u0..u7; OM UAVs land here too
-    ID3D11RenderTargetView*    rtv[kMaxRTV] = {};
-    ID3D11DepthStencilView*    dsv = nullptr;
-    UINT                       num_rtv = 0;
+    ID3D11RenderTargetView* rtv[kMaxRTV] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    UINT num_rtv = 0;
 
-    ID3D11Buffer*            vb[kMaxVB] = {};
-    UINT                     vb_stride[kMaxVB] = {};
-    UINT                     vb_offset[kMaxVB] = {};
-    UINT                     num_vb = 0;
-    ShimVbRecord             shim_vb[kMaxVB] = {}; // what we wrote to the real list; see above
-    ID3D11Buffer*            ib = nullptr;
-    DXGI_FORMAT              ib_format = DXGI_FORMAT_UNKNOWN;
-    UINT                     ib_offset = 0;
-    ID3D11InputLayout*       layout = nullptr;
-    LayoutOverride           layout_override;
+    ID3D11Buffer* vb[kMaxVB] = {};
+    UINT vb_stride[kMaxVB] = {};
+    UINT vb_offset[kMaxVB] = {};
+    UINT num_vb = 0;
+    ShimVbRecord shim_vb[kMaxVB] = {}; // what we wrote to the real list; see above
+    ID3D11Buffer* ib = nullptr;
+    DXGI_FORMAT ib_format = DXGI_FORMAT_UNKNOWN;
+    UINT ib_offset = 0;
+    ID3D11InputLayout* layout = nullptr;
+    LayoutOverride layout_override;
     D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
-    ID3D11BlendState*        blend = nullptr;
-    FLOAT                    blend_factor[4] = { 1, 1, 1, 1 };
-    UINT                     sample_mask = 0xffffffff;
+    ID3D11BlendState* blend = nullptr;
+    FLOAT blend_factor[4] = { 1, 1, 1, 1 };
+    UINT sample_mask = 0xffffffff;
     ID3D11DepthStencilState* depth = nullptr;
-    UINT                     stencil_ref = 0;
-    ID3D11RasterizerState*   raster = nullptr;
-    D3D11_VIEWPORT           viewport = {};
-    bool                     has_viewport = false;
-    D3D11_RECT               scissor = {};
-    bool                     has_scissor = false;
+    UINT stencil_ref = 0;
+    ID3D11RasterizerState* raster = nullptr;
+    D3D11_VIEWPORT viewport = {};
+    bool has_viewport = false;
+    D3D11_RECT scissor = {};
+    bool has_scissor = false;
 };
 
 PipeState& State();
-// The SRV write counter (see PipeState::srv_gen): monotonic, compare by signed difference.
-uint32_t SrvWriteGen();
 
-typedef void (*ModDrawFn)(unsigned count, unsigned start, int base_vertex, unsigned instances,
-    unsigned start_instance, bool indexed, void* user);
-void      SetModDrawCallback(ModDrawFn fn, void* user);
+typedef void (*ModDrawFn)(unsigned count, unsigned start, int base_vertex, unsigned instances, unsigned start_instance,
+    bool indexed, void* user);
+void SetModDrawCallback(ModDrawFn fn, void* user);
 ModDrawFn ModDrawCallback(void** out_user);
 
-bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex,
-    UINT instances, UINT start_instance);
+bool IssueDraw(bool indexed, UINT count, UINT start, INT base_vertex, UINT instances, UINT start_instance);
 bool IssueDispatch(UINT x, UINT y, UINT z);
 
-void               ArmPresentDrawProbe(int frames);
-bool               PresentDrawProbeArmed();
-void               PresentDrawProbeFrameDone();
+void ArmPresentDrawProbe(int frames);
+bool PresentDrawProbeArmed();
+void PresentDrawProbeFrameDone();
 unsigned long long OwnListDrawsIssued();
-
-void SkCapArm(int dispatches);
-void SkCapArmFrames(int frames);
-void SkCapSnapRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name,
-    ID3D12Resource* src, unsigned long long off, unsigned long long bytes, unsigned state,
-    const void* cs, unsigned seq, unsigned gx, unsigned gy, unsigned gz,
-    const char* prov);
-void SkCapSnapDraw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name,
-    ID3D12Resource* src, unsigned long long off, unsigned long long bytes, unsigned state,
-    unsigned seq, const char* prov);
-/* Publish which game dispatch is about to issue the next captured pass -- see SkCapPass::caller_*. */
-void SkCapSetCaller(const wchar_t* ns, unsigned long long cs, unsigned tgy, int mod);
-bool SkCapArmed();
-void SkCapBeforeDispatch(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z);
-void SkCapAfterDispatch(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z);
-void SkCapDrain(); // call once per Present
 
 unsigned long long DispatchesIssued();
 // Times IssueDispatch was ENTERED. calls - issued = dispatches abandoned at a gate; see DISPATCH-BAIL.
 unsigned long long DispatchCalls();
 
 void UploadFrameTick();
+// Released by UploadFrameTick once the GPU has passed its last use.
+void RetireDx12Resource(ID3D12Resource* res);
+void SetRetireObserver(void (*fn)(ID3D12Resource* res)); // told of each, on the thread whose release it was
+void SetTextureUseObserver(void (*fn)(ID3D12Resource* res)); // a 2D texture bound for one of our draws or dispatches
+void NoteTextureUse(ID3D11Resource* res); // ... or a texture a mod's list assigns to a slot
 
 bool ReflectShader(struct ShaderCode& sc);
 
 void TransitionResource(ID3D12GraphicsCommandList* cl, ID3D11Resource* res, D3D12_RESOURCE_STATES to);
 
-D3D12_RESOURCE_STATES     ListStateOf(ID3D12GraphicsCommandList* cl, struct WrapResource* r);
-D3D12_GPU_VIRTUAL_ADDRESS StaticCbSnapshot(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, UINT64 src_off, UINT bytes);
+// Buffers OURS (mod geometry, relocations): their state per list, and the UAV barriers owed on them.
+void OwnBuffer(ID3D12Resource* res);
+void DisownBuffer(ID3D12Resource* res);
+bool OwnedBuffer(ID3D12Resource* res);
+D3D12_RESOURCE_STATES OwnedTransition(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES to);
+void ListBuffersToCommon(ID3D12GraphicsCommandList* cl);
+void FlushUavBarriers(ID3D12GraphicsCommandList* cl);
+void ListBuffersForget(ID3D12GraphicsCommandList* cl);
+
+D3D12_RESOURCE_STATES ListStateOf(ID3D12GraphicsCommandList* cl, struct WrapResource* r);
+D3D12_GPU_VIRTUAL_ADDRESS StaticCbSnapshot(
+    ID3D12GraphicsCommandList* cl, ID3D12Resource* src, UINT64 src_off, UINT bytes);
 
 void SetBufCopyShader(const void* dxil, size_t bytes);
-bool CopyBufferCs(ID3D12GraphicsCommandList* cl, struct WrapResource* dst, UINT64 dst_off,
-    struct WrapResource* src, UINT64 src_off, UINT64 bytes);
+bool CopyBufferCs(ID3D12GraphicsCommandList* cl, struct WrapResource* dst, UINT64 dst_off, struct WrapResource* src,
+    UINT64 src_off, UINT64 bytes);
 
-void     QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t seq = 0);
-void     QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data, UINT subresources, uint64_t seq = 0);
-void     FlushPendingUploads(ID3D12GraphicsCommandList* cl);
-bool     UploadPendingFor(ID3D11Resource* res); // its copy is not recorded on a command list yet
+void QueueUpload(ID3D11Resource* dst, const void* data, size_t bytes, uint64_t seq = 0);
+void QueueTextureUpload(ID3D11Resource* dst, const D3D11_SUBRESOURCE_DATA* data, UINT subresources, uint64_t seq = 0);
+void FlushPendingUploads(ID3D12GraphicsCommandList* cl);
+bool UploadPendingFor(ID3D11Resource* res); // its copy is not recorded on a command list yet
 uint64_t NextUploadSeq();
-bool     ListHoldsUpload(ID3D12GraphicsCommandList* cl, const struct WrapResource* wr);
+bool ListHoldsUpload(ID3D12GraphicsCommandList* cl, const struct WrapResource* wr);
 
 // Descriptor heaps OURS alone. Never the game's shared bindless heap.
-bool                        EnsureHeaps();
-bool                        ShaderVisibleCopy(D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu,
+bool EnsureHeaps();
+bool ShaderVisibleCopy(D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu,
     D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu, ID3D12GraphicsCommandList* cl);
 D3D12_CPU_DESCRIPTOR_HANDLE AllocStagingDescriptor(char kind, UINT* out_slot);
-void                        ReleaseStagingDescriptor(char kind, UINT slot);
+void ReleaseStagingDescriptor(char kind, UINT slot);
+// True once per SetDescriptorHeaps of ours: the game's heaps and root tables need putting back.
+bool TakeHeapsChanged();
 
 
 // GAME PIPELINE STATE INHERITANCE -- attempted, REMOVED, do not rebuild it this way.

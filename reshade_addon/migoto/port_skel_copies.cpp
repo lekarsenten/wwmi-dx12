@@ -3,8 +3,8 @@
 #include "globals.h"
 #include "IniHandler.h"
 #include "CommandList.h"
-#include "port_keygate.h"
-#include "../../src/log.h"
+#include "selection_watch.h"
+#include "../core/log.h"
 
 #include <iterator>
 #include <memory>
@@ -16,40 +16,40 @@ namespace PortApi {
 namespace {
 
 struct ResState {
-    ID3D11Resource*                     resource = nullptr;
-    ID3D11View*                         view = nullptr;
-    ID3D11Device*                       device = nullptr;
-    bool                                is_null = true;
-    bool                                substantiated = false;
-    ResourcePoolCache                   pool;
+    ID3D11Resource* resource = nullptr;
+    ID3D11View* view = nullptr;
+    ID3D11Device* device = nullptr;
+    bool is_null = true;
+    bool substantiated = false;
+    ResourcePoolCache pool;
     std::unique_ptr<ResourceHandleInfo> handle_info;
-    unsigned                            frame_no = 0;
-    int                                 copies_this_frame = 0;
+    unsigned frame_no = 0;
+    int copies_this_frame = 0;
 };
 
 struct Copy {
     std::vector<ResState> res;
-    std::vector<float>    vars;
-    bool                  drawn = false;
+    std::vector<float> vars;
+    bool drawn = false;
 };
 
 struct Skel {
-    std::vector<CustomResource*>      res;
-    std::vector<char>                 draw_written;
+    std::vector<CustomResource*> res;
+    std::vector<char> draw_written;
     std::vector<CommandListVariable*> vars;
-    std::vector<float>                start;
-    std::wstring                      update_fq;
-    std::vector<Copy>                 copies;
+    std::vector<float> start;
+    std::wstring update_fq;
+    std::vector<Copy> copies;
 };
 
 struct Swapped {
-    std::wstring      ns;
-    unsigned          copy = 0;
+    std::wstring ns;
+    unsigned copy = 0;
     std::vector<char> res;
 };
 
 std::unordered_map<std::wstring, Skel> g_skels;
-unsigned                               g_skels_gen = ~0u;
+unsigned g_skels_gen = ~0u;
 
 std::wstring Lower(const wchar_t* s)
 {
@@ -65,7 +65,7 @@ bool StartsWithI(const std::wstring& s, const std::wstring& prefix)
 
 bool IsGate(const std::wstring& name)
 {
-    const size_t       at = (!name.empty() && name[0] == L'$') ? 1 : 0;
+    const size_t at = (!name.empty() && name[0] == L'$') ? 1 : 0;
     const std::wstring bare = name.substr(at);
     return StartsWithI(bare, L"merge_status_id") || StartsWithI(bare, L"state_id");
 }
@@ -88,11 +88,11 @@ void ExchangeVars(Skel& s, Copy& c)
     bool watched_changed = false;
     for (size_t i = 0; i < s.vars.size(); ++i) {
         float& live = s.vars[i]->fval;
-        if (memcmp(&live, &c.vars[i], sizeof live) != 0 && MigotoPort::SelectionVarWatched(&live))
+        if (memcmp(&live, &c.vars[i], sizeof live) != 0 && MigotoPort::g_selection_watch.VarWatched(&live))
             watched_changed = true;
         std::swap(live, c.vars[i]);
     }
-    if (watched_changed) MigotoPort::BumpSelectionInputs();
+    if (watched_changed) MigotoPort::g_selection_watch.BumpInputs();
 }
 
 void Drop(ResState& s)
@@ -117,15 +117,15 @@ void ForgetOnReload()
 Skel& SkelOf(const wchar_t* ns)
 {
     const std::wstring key = Lower(ns);
-    auto               it = g_skels.find(key);
+    auto it = g_skels.find(key);
     if (it != g_skels.end()) return it->second;
-    Skel               s;
+    Skel s;
     const std::wstring rp = L"resource\\" + key + L"\\";
     for (auto& kv : customResources) {
         if (!StartsWithI(kv.first, rp)) continue;
         const std::wstring tail = Lower(kv.first.c_str() + rp.size());
-        const bool         rw = tail == L"mergedskeletonrw" || tail == L"extramergedskeletonrw";
-        const bool         out = tail == L"mergedskeleton" || tail == L"extramergedskeleton" ||
+        const bool rw = tail == L"mergedskeletonrw" || tail == L"extramergedskeletonrw";
+        const bool out = tail == L"mergedskeleton" || tail == L"extramergedskeleton" ||
             StartsWithI(tail, L"remappedskeletoncomponent") || StartsWithI(tail, L"extraremappedskeletoncomponent");
         if (!rw && !out) continue;
         s.res.push_back(&kv.second);
@@ -142,8 +142,8 @@ Skel& SkelOf(const wchar_t* ns)
     }
     wchar_t fq[512] = {};
     if (ResolveSection(ns, nullptr, L"UpdateMergedSkeleton", fq, std::size(fq)) && fq[0]) s.update_fq = fq;
-    logger::write("SKCOPIES ns='%ls': %zu skeleton resource(s), %zu merge gate(s), update section %ls -- %s",
-        ns, s.res.size(), s.vars.size(), s.update_fq.empty() ? L"(none)" : s.update_fq.c_str(),
+    logger::write("SKCOPIES ns='%ls': %zu skeleton resource(s), %zu merge gate(s), update section %ls -- %s", ns,
+        s.res.size(), s.vars.size(), s.update_fq.empty() ? L"(none)" : s.update_fq.c_str(),
         s.res.empty() || s.update_fq.empty() ? "no merged skeleton here: copies share the ini's own"
                                              : "each copy drawn in a frame gets its own");
     return g_skels.emplace(key, std::move(s)).first->second;
@@ -173,7 +173,7 @@ SkelCopyScope::SkelCopyScope(const wchar_t* ns, unsigned copy)
     ForgetOnReload();
     Skel& s = SkelOf(ns);
     if (!copy || s.res.empty() || s.update_fq.empty()) return;
-    Copy&    c = CopyOf(s, copy);
+    Copy& c = CopyOf(s, copy);
     Swapped* w = new Swapped{ Lower(ns), copy, std::vector<char>(s.res.size(), 0) };
     for (size_t i = 0; i < s.res.size(); ++i) {
         if (!s.draw_written[i] && !c.res[i].resource) continue;
@@ -190,7 +190,7 @@ SkelCopyScope::~SkelCopyScope()
     Swapped* w = static_cast<Swapped*>(swapped_);
     if (!w) return;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    auto                                  it = g_skels.find(w->ns);
+    auto it = g_skels.find(w->ns);
     if (it != g_skels.end() && g_skels_gen == g_generation) {
         Skel& s = it->second;
         Copy& c = s.copies[w->copy];

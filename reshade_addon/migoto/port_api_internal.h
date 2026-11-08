@@ -15,22 +15,24 @@ class CustomResource;
 namespace PortApi {
 
 // The one device/context pair their engine runs against, and whether a config is loaded (port_api.cpp).
-extern HackerDevice         g_dev;
+extern HackerDevice g_dev;
 extern FrameAnalysisContext g_ctx;
-extern bool                 g_loaded;
-extern unsigned             g_generation; // bumped on every (re)load
+extern bool g_loaded;
+extern unsigned g_generation; // bumped on every (re)load
 
 // Their engine assumes the immediate context's single thread; every call in holds this.
 std::recursive_mutex& EngineLock();
 
 // Parse-time snapshots and indexes (port_parse_index.cpp). Rebuilt after every parse, read lock-free.
-void                                                           RebuildParseSnapshots();
-bool                                                           OverrideHashKnown(uint64_t h);
-bool                                                           TextureOverrideHashKnown(uint32_t h); // true before the first parse: unknown, ask the engine
-std::unordered_map<std::wstring, TextureOverride*>&            SectionIndex();
+void RebuildParseSnapshots();
+bool OverrideHashKnown(uint64_t h);
+bool TextureOverrideHashKnown(uint32_t h); // true before the first parse: unknown, ask the engine
+std::unordered_map<std::wstring, TextureOverride*>& SectionIndex();
+bool TextureOverrideAssignsThis(TextureOverride* to);
+void TextureOverrideReadVars(TextureOverride* to, std::vector<const float*>& vars);
 std::unordered_map<std::wstring, ExplicitCommandListSection*>& ExplicitIndex();
-std::unordered_map<const void*, std::wstring>&                 ExplicitNameIndex();
-std::unordered_map<const void*, std::wstring>&                 CustomResourceNameIndex();
+std::unordered_map<const void*, std::wstring>& ExplicitNameIndex();
+std::unordered_map<const void*, std::wstring>& CustomResourceNameIndex();
 
 // Each extra copy drawn this frame gets its mod's [CommandListUpdateMergedSkeleton] run on its own state (port_skel_copies.cpp).
 void RunSkelCopyUpdates();
@@ -46,11 +48,11 @@ bool DeferredPending(CustomResource* r);
 // Every variable's value, the ini params and each custom shader's runs this frame, put back after a run that is to
 // leave none of its writes (port_vars.cpp). Caller holds the engine lock across both.
 struct EngineValues {
-    std::vector<float>                    vars;
-    std::vector<DirectX::XMFLOAT4>        params;
+    std::vector<float> vars;
+    std::vector<DirectX::XMFLOAT4> params;
     std::vector<std::pair<unsigned, int>> shader_runs; // frame_no, executions_this_frame
-    void                                  Take();
-    void                                  PutBack() const;
+    void Take();
+    void PutBack() const;
 };
 
 } // namespace PortApi

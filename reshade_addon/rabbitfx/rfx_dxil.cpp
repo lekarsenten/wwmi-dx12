@@ -10,24 +10,23 @@
 
 namespace {
 
-HMODULE               g_dxc = nullptr;
-HMODULE               g_dxil = nullptr;
+HMODULE g_dxc = nullptr;
+HMODULE g_dxil = nullptr;
 DxcCreateInstanceProc g_dxc_create = nullptr;
 DxcCreateInstanceProc g_dxil_create = nullptr;
-bool                  g_init_tried = false;
-bool                  g_init_ok = false;
-std::string           g_init_why;
-std::mutex            g_mtx; // init, and one patch at a time: a handful of shaders per session
+bool g_init_tried = false;
+bool g_init_ok = false;
+std::string g_init_why;
+std::mutex g_mtx; // init, and one patch at a time: a handful of shaders per session
 
-template <class T>
-struct Com {
+template <class T> struct Com {
     T* p = nullptr;
     ~Com()
     {
         if (p) p->Release();
     }
-    T**      operator&() { return &p; }
-    T*       operator->() const { return p; }
+    T** operator&() { return &p; }
+    T* operator->() const { return p; }
     explicit operator bool() const { return p != nullptr; }
 };
 
@@ -47,15 +46,15 @@ std::string ErrText(IDxcOperationResult* r)
 
 struct Module {
     std::string t;
-    int         max_node = -1;
+    int max_node = -1;
 
     void Scan()
     {
         max_node = -1;
         for (size_t i = 0; (i = t.find("\n!", i)) != std::string::npos; ++i) {
             size_t j = i + 2;
-            int    n = 0;
-            bool   any = false;
+            int n = 0;
+            bool any = false;
             while (j < t.size() && t[j] >= '0' && t[j] <= '9') {
                 n = n * 10 + (t[j] - '0');
                 ++j;
@@ -68,7 +67,7 @@ struct Module {
     bool NodeSpan(int n, size_t& b, size_t& e) const
     {
         const std::string key = "\n!" + std::to_string(n) + " = ";
-        const size_t      i = t.find(key);
+        const size_t i = t.find(key);
         if (i == std::string::npos) return false;
         b = i + 1;
         e = t.find('\n', b);
@@ -100,11 +99,11 @@ struct Module {
 std::vector<std::string> Operands(const std::string& node)
 {
     std::vector<std::string> out;
-    const size_t             open = node.find("!{");
-    const size_t             close = node.rfind('}');
+    const size_t open = node.find("!{");
+    const size_t close = node.rfind('}');
     if (open == std::string::npos || close == std::string::npos || close < open + 2) return out;
-    int         depth = 0;
-    bool        quote = false;
+    int depth = 0;
+    bool quote = false;
     std::string cur;
     for (size_t i = open + 2; i < close; ++i) {
         const char c = node[i];
@@ -185,14 +184,14 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
     out.unmasked = 0;
     auto def_of = [&](const std::string& name) -> std::string { // the text of `  <name> = ...` (no newline)
         const std::string key = "\n  " + name + " = ";
-        const size_t      p = m.t.find(key);
+        const size_t p = m.t.find(key);
         if (p == std::string::npos) return std::string();
         const size_t e = m.t.find('\n', p + 1);
         return m.t.substr(p + key.size(), e - (p + key.size()));
     };
     const std::string dcall = "call void @dx.op.discard(i32 82, i1 ";
     for (size_t p = 0; (p = m.t.find(dcall, p)) != std::string::npos; p += dcall.size()) {
-        const size_t      ce = m.t.find(')', p + dcall.size());
+        const size_t ce = m.t.find(')', p + dcall.size());
         const std::string cond = m.t.substr(p + dcall.size(), ce - (p + dcall.size()));
         if (cond.empty() || cond[0] != '%') continue;
         const std::string cd = def_of(cond);
@@ -204,9 +203,9 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         const std::string xd = def_of(x);
         if (xd.rfind("call float @dx.op.binary.f32(i32 36, ", 0) != 0) continue; // FMin
         const std::string key = "\n  " + y + " = " + yd;
-        const size_t      yp = m.t.find(key);
+        const size_t yp = m.t.find(key);
         if (yp == std::string::npos) continue;
-        const size_t cpos = yp + key.size() - 18;          // the 18-char constant ends the line
+        const size_t cpos = yp + key.size() - 18; // the 18-char constant ends the line
         if (m.t.compare(cpos, 6, "0xBFD5") != 0) continue; // trailing metadata would shift it
         m.t.replace(cpos, 18, "1.000000e+00");
         ++out.unmasked;
@@ -216,9 +215,9 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         for (size_t p = 0; (p = m.t.find(name, p)) != std::string::npos; p += name.size()) {
             const char nx = p + name.size() < m.t.size() ? m.t[p + name.size()] : '\0';
             if (nx >= '0' && nx <= '9') continue;
-            const size_t      ls = m.t.rfind('\n', p) + 1;
+            const size_t ls = m.t.rfind('\n', p) + 1;
             const std::string line = m.t.substr(ls, m.t.find('\n', p) - ls);
-            const size_t      eq = line.find(" = ");
+            const size_t eq = line.find(" = ");
             if (line.rfind("  %", 0) != 0 || eq == std::string::npos || ls + eq + 3 > p) continue;
             r.emplace_back(line.substr(2, eq - 2), line.substr(eq + 3));
         }
@@ -236,17 +235,18 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
     };
     static const char kThirdOff[] = ", 0xBFD5";
     for (size_t p = 0; (p = m.t.find(kThirdOff, p)) != std::string::npos; p += sizeof(kThirdOff) - 1) {
-        const size_t      ls = m.t.rfind('\n', p) + 1;
-        const size_t      le = m.t.find('\n', p);
+        const size_t ls = m.t.rfind('\n', p) + 1;
+        const size_t le = m.t.find('\n', p);
         const std::string line = m.t.substr(ls, le - ls);
-        const size_t      eq = line.find(" = fadd fast float %");
+        const size_t eq = line.find(" = fadd fast float %");
         if (line.rfind("  %", 0) != 0 || eq == std::string::npos || le != p + 20) continue;
         const std::string y = line.substr(2, eq - 2);
-        const size_t      x0 = eq + 19;
-        if (def_of(line.substr(x0, line.find(',', x0) - x0)).rfind("call float @dx.op.binary.f32(i32 36, ", 0) != 0) continue;
+        const size_t x0 = eq + 19;
+        if (def_of(line.substr(x0, line.find(',', x0) - x0)).rfind("call float @dx.op.binary.f32(i32 36, ", 0) != 0)
+            continue;
         std::string v = y;
-        auto        us = users(v);
-        double      k = 0;
+        auto us = users(v);
+        double k = 0;
         if (us.size() == 1 && us[0].second.rfind("fmul fast float " + v + ", ", 0) == 0 &&
             value_of(us[0].second.substr(16 + v.size() + 2), k) && k > 0) {
             v = us[0].first;
@@ -257,7 +257,7 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
             !value_of(us[0].second.substr(20 + v.size() + 2), t) || t < 0 || t > 0.01)
             continue;
         const std::string c = us[0].first;
-        const auto        cus = users(c);
+        const auto cus = users(c);
         if (cus.empty() || !std::all_of(cus.begin(), cus.end(), [&](const std::pair<std::string, std::string>& u) {
                 return u.second == "select i1 " + c + ", float 0.000000e+00, float 1.000000e+00";
             }))
@@ -265,16 +265,16 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         m.t.replace(p + 2, 18, "1.000000e+00");
         ++out.unmasked;
     }
-    static const char        kIgn[] = "0x404A7DD040000000";
+    static const char kIgn[] = "0x404A7DD040000000";
     std::vector<std::string> noise;
     for (size_t p = 0; (p = m.t.find(kIgn, p)) != std::string::npos; p += sizeof(kIgn) - 1) {
-        const size_t      ls = m.t.rfind('\n', p) + 1;
+        const size_t ls = m.t.rfind('\n', p) + 1;
         const std::string line = m.t.substr(ls, m.t.find('\n', p) - ls);
         if (line.find("= fmul fast float ") == std::string::npos) continue;
-        const size_t      mp = line.find('%');
+        const size_t mp = line.find('%');
         const std::string mulname = line.substr(mp, line.find(' ', mp) - mp);
         const std::string frc = "= call float @dx.op.unary.f32(i32 22, float " + mulname + ")";
-        const size_t      fp = m.t.find(frc);
+        const size_t fp = m.t.find(frc);
         if (fp == std::string::npos) continue;
         const size_t fls = m.t.rfind('\n', fp) + 1;
         const size_t np = m.t.find('%', fls);
@@ -285,10 +285,11 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         const auto f = Operands(m.Node(NodeRef(el_ref)));
         if (f.size() < 11 || f[1] != "!\"COLOR\"") continue;
         const auto idx = Operands(m.Node(NodeRef(f[4])));
-        long long  csig;
-        long long  first;
+        long long csig;
+        long long first;
         if (idx.empty() || !IntOf(idx[0], first) || first != 0 || !IntOf(f[0], csig)) continue;
-        const std::string ld = "= call float @dx.op.loadInput.f32(i32 4, i32 " + std::to_string(csig) + ", i32 0, i8 3, i32 undef)";
+        const std::string ld =
+            "= call float @dx.op.loadInput.f32(i32 4, i32 " + std::to_string(csig) + ", i32 0, i8 3, i32 undef)";
         for (size_t p = 0; (p = m.t.find(ld, p)) != std::string::npos; p += ld.size()) {
             const size_t ls = m.t.rfind('\n', p) + 1;
             const size_t pct = m.t.find('%', ls);
@@ -298,16 +299,18 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
     }
     auto set_def = [&](const std::string& name, const std::string& was, const std::string& now) {
         const std::string key = "\n  " + name + " = " + was + "\n";
-        const size_t      p = m.t.find(key);
+        const size_t p = m.t.find(key);
         if (p != std::string::npos) m.t.replace(p, key.size(), "\n  " + name + " = " + now + "\n");
         return p != std::string::npos;
     };
-    auto              has = [](const std::vector<std::string>& v, const std::string& s) { return std::find(v.begin(), v.end(), s) != v.end(); };
+    auto has = [](const std::vector<std::string>& v, const std::string& s) {
+        return std::find(v.begin(), v.end(), s) != v.end();
+    };
     static const char kThird[] = "0xBFD554C980000000";
     static const char kNew[] = "0xBFC3333340000000";
     static const char kFMin[] = "call float @dx.op.binary.f32(i32 36, float ";
     for (size_t p = 0; (p = m.t.find(dcall, p)) != std::string::npos; p += dcall.size()) {
-        const size_t      ce = m.t.find(')', p + dcall.size());
+        const size_t ce = m.t.find(')', p + dcall.size());
         const std::string cond = m.t.substr(p + dcall.size(), ce - (p + dcall.size()));
         if (cond.empty() || cond[0] != '%') continue;
         const std::string cd = def_of(cond);
@@ -322,9 +325,10 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         for (const std::string& op : { yd.substr(a0, a1 - a0), yd.substr(b0, b1 - b0) }) {
             if (op.empty() || op[0] != '%') continue;
             const std::string od = def_of(op);
-            std::string       s = op;
-            std::string       sd = od;
-            if (od.rfind("select i1 %", 0) == 0 && od.size() > 20 && od.compare(od.size() - 20, 20, ", float 1.000000e+00") == 0) {
+            std::string s = op;
+            std::string sd = od;
+            if (od.rfind("select i1 %", 0) == 0 && od.size() > 20 &&
+                od.compare(od.size() - 20, 20, ", float 1.000000e+00") == 0) {
                 const size_t f0 = od.find(", float %");
                 s = od.substr(f0 + 8, od.find(',', f0 + 8) - (f0 + 8));
                 sd = def_of(s);
@@ -334,20 +338,26 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
                 if (has(noise, sd.substr(c + 2)) && set_def(s, sd, sd.substr(0, c) + ", -1.000000e+00")) ++out.degated;
             }
             for (const auto& w : cw)
-                if (od == "fadd fast float " + w + ", " + kThird && set_def(op, od, "fadd fast float " + w + ", " + kNew)) {
+                if (od == "fadd fast float " + w + ", " + kThird &&
+                    set_def(op, od, "fadd fast float " + w + ", " + kNew)) {
                     ++out.decensored;
                     break;
                 }
         }
     }
-    return "opacity mask: " + (out.unmasked ? std::to_string(out.unmasked) + " FMin - 1/3 threshold(s) -> +1" : std::string("none")) + ", dither gate: " + (out.degated ? std::to_string(out.degated) + " subtraction(s) -> -1" : std::string("none")) + ", vertex mask: " + (out.decensored ? std::to_string(out.decensored) + " COLOR0.w - 1/3 -> -0.15" : std::string("none"));
+    return "opacity mask: " +
+        (out.unmasked ? std::to_string(out.unmasked) + " FMin - 1/3 threshold(s) -> +1" : std::string("none")) +
+        ", dither gate: " +
+        (out.degated ? std::to_string(out.degated) + " subtraction(s) -> -1" : std::string("none")) +
+        ", vertex mask: " +
+        (out.decensored ? std::to_string(out.decensored) + " COLOR0.w - 1/3 -> -0.15" : std::string("none"));
 }
 
 // A float as LLVM IR spells it exactly: the hex of its double.
 std::string FloatLit(float f)
 {
     const double d = f;
-    uint64_t     u = 0;
+    uint64_t u = 0;
     memcpy(&u, &d, sizeof u);
     char s[24];
     snprintf(s, sizeof s, "0x%016llX", (unsigned long long)u);
@@ -356,23 +366,24 @@ std::string FloatLit(float f)
 
 // The input signature's element `name` index 0, a float of at least `cols_min` columns whose used mask covers
 // `need`; -1 when there is none.
-long long InputElement(Module& m, int in_list_node, const char* name, long long cols_min, long long need, std::string& why)
+long long InputElement(
+    Module& m, int in_list_node, const char* name, long long cols_min, long long need, std::string& why)
 {
     for (const auto& el_ref : Operands(m.Node(in_list_node))) {
         const auto f = Operands(m.Node(NodeRef(el_ref)));
         if (f.size() < 11 || f[1] != std::string("!\"") + name + "\"") continue;
         const auto idx = Operands(m.Node(NodeRef(f[4])));
-        long long  sig;
-        long long  comp;
-        long long  cols;
-        long long  first;
+        long long sig;
+        long long comp;
+        long long cols;
+        long long first;
         if (idx.empty() || !IntOf(idx[0], first) || first != 0) continue;
         if (!IntOf(f[0], sig) || !IntOf(f[2], comp) || !IntOf(f[7], cols)) continue;
         if (comp != 9 || cols < cols_min) {
             why = std::string(name) + " is not a float" + std::to_string(cols_min) + "+";
             return -1;
         }
-        long long  used = 0;
+        long long used = 0;
         const auto tags = Operands(m.Node(NodeRef(f[10])));
         for (size_t i = 0; i + 1 < tags.size(); i += 2) {
             long long tag;
@@ -380,7 +391,8 @@ long long InputElement(Module& m, int in_list_node, const char* name, long long 
             if (IntOf(tags[i], tag) && tag == 3 && IntOf(tags[i + 1], mask)) used = mask;
         }
         if ((used & need) != need) {
-            why = std::string(name) + " is read in columns " + std::to_string(used) + ", the cut needs " + std::to_string(need);
+            why = std::string(name) + " is read in columns " + std::to_string(used) + ", the cut needs " +
+                std::to_string(need);
             return -1;
         }
         return sig;
@@ -393,8 +405,8 @@ long long InputElement(Module& m, int in_list_node, const char* name, long long 
 bool Cut(Module& m, const std::string& fn, int sig_node, const std::vector<RfxDxilCut>& cuts, RfxDxilResult& out)
 {
     std::string& why = out.why;
-    const auto   sops = Operands(m.Node(sig_node));
-    const int    in_list_node = sops.empty() ? -1 : NodeRef(sops[0]);
+    const auto sops = Operands(m.Node(sig_node));
+    const int in_list_node = sops.empty() ? -1 : NodeRef(sops[0]);
     if (in_list_node < 0) {
         why = "no input signature";
         return false;
@@ -405,16 +417,16 @@ bool Cut(Module& m, const std::string& fn, int sig_node, const std::vector<RfxDx
     if (col < 0) return false;
 
     auto load = [&](const char* name, long long sig, int c) {
-        return std::string("  %uidc_") + name + " = call float @dx.op.loadInput.f32(i32 4, i32 " + std::to_string(sig) + ", i32 0, i8 " +
-            std::to_string(c) + ", i32 undef)\n";
+        return std::string("  %uidc_") + name + " = call float @dx.op.loadInput.f32(i32 4, i32 " + std::to_string(sig) +
+            ", i32 0, i8 " + std::to_string(c) + ", i32 undef)\n";
     };
     std::string b = load("x", pos, 0) + load("y", pos, 1) + load("r", col, 0) + load("g", col, 1) + load("b", col, 2);
     std::string any;
     for (size_t k = 0; k < cuts.size(); ++k) {
         const RfxDxilCut& c = cuts[k];
         const std::string p = "%uidc" + std::to_string(k) + "_";
-        std::string       all;
-        auto              test = [&](const char* name, const char* op, const char* v, float lit) {
+        std::string all;
+        auto test = [&](const char* name, const char* op, const char* v, float lit) {
             b += "  " + p + name + " = fcmp fast " + op + " float %uidc_" + v + ", " + FloatLit(lit) + "\n";
             if (all.empty())
                 all = p + name;
@@ -443,8 +455,9 @@ bool Cut(Module& m, const std::string& fn, int sig_node, const std::vector<RfxDx
     b += "  call void @dx.op.discard(i32 82, i1 " + any + ")\n";
 
     std::string pre;
-    auto        need_decl = [&](const char* name, const char* decl) {
-        if (m.t.find(std::string("@dx.op.") + name + "(i32,") == std::string::npos) pre += std::string(decl) + "\n"; };
+    auto need_decl = [&](const char* name, const char* decl) {
+        if (m.t.find(std::string("@dx.op.") + name + "(i32,") == std::string::npos) pre += std::string(decl) + "\n";
+    };
     need_decl("loadInput.f32", "declare float @dx.op.loadInput.f32(i32, i32, i32, i8, i32) nounwind readnone");
     need_decl("discard", "declare void @dx.op.discard(i32, i1) nounwind");
     const size_t def = m.t.find("\ndefine void " + fn + "(");
@@ -459,7 +472,8 @@ bool Cut(Module& m, const std::string& fn, int sig_node, const std::vector<RfxDx
     }
     m.t.insert(brace + 2, b);
     m.t.insert(def + 1, pre);
-    why = "cut: SV_Position = input " + std::to_string(pos) + ", COLOR0 = input " + std::to_string(col) + ", " + std::to_string(cuts.size()) + " box(es)";
+    why = "cut: SV_Position = input " + std::to_string(pos) + ", COLOR0 = input " + std::to_string(col) + ", " +
+        std::to_string(cuts.size()) + " box(es)";
     return true;
 }
 
@@ -476,7 +490,7 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         why = "no !dx.entryPoints";
         return false;
     }
-    const int  ep_node = atoi(m.t.c_str() + ep + 22);
+    const int ep_node = atoi(m.t.c_str() + ep + 22);
     const auto eops = Operands(m.Node(ep_node));
     if (eops.size() < 5) {
         why = "entry point node has " + std::to_string(eops.size()) + " operands";
@@ -488,8 +502,8 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         return false;
     }
     const std::string fn = eops[0].substr(at); // @main, or a quoted mangled name
-    const int         sig_node = NodeRef(eops[2]);
-    const int         res_node = NodeRef(eops[3]);
+    const int sig_node = NodeRef(eops[2]);
+    const int res_node = NodeRef(eops[3]);
     if (sig_node < 0) {
         why = "entry point has no signatures";
         return false;
@@ -497,7 +511,7 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     if (!spec.cuts.empty()) return Cut(m, fn, sig_node, spec.cuts, out);
     if (!spec.inject) {
         const auto s0 = Operands(m.Node(sig_node));
-        const int  il = s0.empty() ? -1 : NodeRef(s0[0]);
+        const int il = s0.empty() ? -1 : NodeRef(s0[0]);
         if (il < 0) {
             why = "no input signature";
             return false;
@@ -526,16 +540,16 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         return false;
     }
     std::vector<std::string> srv_list;
-    const int                srv_list_node = NodeRef(rops[0]);
+    const int srv_list_node = NodeRef(rops[0]);
     if (srv_list_node >= 0) srv_list = Operands(m.Node(srv_list_node));
     long long new_id = 0;
-    bool      glow_reg_taken = false;
+    bool glow_reg_taken = false;
     for (const auto& rec_ref : srv_list) {
         const auto f = Operands(m.Node(NodeRef(rec_ref)));
-        long long  id;
-        long long  space;
-        long long  lower;
-        long long  range;
+        long long id;
+        long long space;
+        long long lower;
+        long long range;
         if (f.size() < 7 || !IntOf(f[0], id) || !IntOf(f[3], space) || !IntOf(f[4], lower) || !IntOf(f[5], range)) {
             why = "SRV record " + rec_ref + " did not parse";
             return false;
@@ -543,14 +557,15 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         if (id >= new_id) new_id = id + 1;
         const bool unbounded = (range < 0 || range >= 0xFFFFFFFFll);
         if (space != 0 || unbounded) {
-            why = "the shader reads an SRV outside the fixed space-0 registers (space " + std::to_string(space) + ", t" +
-                std::to_string(lower) + (unbounded ? ", unbounded" : "") + "): a one-table shadow bind would leave it dangling";
+            why = "the shader reads an SRV outside the fixed space-0 registers (space " + std::to_string(space) +
+                ", t" + std::to_string(lower) + (unbounded ? ", unbounded" : "") +
+                "): a one-table shadow bind would leave it dangling";
             return false;
         }
         auto over = [&](unsigned reg) { return lower <= (long long)reg && lower + range > (long long)reg; };
         if (over(spec.fx_reg)) {
-            why = "the shader already declares t" + std::to_string(lower) + " x" + std::to_string(range) +
-                " over t" + std::to_string(spec.fx_reg);
+            why = "the shader already declares t" + std::to_string(lower) + " x" + std::to_string(range) + " over t" +
+                std::to_string(spec.fx_reg);
             return false;
         }
         if (over(spec.glow_reg) || over(spec.params_reg)) glow_reg_taken = true;
@@ -561,12 +576,14 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     if (const int smp_list_node = NodeRef(rops[3]); smp_list_node >= 0)
         for (const auto& rec_ref : Operands(m.Node(smp_list_node))) {
             const auto f = Operands(m.Node(NodeRef(rec_ref)));
-            long long  id;
-            long long  space;
-            long long  lower;
-            long long  range;
-            long long  kind;
-            if (f.size() < 7 || !IntOf(f[0], id) || !IntOf(f[3], space) || !IntOf(f[4], lower) || !IntOf(f[5], range) || !IntOf(f[6], kind)) continue;
+            long long id;
+            long long space;
+            long long lower;
+            long long range;
+            long long kind;
+            if (f.size() < 7 || !IntOf(f[0], id) || !IntOf(f[3], space) || !IntOf(f[4], lower) || !IntOf(f[5], range) ||
+                !IntOf(f[6], kind))
+                continue;
             if (kind != 0 || range == 0) continue;
             if (space == 0 && lower == 0) {
                 smp_id = id;
@@ -580,22 +597,22 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         }
     // ---- input signature: TEXCOORD0, float, at least two columns --------------------------------
     const auto sops = Operands(m.Node(sig_node));
-    const int  in_list_node = sops.empty() ? -1 : NodeRef(sops[0]);
+    const int in_list_node = sops.empty() ? -1 : NodeRef(sops[0]);
     if (in_list_node < 0) {
         why = "no input signature";
         return false;
     }
-    long long                uv_sig = -1;
-    int                      uv_elem_node = -1;
+    long long uv_sig = -1;
+    int uv_elem_node = -1;
     std::vector<std::string> uv_elem;
     for (const auto& el_ref : Operands(m.Node(in_list_node))) {
         const auto f = Operands(m.Node(NodeRef(el_ref)));
         if (f.size() < 11 || f[1] != "!\"TEXCOORD\"") continue;
         const auto idx = Operands(m.Node(NodeRef(f[4])));
-        long long  sig;
-        long long  comp;
-        long long  cols;
-        long long  first;
+        long long sig;
+        long long comp;
+        long long cols;
+        long long first;
         if (idx.empty() || !IntOf(idx[0], first) || first != 0) continue;
         if (!IntOf(f[0], sig) || !IntOf(f[2], comp) || !IntOf(f[7], cols)) continue;
         if (comp != 9 || cols < 2) {
@@ -618,18 +635,23 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
             const auto f = Operands(m.Node(NodeRef(el_ref)));
             if (f.size() < 11 || f[1] != "!\"SV_Target\"") continue;
             const auto idx = Operands(m.Node(NodeRef(f[4])));
-            long long  sig;
-            long long  comp;
-            long long  cols;
-            long long  first;
-            if (idx.empty() || !IntOf(idx[0], first) || !IntOf(f[0], sig) || !IntOf(f[2], comp) || !IntOf(f[7], cols)) continue;
+            long long sig;
+            long long comp;
+            long long cols;
+            long long first;
+            if (idx.empty() || !IntOf(idx[0], first) || !IntOf(f[0], sig) || !IntOf(f[2], comp) || !IntOf(f[7], cols))
+                continue;
             if (comp != 9 || cols < 3) continue;
             if (first == 0) o_sig[0] = sig;
             if (first == 3) o_sig[1] = sig;
         }
-    auto store_prefix = [](long long sig, int col) { return "call void @dx.op.storeOutput.f32(i32 5, i32 " + std::to_string(sig) + ", i32 0, i8 " + std::to_string(col) + ", float "; };
+    auto store_prefix = [](long long sig, int col) {
+        return "call void @dx.op.storeOutput.f32(i32 5, i32 " + std::to_string(sig) + ", i32 0, i8 " +
+            std::to_string(col) + ", float ";
+    };
     if (glow_reg_taken)
-        out.glow_why = "t" + std::to_string(spec.glow_reg) + " / t" + std::to_string(spec.params_reg) + " already declared";
+        out.glow_why =
+            "t" + std::to_string(spec.glow_reg) + " / t" + std::to_string(spec.params_reg) + " already declared";
     else if (smp_id < 0)
         out.glow_why = "no plain sampler";
     else if (o_sig[0] < 0 || o_sig[1] < 0)
@@ -638,7 +660,8 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
         for (int o = 0; o < 2 && out.glow_why.empty(); ++o)
             for (int c = 0; c < 3; ++c)
                 if (m.t.find(store_prefix(o_sig[o], c)) == std::string::npos) {
-                    out.glow_why = "SV_Target" + std::to_string(o ? 3 : 0) + " column " + std::to_string(c) + " is never stored";
+                    out.glow_why =
+                        "SV_Target" + std::to_string(o ? 3 : 0) + " column " + std::to_string(c) + " is never stored";
                     break;
                 }
     }
@@ -647,7 +670,7 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     // The uv element's used mask (tag 3) must cover x and y. The tag node may be shared: never edit it.
     {
         std::vector<std::string> tags;
-        const int                tag_node = NodeRef(uv_elem[10]);
+        const int tag_node = NodeRef(uv_elem[10]);
         if (tag_node >= 0) tags = Operands(m.Node(tag_node));
         bool have = false;
         bool changed = false;
@@ -678,10 +701,12 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     const long long prm_id = new_id + 2;
     {
         const int tag = m.AddNode("!{i32 0, i32 9}"); // element type: float
-        auto      add_srv = [&](long long id, const char* type, unsigned reg, int shape) {
+        auto add_srv = [&](long long id, const char* type, unsigned reg, int shape) {
             const int rec = m.AddNode("!{i32 " + std::to_string(id) + ", " + type + "* undef, !\"\", i32 0, i32 " +
-                                      std::to_string(reg) + ", i32 1, i32 " + std::to_string(shape) + ", i32 0, !" + std::to_string(tag) + "}");
-            srv_list.push_back("!" + std::to_string(rec)); };
+                std::to_string(reg) + ", i32 1, i32 " + std::to_string(shape) + ", i32 0, !" + std::to_string(tag) +
+                "}");
+            srv_list.push_back("!" + std::to_string(rec));
+        };
         add_srv(fx_id, kTexType, spec.fx_reg, 2); // shape 2 = Texture2D
         if (out.has_glow) {
             add_srv(glow_id, kTexType, spec.glow_reg, 2);
@@ -696,8 +721,9 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     }
     // ---- types and declarations the injection needs, placed before the function -----------------
     std::string pre;
-    auto        need_type = [&](const std::string& name, const std::string& body) {
-        if (m.t.find("\n" + name + " = type") == std::string::npos) pre += name + " = type " + body + "\n"; };
+    auto need_type = [&](const std::string& name, const std::string& body) {
+        if (m.t.find("\n" + name + " = type") == std::string::npos) pre += name + " = type " + body + "\n";
+    };
     need_type("%dx.types.Handle", "{ i8* }");
     need_type("%dx.types.ResRet.f32", "{ float, float, float, float, i32 }");
     need_type("%dx.types.Dimensions", "{ i32, i32, i32, i32 }");
@@ -706,15 +732,20 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     if (out.has_glow) need_type(kBufType, "{ <4 x float> }");
     // A declaration's parameter list opens `(i32,` (the opcode's TYPE); a call's opens `(i32 <opcode>,`.
     auto need_decl = [&](const char* name, const char* decl) {
-        if (m.t.find(std::string("@dx.op.") + name + "(i32,") == std::string::npos) pre += std::string(decl) + "\n"; };
+        if (m.t.find(std::string("@dx.op.") + name + "(i32,") == std::string::npos) pre += std::string(decl) + "\n";
+    };
     need_decl("loadInput.f32", "declare float @dx.op.loadInput.f32(i32, i32, i32, i8, i32) nounwind readnone");
-    need_decl("getDimensions", "declare %dx.types.Dimensions @dx.op.getDimensions(i32, %dx.types.Handle, i32) nounwind readonly");
-    need_decl("textureLoad.f32", "declare %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i32) nounwind readonly");
+    need_decl("getDimensions",
+        "declare %dx.types.Dimensions @dx.op.getDimensions(i32, %dx.types.Handle, i32) nounwind readonly");
+    need_decl("textureLoad.f32",
+        "declare %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i32) nounwind readonly");
     need_decl("discard", "declare void @dx.op.discard(i32, i1) nounwind");
     if (smp_id >= 0)
-        need_decl("sample.f32", "declare %dx.types.ResRet.f32 @dx.op.sample.f32(i32, %dx.types.Handle, %dx.types.Handle, float, float, float, float, i32, i32, i32, float) nounwind readonly");
+        need_decl("sample.f32",
+            "declare %dx.types.ResRet.f32 @dx.op.sample.f32(i32, %dx.types.Handle, %dx.types.Handle, float, float, float, float, i32, i32, i32, float) nounwind readonly");
     if (out.has_glow) {
-        need_decl("bufferLoad.f32", "declare %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32, %dx.types.Handle, i32, i32) nounwind readonly");
+        need_decl("bufferLoad.f32",
+            "declare %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32, %dx.types.Handle, i32, i32) nounwind readonly");
         need_decl("unary.f32", "declare float @dx.op.unary.f32(i32, float) nounwind readnone");
         need_decl("binary.f32", "declare float @dx.op.binary.f32(i32, float, float) nounwind readnone");
     }
@@ -732,7 +763,8 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
                     const std::string val = m.t.substr(v0, v1 - v0);
                     const std::string sel = "%rfxg_sel" + std::to_string(k++);
                     m.t.replace(v0, v1 - v0, sel);
-                    const std::string line = "  " + sel + " = select i1 %rfxg_onb, float " + (o ? kRfxGlowO3[c] : kRfxGlowO0[c]) + ", float " + val + "\n";
+                    const std::string line = "  " + sel + " = select i1 %rfxg_onb, float " +
+                        (o ? kRfxGlowO3[c] : kRfxGlowO0[c]) + ", float " + val + "\n";
                     m.t.insert(ls, line);
                     i = v0 + line.size() + sel.size();
                 }
@@ -743,8 +775,9 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     const std::string sig = std::to_string(uv_sig);
     const std::string id = std::to_string(fx_id);
     const std::string reg = std::to_string(spec.fx_reg);
-    std::string       b;
-    b += "  %rfx_t = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 " + id + ", i32 " + reg + ", i1 false)\n";
+    std::string b;
+    b += "  %rfx_t = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 " + id + ", i32 " + reg +
+        ", i1 false)\n";
     b += "  %rfx_u = call float @dx.op.loadInput.f32(i32 4, i32 " + sig + ", i32 0, i8 0, i32 undef)\n";
     b += "  %rfx_v = call float @dx.op.loadInput.f32(i32 4, i32 " + sig + ", i32 0, i8 1, i32 undef)\n";
     b += "  %rfx_dim = call %dx.types.Dimensions @dx.op.getDimensions(i32 72, %dx.types.Handle %rfx_t, i32 0)\n";
@@ -758,11 +791,14 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     b += "  %rfx_yf = fmul fast float %rfx_hf, %rfx_v\n";
     b += "  %rfx_x = fptosi float %rfx_xf to i32\n";
     b += "  %rfx_y = fptosi float %rfx_yf to i32\n";
-    b += "  %rfx_ld = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %rfx_t, i32 0, i32 %rfx_x, i32 %rfx_y, i32 undef, i32 1, i32 1, i32 undef)\n";
+    b +=
+        "  %rfx_ld = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %rfx_t, i32 0, i32 %rfx_x, i32 %rfx_y, i32 undef, i32 1, i32 1, i32 undef)\n";
     b += "  %rfx_la = extractvalue %dx.types.ResRet.f32 %rfx_ld, 3\n";
     if (smp_id >= 0) {
-        b += "  %rfx_s = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 3, i32 " + std::to_string(smp_id) + ", i32 " + std::to_string(smp_reg) + ", i1 false)\n";
-        b += "  %rfx_sm = call %dx.types.ResRet.f32 @dx.op.sample.f32(i32 60, %dx.types.Handle %rfx_t, %dx.types.Handle %rfx_s, float %rfx_u, float %rfx_v, float undef, float undef, i32 0, i32 0, i32 undef, float undef)\n";
+        b += "  %rfx_s = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 3, i32 " + std::to_string(smp_id) +
+            ", i32 " + std::to_string(smp_reg) + ", i1 false)\n";
+        b +=
+            "  %rfx_sm = call %dx.types.ResRet.f32 @dx.op.sample.f32(i32 60, %dx.types.Handle %rfx_t, %dx.types.Handle %rfx_s, float %rfx_u, float %rfx_v, float undef, float undef, i32 0, i32 0, i32 undef, float undef)\n";
         b += "  %rfx_sa = extractvalue %dx.types.ResRet.f32 %rfx_sm, 3\n";
         b += "  %rfx_z = fcmp fast oeq float %rfx_la, 0.000000e+00\n";
         b += "  %rfx_a = select i1 %rfx_z, float %rfx_sa, float %rfx_la\n";
@@ -800,9 +836,14 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     m.t.insert(brace + 2, b);
     m.t.insert(def + 1, pre);
     const std::string dc_why = spec.decensor ? Decensor(m, in_list_node, out) : std::string("off");
-    why = "uv=input " + sig + " (TEXCOORD0), its own SRVs reach t" + std::to_string(out.srv_max_reg) + "; cutout: SRV id " + id + " at t" + reg +
+    why = "uv=input " + sig + " (TEXCOORD0), its own SRVs reach t" + std::to_string(out.srv_max_reg) +
+        "; cutout: SRV id " + id + " at t" + reg +
         (smp_id >= 0 ? ", fallback sample through s" + std::to_string(smp_reg) : ", no plain sampler: load only") +
-        "; glow: " + (out.has_glow ? "SRV ids " + std::to_string(glow_id) + " / " + std::to_string(prm_id) + " at t" + std::to_string(spec.glow_reg) + " / t" + std::to_string(spec.params_reg) + ", o0 = output " + std::to_string(o_sig[0]) + ", o3 = output " + std::to_string(o_sig[1]) : "NOT patched (" + out.glow_why + ")") +
+        "; glow: " +
+        (out.has_glow ? "SRV ids " + std::to_string(glow_id) + " / " + std::to_string(prm_id) + " at t" +
+                    std::to_string(spec.glow_reg) + " / t" + std::to_string(spec.params_reg) + ", o0 = output " +
+                    std::to_string(o_sig[0]) + ", o3 = output " + std::to_string(o_sig[1])
+                      : "NOT patched (" + out.glow_why + ")") +
         "; decensor: " + dc_why;
     return true;
 }
@@ -821,7 +862,8 @@ bool RfxDxilInit(const wchar_t* dll_dir, std::string& why)
     g_dxc = LoadLibraryExW((dir + L"\\dxcompiler.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     g_dxil = LoadLibraryExW((dir + L"\\dxil.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g_dxc || !g_dxil) {
-        g_init_why = std::string(!g_dxc ? "dxcompiler.dll" : "dxil.dll") + " did not load (error " + std::to_string(GetLastError()) + ")";
+        g_init_why = std::string(!g_dxc ? "dxcompiler.dll" : "dxil.dll") + " did not load (error " +
+            std::to_string(GetLastError()) + ")";
         why = g_init_why;
         return false;
     }
@@ -849,8 +891,8 @@ bool RfxDxilPatch(const void* ps, size_t ps_size, const RfxDxilSpec& spec, RfxDx
         out.why = "no shader bytes";
         return false;
     }
-    Com<IDxcLibrary>   lib;
-    Com<IDxcCompiler>  comp;
+    Com<IDxcLibrary> lib;
+    Com<IDxcCompiler> comp;
     Com<IDxcAssembler> as;
     Com<IDxcValidator> val;
     if (FAILED(g_dxc_create(CLSID_DxcLibrary, __uuidof(IDxcLibrary), (void**)&lib)) ||
@@ -888,7 +930,7 @@ bool RfxDxilPatch(const void* ps, size_t ps_size, const RfxDxilSpec& spec, RfxDx
         return false;
     }
     Com<IDxcOperationResult> ar;
-    HRESULT                  st = E_FAIL;
+    HRESULT st = E_FAIL;
     if (FAILED(as->AssembleToContainer(txt.p, &ar)) || !ar || FAILED(ar->GetStatus(&st)) || FAILED(st)) {
         out.why = "assemble: " + ErrText(ar.p);
         return false;
@@ -900,12 +942,14 @@ bool RfxDxilPatch(const void* ps, size_t ps_size, const RfxDxilSpec& spec, RfxDx
         return false;
     }
     Com<IDxcOperationResult> vr;
-    HRESULT                  vst = E_FAIL;
-    if (FAILED(val->Validate(cont.p, DxcValidatorFlags_InPlaceEdit, &vr)) || !vr || FAILED(vr->GetStatus(&vst)) || FAILED(vst)) {
+    HRESULT vst = E_FAIL;
+    if (FAILED(val->Validate(cont.p, DxcValidatorFlags_InPlaceEdit, &vr)) || !vr || FAILED(vr->GetStatus(&vst)) ||
+        FAILED(vst)) {
         out.why = "validate: " + ErrText(vr.p);
         return false;
     }
-    out.code.assign((const uint8_t*)cont->GetBufferPointer(), (const uint8_t*)cont->GetBufferPointer() + cont->GetBufferSize());
+    out.code.assign(
+        (const uint8_t*)cont->GetBufferPointer(), (const uint8_t*)cont->GetBufferPointer() + cont->GetBufferSize());
     out.why = resolved;
     out.settled = true;
     return true;

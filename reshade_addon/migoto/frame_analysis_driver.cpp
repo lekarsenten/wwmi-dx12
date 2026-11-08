@@ -26,12 +26,12 @@
 #include "frame_analysis_driver.h"
 #include "port_api.h" // PortApi::FrameAnalysisCtx -- the ONE context, see Get() below
 #include "globals.h"
-#include "util.h"               // CreateDirectoryEnsuringAccess
-#include "dx12_pipeline.h"      // PipeState/State() -- what the dump will read = what is bound
-#include "dx12_wrap.h"          // AsWrapView: view -> our resource wrapper -> the DX12 resource
+#include "util.h" // CreateDirectoryEnsuringAccess
+#include "dx12_pipeline.h" // PipeState/State() -- what the dump will read = what is bound
+#include "dx12_wrap.h" // AsWrapView: view -> our resource wrapper -> the DX12 resource
 #include "dx12_dump_readback.h" // PreDrain*: the coalescing
-#include "dump_watchdog.h"      // DumpStage / DumpWatchdog*: a hung capture names its position
-#include "../../src/log.h"
+#include "dump_watchdog.h" // DumpStage / DumpWatchdog*: a hung capture names its position
+#include "../core/log.h"
 
 #include <mutex>
 #include <time.h>
@@ -41,12 +41,15 @@ namespace MigotoPort {
 namespace {
 
 FrameAnalysisContext* g_fa = nullptr;
-std::recursive_mutex  g_fa_mtx; // recursive: FrameAnalysisDrawScope holds it across the publish + dump
-bool                  g_char_only = true;
+std::recursive_mutex g_fa_mtx; // recursive: FrameAnalysisDrawScope holds it across the publish + dump
+bool g_char_only = true;
+bool g_log_only = false;
+int g_frames = 1; // the frames a capture spans under d3dx.ini's hold: the ones the button asked for
 
 // Pending arm, applied AFTER the stop check in the same present -- see the header comment.
-int  g_arm_req = 0;
+int g_arm_req = 0;
 bool g_arm_char = true;
+bool g_arm_log_only = false;
 
 FrameAnalysisContext* Get()
 {
@@ -56,9 +59,9 @@ FrameAnalysisContext* Get()
 
 bool AnalyseFrameStart()
 {
-    wchar_t   path[MAX_PATH];
-    wchar_t   subdir[MAX_PATH];
-    time_t    ltime;
+    wchar_t path[MAX_PATH];
+    wchar_t subdir[MAX_PATH];
+    time_t ltime;
     struct tm tm;
 
     time(&ltime);
@@ -73,20 +76,19 @@ bool AnalyseFrameStart()
     }
 
     if (!CreateDirectoryEnsuringAccess(path)) {
-        logger::write("FRAMEANALYSIS: could not create %S (err %u) -- capture ABORTED",
-            path, GetLastError());
+        logger::write("FRAMEANALYSIS: could not create %S (err %u) -- capture ABORTED", path, GetLastError());
         return false;
     }
 
     wcscpy_s(G->ANALYSIS_PATH, MAX_PATH, path);
-    G->cur_analyse_options = G->def_analyse_options;
+    G->cur_analyse_options = g_log_only ? FrameAnalysisOptions::INVALID : G->def_analyse_options;
     G->frame_analysis_seen_rts.clear();
     G->analyse_frame_no = 1;
     G->analyse_frame = true;
     DumpWatchdogStart();
 
-    logger::write("FRAMEANALYSIS: capturing -> %S (analyse_options=0x%08x from d3dx.ini, %s)",
-        path, (unsigned)G->def_analyse_options,
+    logger::write("FRAMEANALYSIS: capturing -> %S (analyse_options=0x%08x %s, %s)", path,
+        (unsigned)G->cur_analyse_options, g_log_only ? "-- log only, d3dx.ini's not used" : "from d3dx.ini",
         g_char_only ? "CHAR draws only" : "EVERY draw");
     return true;
 }
@@ -105,7 +107,7 @@ void AnalyseFrameStopAtBoundary()
 {
     if (!G->analyse_frame) return;
 
-    if (G->def_analyse_options & FrameAnalysisOptions::HOLD) {
+    if (!g_log_only && (G->def_analyse_options & FrameAnalysisOptions::HOLD) && G->analyse_frame_no < g_frames) {
         G->analyse_frame_no++;
     } else {
         G->analyse_frame = false;
@@ -117,25 +119,25 @@ void AnalyseFrameStopAtBoundary()
 
 } // namespace
 
-void FrameAnalysisArm(int frames, bool char_only)
+void FrameAnalysisArm(int frames, bool char_only, bool log_only)
 {
     std::lock_guard<std::recursive_mutex> l(g_fa_mtx);
     g_arm_req = frames < 1 ? 1 : frames;
     g_arm_char = char_only;
-    logger::write("FRAMEANALYSIS: arm requested (%s) -- starts next frame, analyse_options come from "
-                  "d3dx.ini",
-        char_only ? "CHAR draws only" : "EVERY draw");
+    g_arm_log_only = log_only;
+    logger::write("FRAMEANALYSIS: arm requested (%s) -- starts next frame, %s",
+        char_only ? "CHAR draws only" : "EVERY draw", log_only ? "log.txt only" : "analyse_options come from d3dx.ini");
 }
 
 namespace {
 
 struct EngineFault {
-    unsigned long      code = 0;
-    void*              addr = nullptr;
-    void*              frames[32] = {};
-    unsigned           n = 0;
+    unsigned long code = 0;
+    void* addr = nullptr;
+    void* frames[32] = {};
+    unsigned n = 0;
     unsigned long long access = 0; // the VA an access violation touched
-    int                rw = -1;    // 0 read / 1 write
+    int rw = -1; // 0 read / 1 write
 };
 
 int EngineFaultFilter(EXCEPTION_POINTERS* ep, EngineFault* f)
@@ -175,9 +177,12 @@ void ReleaseIfHeldByThisThread(CRITICAL_SECTION& cs, const char* name)
 
 void AbortCaptureAfterFault(const EngineFault& f)
 {
-    logger::write("FRAMEANALYSIS: FAULT 0x%08lX at %p (%s VA %llx) inside their engine at draw %06u -- capture ABORTED, the frame continues",
-        f.code, f.addr, f.rw == 0 ? "reading" : f.rw == 1 ? "writing"
-                                                          : "access",
+    logger::write(
+        "FRAMEANALYSIS: FAULT 0x%08lX at %p (%s VA %llx) inside their engine at draw %06u -- capture ABORTED, the frame continues",
+        f.code, f.addr,
+        f.rw == 0       ? "reading"
+            : f.rw == 1 ? "writing"
+                        : "access",
         f.access, Get()->PortDrawIndex());
     DumpLogFrames("FRAMEANALYSIS", f.frames, f.n);
     ReleaseIfHeldByThisThread(G->mCriticalSection, "G->mCriticalSection");
@@ -206,9 +211,8 @@ bool FrameAnalysisWantGameDraw(bool claimed, bool char_band)
     return claimed || char_band;
 }
 
-void FrameAnalysisAfterDraw(bool compute, DrawCallInfo* call_info,
-    unsigned long long vs_hash, unsigned long long ps_hash,
-    unsigned long long cs_hash)
+void FrameAnalysisAfterDraw(bool compute, DrawCallInfo* call_info, unsigned long long vs_hash,
+    unsigned long long ps_hash, unsigned long long cs_hash)
 {
     if (!G->analyse_frame) return;
     DumpStage("AfterDraw: wait g_fa_mtx", Get()->PortDrawIndex());
@@ -283,8 +287,10 @@ void FrameAnalysisFrameEnd()
     AnalyseFrameStopAtBoundary();
 
     if (g_arm_req) {
+        g_frames = g_arm_req;
         g_arm_req = 0;
         g_char_only = g_arm_char;
+        g_log_only = g_arm_log_only;
         AnalyseFrameStart();
     }
 }

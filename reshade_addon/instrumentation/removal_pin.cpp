@@ -1,13 +1,13 @@
 // removal_pin.cpp -- see removal_pin.h.
 #include "../addon_common.h"
 #include "removal_pin.h"
-#include "../rt/rt_hooks.h" // RtOnBlasBuild
-#include "../hooks/sharded_map.h"
+#include "../core/sharded_map.h"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include "../addon/addon.h"
 
 #ifdef WWMI_DEBUG
 namespace {
@@ -15,12 +15,12 @@ struct Tally {
     static constexpr unsigned kKinds = 12;
     struct Kind {
         const char* what;
-        uint32_t    n;
+        uint32_t n;
     };
-    Kind     kinds[kKinds] = {};
+    Kind kinds[kKinds] = {};
     unsigned nkinds = 0;
     uint32_t total = 0;
-    void     add(const char* what)
+    void add(const char* what)
     {
         ++total;
         for (unsigned i = 0; i < nkinds; ++i)
@@ -37,33 +37,33 @@ struct Tally {
         if (!total || n < 0 || (size_t)n >= cap) return;
         size_t p = (size_t)n;
         for (unsigned i = 0; i < nkinds && p < cap; ++i) {
-            n = snprintf(out + p, cap - p, "%s%s x%u%s", i ? ", " : " [", kinds[i].what, kinds[i].n,
-                i + 1 == nkinds ? "]" : "");
+            n = snprintf(
+                out + p, cap - p, "%s%s x%u%s", i ? ", " : " [", kinds[i].what, kinds[i].n, i + 1 == nkinds ? "]" : "");
             if (n < 0) break;
             p += (size_t)n;
         }
     }
 };
 struct Exec {
-    uint64_t      seq = 0;
-    uint32_t      frame = 0;
-    const void*   list = nullptr;
-    int           type = -1;
-    int           qtype = -1;
-    const char*   who = "";
-    unsigned long tid = 0;  // the calling thread (a Close that fails asserts on its thread)
-    ULONGLONG     tick = 0; // GetTickCount64 at the entry
-    char          ours[200] = {};
+    uint64_t seq = 0;
+    uint32_t frame = 0;
+    const void* list = nullptr;
+    int type = -1;
+    int qtype = -1;
+    const char* who = "";
+    unsigned long tid = 0; // the calling thread (a Close that fails asserts on its thread)
+    ULONGLONG tick = 0; // GetTickCount64 at the entry
+    char ours[200] = {};
 };
 constexpr unsigned kRing = 48;
 constexpr unsigned kCloseRing = 48;
 
-std::mutex                     g_mtx;
+std::mutex g_mtx;
 ShardedMap<const void*, Tally> g_tally; // by native list; an entry lives one recording; its own locks
 struct Ref {
     const void* list;
-    uint32_t    frame;
-    uint64_t    exec_seq_then;
+    uint32_t frame;
+    uint64_t exec_seq_then;
     const char* what;
 };
 std::unordered_map<const void*, Ref> g_refs;
@@ -72,25 +72,24 @@ struct LastExec {
     uint64_t seq;
 };
 std::unordered_map<const void*, LastExec> g_last_exec; // by native list: its last execute
-constexpr size_t                          kRefsSweepAt = 4096;
-uint32_t                                  g_refs_swept_frame = 0;
-Exec                                      g_ring[kRing];
-uint64_t                                  g_seq = 0; // entries seen; g_ring[(g_seq - 1) % kRing] is the newest
-Exec                                      g_closes[kCloseRing];
-uint64_t                                  g_close_seq = 0;
-std::atomic<bool>                         g_reported{ false };
+constexpr size_t kRefsSweepAt = 4096;
+uint32_t g_refs_swept_frame = 0;
+Exec g_ring[kRing];
+uint64_t g_seq = 0; // entries seen; g_ring[(g_seq - 1) % kRing] is the newest
+Exec g_closes[kCloseRing];
+uint64_t g_close_seq = 0;
+std::atomic<bool> g_reported{ false };
 
 // One ring, newest first. Under g_mtx.
 void WriteRing(const char* label, const Exec* ring, unsigned cap, uint64_t seq, unsigned long mark_tid)
 {
     const ULONGLONG now = GetTickCount64();
-    const unsigned  n = seq < cap ? (unsigned)seq : cap;
+    const unsigned n = seq < cap ? (unsigned)seq : cap;
     for (unsigned i = 0; i < n; ++i) {
         const Exec& e = ring[(seq - 1 - i) % cap];
-        logger::report("REMOVAL-PIN:   %s #%llu frame=%u -%llu ms tid=%lu%s %s list=%p type=%d queue=%d %s",
-            label, (unsigned long long)e.seq, e.frame, (unsigned long long)(now - e.tick), e.tid,
-            (mark_tid && e.tid == mark_tid) ? " <-stalled-thread" : "", e.who,
-            e.list, e.type, e.qtype, e.ours);
+        logger::report("REMOVAL-PIN:   %s #%llu frame=%u -%llu ms tid=%lu%s %s list=%p type=%d queue=%d %s", label,
+            (unsigned long long)e.seq, e.frame, (unsigned long long)(now - e.tick), e.tid,
+            (mark_tid && e.tid == mark_tid) ? " <-stalled-thread" : "", e.who, e.list, e.type, e.qtype, e.ours);
     }
 }
 void WriteUnexecuted()
@@ -121,8 +120,7 @@ void Report(HRESULT hr, const char* where)
                    "%llu ExecuteCommandLists entries seen): the removing call lies between the previous "
                    "entry below and this one. Entries newest first, each with what OUR addon recorded "
                    "onto that list in its recording:",
-        (unsigned)hr, where, g_frame_id,
-        (unsigned long long)g_seq);
+        (unsigned)hr, where, g_frame_id, (unsigned long long)g_seq);
     WriteRing("exec", g_ring, kRing, g_seq, 0);
     logger::report("REMOVAL-PIN: the last closes, newest first:");
     WriteRing("close", g_closes, kCloseRing, g_close_seq, 0);
@@ -160,13 +158,13 @@ namespace RemovalPin {
 void Mark(const void* native_list, const char* what)
 {
     if (!g_debug || !native_list || !what) return;
-    auto*  cl = reinterpret_cast<ID3D12GraphicsCommandList*>(const_cast<void*>(native_list));
+    auto* cl = reinterpret_cast<ID3D12GraphicsCommandList*>(const_cast<void*>(native_list));
     UINT64 blob[16] = {};
     blob[0] = (0x008ull & 0x3FFull) << 10;
     blob[1] = 0xFF00FF00ull;
     blob[2] = (8ull << 55) | (1ull << 54);
     const size_t len = strlen(what) + 1;
-    size_t       chunks = (len + 7) / 8;
+    size_t chunks = (len + 7) / 8;
     if (chunks > 13) chunks = 13;
     memcpy(&blob[3], what, len < chunks * 8 ? len : chunks * 8);
     reinterpret_cast<char*>(&blob[3])[chunks * 8 - 1] = 0;
@@ -189,9 +187,9 @@ void OnReset(const void* native_list)
 void OnClose(const void* native_list)
 {
     if (!g_debug || !native_list) return;
-    auto*                       nl = reinterpret_cast<ID3D12CommandList*>(const_cast<void*>(native_list));
+    auto* nl = reinterpret_cast<ID3D12CommandList*>(const_cast<void*>(native_list));
     std::lock_guard<std::mutex> l(g_mtx);
-    const uint64_t              seq = ++g_close_seq;
+    const uint64_t seq = ++g_close_seq;
     Fill(g_closes[(seq - 1) % kCloseRing], seq, nl, (int)nl->GetType(), -1, "Close");
 }
 
@@ -214,13 +212,13 @@ void OnDestroyResource(const void* resource)
 {
     if (!g_debug || !resource) return;
     std::lock_guard<std::mutex> l(g_mtx);
-    auto                        it = g_refs.find(resource);
+    auto it = g_refs.find(resource);
     if (it == g_refs.end()) return;
     const Ref r = it->second;
     g_refs.erase(it);
     const uint32_t age = g_frame_id - r.frame;
     if (age > 8u) return; // executed and retired long ago: not a hazard
-    auto       le = g_last_exec.find(r.list);
+    auto le = g_last_exec.find(r.list);
     const bool executed = le != g_last_exec.end() && le->second.frame >= r.frame;
     logger::write("REMOVAL-PIN: DEAD-REF %p destroyed by the game %u frame(s) after we named it (%s) on list %p, "
                   "which %s -- the kernel rejects a submission naming a freed allocation (INVALID_CALL, no breadcrumb)",
@@ -254,7 +252,7 @@ void Describe(const void* native_list, char* out, size_t cap)
 {
     if (!out || !cap) return;
     std::lock_guard<std::mutex> l(g_mtx);
-    const unsigned              rn = g_seq < kRing ? (unsigned)g_seq : kRing;
+    const unsigned rn = g_seq < kRing ? (unsigned)g_seq : kRing;
     for (unsigned i = 0; i < rn; ++i) {
         const Exec& e = g_ring[(g_seq - 1 - i) % kRing];
         if (e.list != native_list) continue;
@@ -263,10 +261,11 @@ void Describe(const void* native_list, char* out, size_t cap)
     }
     if (!g_tally.with(native_list, [&](const Tally& t) { t.describe(out, cap); }))
         snprintf(out, cap, "ours=0 (no recording of ours on it)");
-    auto         le = g_last_exec.find(native_list);
+    auto le = g_last_exec.find(native_list);
     const size_t n = strlen(out);
     if (le != g_last_exec.end() && n < cap)
-        snprintf(out + n, cap - n, " -- last executed #%llu frame=%u (before the ring)", (unsigned long long)le->second.seq, le->second.frame);
+        snprintf(out + n, cap - n, " -- last executed #%llu frame=%u (before the ring)",
+            (unsigned long long)le->second.seq, le->second.frame);
     else if (n < cap)
         snprintf(out + n, cap - n, " -- never executed");
 }
@@ -280,43 +279,3 @@ void Check(ID3D12Device* dev, const char* where)
 
 } // namespace RemovalPin
 #endif
-
-static void RtBlockWithoutModule()
-{
-    if (RtModulePresent() || g_rt_blocked.load(std::memory_order_relaxed) || g_rt_blocked.exchange(true)) return;
-    logger::report("RT BLOCK: the game is ray tracing and this build has no RT module -- the add-on is off until the game "
-                   "restarts (frame %u). Turn ray tracing off in the game's graphics settings.",
-        g_frame_id);
-}
-
-bool on_build_acceleration_structure(reshade::api::command_list* cmd_list, reshade::api::acceleration_structure_type type,
-    reshade::api::acceleration_structure_build_flags build_flags, uint32_t input_count,
-    const reshade::api::acceleration_structure_build_input* inputs, reshade::api::resource,
-    uint64_t, reshade::api::resource_view, reshade::api::resource_view dest,
-    reshade::api::acceleration_structure_build_mode mode)
-{
-    RtBlockWithoutModule();
-    static std::atomic<unsigned long long> s_n{ 0 };
-    const unsigned long long               n = s_n.fetch_add(1, std::memory_order_relaxed);
-    if (n == 0 || n == 1000 || n == 100000)
-        logger::report("RT ACTIVE: BuildRaytracingAccelerationStructure #%llu (type %d, mode %d, %u input(s)) at frame %u -- "
-                       "the game builds acceleration structures, so ray tracing is on and running",
-            n + 1, (int)type, (int)mode,
-            input_count, g_frame_id);
-    // RT (rt/rt_blas.cpp): the rings RTPAL finds the mod character's skin cache by, H19 FREEZE, and the RTGEO / RTDBG lines.
-    if (RtOnBlasBuild(cmd_list, type, build_flags, input_count, inputs, dest, mode, n)) return true;
-    if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-as-build");
-    return false;
-}
-bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resource, uint64_t, uint64_t, reshade::api::resource,
-    uint64_t, uint64_t, uint64_t, reshade::api::resource, uint64_t, uint64_t, uint64_t, reshade::api::resource,
-    uint64_t, uint64_t, uint64_t, uint32_t width, uint32_t height, uint32_t depth)
-{
-    RtBlockWithoutModule();
-    static std::atomic<unsigned long long> s_n{ 0 };
-    const unsigned long long               n = s_n.fetch_add(1, std::memory_order_relaxed);
-    if (n == 0 || n == 1000 || n == 100000)
-        logger::report("RT ACTIVE: DispatchRays #%llu (%u x %u x %u) at frame %u", n + 1, width, height, depth, g_frame_id);
-    if (cmd_list) RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "game-dispatch-rays");
-    return false;
-}

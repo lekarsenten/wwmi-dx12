@@ -3,27 +3,31 @@
 #include "tex_encode.h"
 #include "tex_gc.h"
 #include "../addon_common.h"
-#include "../config.h" // g_tex_mod_budget
-#include "../../src/dxgi_bc.h"
-#include "../../src/log.h"
-#include "../../src/mod_loader.h"
+#include "../instrumentation/diag_gate.h"
+#include "../addon/settings.h"
+#include "tex_toggles.h"
+#include "../core/dxgi_bc.h"
+#include "../core/log.h"
+#include "mod_texture_store.h"
 #include <d3d11.h>
 #include <algorithm>
 #include <cwctype>
 #include <vector>
+#include "../addon/addon.h"
+#include "../mods/mod_registry.h"
 
 TexBudget g_tex_budget;
 
 namespace {
 constexpr unsigned kMaxDown = 4;
-constexpr auto     kSettle = std::chrono::seconds(1);
-constexpr auto     kRecheck = std::chrono::seconds(30);
+constexpr auto kSettle = std::chrono::seconds(1);
+constexpr auto kRecheck = std::chrono::seconds(30);
 
 uint64_t TextureBytes(UINT64 w, UINT h, unsigned mips, DXGI_FORMAT f)
 {
     const uint32_t block = DxgiBcBlockBytes((uint32_t)f);
     const uint32_t px = DxgiPlainBytesPerPixel((uint32_t)f);
-    uint64_t       sum = 0;
+    uint64_t sum = 0;
     for (unsigned m = 0; m < mips; ++m) {
         sum += block ? ((w + 3) / 4) * ((h + 3) / 4) * block : w * h * (px ? px : 4);
         w = (std::max)(w / 2, (UINT64)1);
@@ -38,12 +42,12 @@ std::wstring Lower(std::wstring s)
     return s;
 }
 
-// Every loaded ini's namespace (lower case) -> its mod, as the mod count names it (ModLoader::EnumerateMods).
+// Every loaded ini's namespace (lower case) -> its mod, as the mod count names it (ModRegistry::Discover).
 std::unordered_map<std::wstring, std::wstring> ModsOfNamespaces()
 {
     std::unordered_map<std::wstring, std::wstring> mods;
-    for (const ModLoader::DiscoveredMod& m : ModLoader::EnumerateMods())
-        for (const ModLoader::ModIni& i : m.inis) mods[Lower(i.ns)] = m.name;
+    for (const DiscoveredMod& m : ModRegistry::Discover())
+        for (const ModIni& i : m.inis) mods[Lower(i.ns)] = m.name;
     return mods;
 }
 } // namespace
@@ -87,14 +91,14 @@ void TexBudget::Ended()
 
 bool TexBudget::Due(std::chrono::steady_clock::time_point now)
 {
-    const int step = g_tex_mod_budget;
+    const int step = g_settings.tex_mod_budget;
     if (step != step_) {
         step_ = step;
         step_moved_ = now;
         wanted_ = true;
     }
-    const bool     limited = TexBudgetMb(step) != 0;
-    const bool     collects = TexCollects(step);
+    const bool limited = TexBudgetMb(step) != 0;
+    const bool collects = TexCollects(step);
     const unsigned loads = g_tex_defer.Loaded();
     if (loads != loads_seen_) {
         loads_seen_ = loads;
@@ -106,7 +110,7 @@ bool TexBudget::Due(std::chrono::steady_clock::time_point now)
     const bool collect = collects && g_tex_gc.Due();
     if (!collect && (!wanted_ || now - loads_moved_ < kSettle)) return false;
     if (collects && !g_tex_encoder.Ready() && !g_tex_encoder.Failed()) {
-        g_tex_encoder.Prepare(g_d3d12_device);
+        g_tex_encoder.Prepare(g_addon.d3d12_device);
         return false;
     }
     wanted_ = false;
@@ -115,19 +119,19 @@ bool TexBudget::Due(std::chrono::steady_clock::time_point now)
 
 void TexBudget::Fit()
 {
-    const int      step = g_tex_mod_budget;
+    const int step = g_settings.tex_mod_budget;
     const uint64_t budget = (uint64_t)TexBudgetMb(step) << 20;
     last_fit_ = std::chrono::steady_clock::now();
 
     struct Tex {
         PortApi::LoadedTexture t;
-        D3D12_RESOURCE_DESC    rd;
-        Stored                 stored;
-        unsigned               now = 0;
-        unsigned               want = 0;
-        unsigned               most = 0; // the furthest down it may go
-        bool                   fixed = false;
-        bool                   evict = false;
+        D3D12_RESOURCE_DESC rd;
+        Stored stored;
+        unsigned now = 0;
+        unsigned want = 0;
+        unsigned most = 0; // the furthest down it may go
+        bool fixed = false;
+        bool evict = false;
     };
     std::vector<PortApi::LoadedTexture> all;
     PortApi::LoadedTexturesAll(all);
@@ -158,12 +162,13 @@ void TexBudget::Fit()
                 returning_.erase(back);
             }
         }
-        x.fixed = g_tex_replace.HalfSize(x.t.load.fq_name) || x.rd.DepthOrArraySize != 1 || kept_.count(x.t.load.fq_name);
+        x.fixed =
+            g_tex_replace.HalfSize(x.t.load.fq_name) || x.rd.DepthOrArraySize != 1 || kept_.count(x.t.load.fq_name);
         const bool bc = DxgiIsBc((uint32_t)x.rd.Format);
         const bool encodable = can_encode && x.stored.mips == 1 && IsBc7(x.rd.Format);
         for (unsigned k = 1; !x.fixed && k <= kMaxDown; ++k) {
             const UINT64 w = x.stored.width >> k;
-            const UINT   h = x.stored.height >> k;
+            const UINT h = x.stored.height >> k;
             if ((std::max)(w, (UINT64)h) < kTexMinSide || (bc && (w % 4 || h % 4))) break;
             if (x.stored.mips <= k && !encodable) break;
             x.most = k;
@@ -173,15 +178,15 @@ void TexBudget::Fit()
     }
 
     if (mods_of_ns_.empty()) mods_of_ns_ = ModsOfNamespaces();
-    std::vector<std::wstring>                mods;
+    std::vector<std::wstring> mods;
     std::unordered_map<std::wstring, size_t> mod_index;
-    std::vector<std::vector<size_t>>         members;
-    std::vector<size_t>                      mod_of(texs.size());
+    std::vector<std::vector<size_t>> members;
+    std::vector<size_t> mod_of(texs.size());
     for (size_t i = 0; i < texs.size(); ++i) {
-        const std::wstring  ns = PortApi::NamespaceOfResource(texs[i].t.load.fq_name);
-        const auto          it = mods_of_ns_.find(Lower(ns));
+        const std::wstring ns = PortApi::NamespaceOfResource(texs[i].t.load.fq_name);
+        const auto it = mods_of_ns_.find(Lower(ns));
         const std::wstring& mod = it != mods_of_ns_.end() ? it->second : ns;
-        const auto          at_mod = mod_index.emplace(Lower(mod), mods.size());
+        const auto at_mod = mod_index.emplace(Lower(mod), mods.size());
         if (at_mod.second) {
             mods.push_back(mod);
             members.emplace_back();
@@ -192,11 +197,12 @@ void TexBudget::Fit()
 
     auto at = [](const Tex& x, unsigned k) {
         if (x.fixed) return TextureBytes(x.rd.Width, x.rd.Height, x.rd.MipLevels, x.rd.Format) * x.rd.DepthOrArraySize;
-        return TextureBytes(x.stored.width >> k, x.stored.height >> k, x.stored.mips > k ? x.stored.mips - k : 1u, x.rd.Format);
+        return TextureBytes(
+            x.stored.width >> k, x.stored.height >> k, x.stored.mips > k ? x.stored.mips - k : 1u, x.rd.Format);
     };
     std::vector<uint64_t> before(mods.size());
-    std::vector<char>     over(mods.size());
-    unsigned              mods_over = 0;
+    std::vector<char> over(mods.size());
+    unsigned mods_over = 0;
     for (size_t m = 0; m < mods.size(); ++m) {
         uint64_t after = 0;
         for (size_t i : members[m]) {
@@ -225,12 +231,12 @@ void TexBudget::Fit()
     }
 
     if (TexCollects(step)) {
-        std::vector<TexCollector::Item> items;
+        std::vector<TexGc::Item> items;
         items.reserve(texs.size());
         for (size_t i = 0; i < texs.size(); ++i) {
-            const Tex&         x = texs[i];
-            TexCollector::Item it{ &x.t.load.fq_name, &mods[mod_of[i]], x.t.dx12, x.now, x.want, x.most, x.fixed, {} };
-            for (unsigned k = 0; k < TexCollector::kLevels; ++k) it.bytes[k] = at(x, k);
+            const Tex& x = texs[i];
+            TexGc::Item it{ &x.t.load.fq_name, &mods[mod_of[i]], x.t.dx12, x.now, x.want, x.most, x.fixed, {} };
+            for (unsigned k = 0; k < TexGc::kLevels; ++k) it.bytes[k] = at(x, k);
             items.push_back(it);
         }
         g_tex_gc.Decide(items);
@@ -240,8 +246,8 @@ void TexBudget::Fit()
         }
     }
 
-    std::vector<TexReplacer::Order> orders;
-    unsigned                        mods_changed = 0;
+    std::vector<TexReplace::Order> orders;
+    unsigned mods_changed = 0;
     for (size_t m = 0; m < mods.size(); ++m) {
         uint64_t after = 0;
         unsigned from_mips = 0;
@@ -268,7 +274,9 @@ void TexBudget::Fit()
                 ++raised;
             else
                 ++from_mips;
-            if (mipped) x.t.load.maxsize = x.want ? (unsigned)((std::max)(x.stored.width, (UINT64)x.stored.height) >> x.want) : 0;
+            if (mipped)
+                x.t.load.maxsize =
+                    x.want ? (unsigned)((std::max)(x.stored.width, (UINT64)x.stored.height) >> x.want) : 0;
             planned_[x.t.load.fq_name] = Lowered{ x.stored, x.want, nullptr };
             orders.push_back({ std::move(x.t), shift, at(x, x.want), false, from_file });
             x.t.res = nullptr;
@@ -283,10 +291,11 @@ void TexBudget::Fit()
     for (Tex& x : texs)
         if (x.t.res) x.t.res->Release();
     if (orders.empty()) return;
-    logger::write("TEXFIT (budget %s): %zu texture(s) of %u mod(s) to swap, of %zu loaded in %zu mod(s); %u mod(s) stay over",
+    logger::write(
+        "TEXFIT (budget %s): %zu texture(s) of %u mod(s) to swap, of %zu loaded in %zu mod(s); %u mod(s) stay over",
         TexBudgetName(step), orders.size(), mods_changed, texs.size(), mods.size(), mods_over);
     if (g_tex_replace.Start(orders)) return;
-    for (TexReplacer::Order& o : orders)
+    for (TexReplace::Order& o : orders)
         if (o.was.res) o.was.res->Release();
     planned_.clear();
     wanted_ = true;

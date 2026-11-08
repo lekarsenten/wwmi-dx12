@@ -21,11 +21,11 @@ namespace MigotoPort {
 
 struct InputElement {
     const char* semantic = nullptr;
-    unsigned    semantic_index = 0;
-    unsigned    format = 0;             // DXGI_FORMAT value
-    unsigned    buffer_binding = 0;     // input slot
-    unsigned    offset = 0;             // aligned byte offset
-    unsigned    instance_step_rate = 0; // 0 = per vertex
+    unsigned semantic_index = 0;
+    unsigned format = 0; // DXGI_FORMAT value
+    unsigned buffer_binding = 0; // input slot
+    unsigned offset = 0; // aligned byte offset
+    unsigned instance_step_rate = 0; // 0 = per vertex
 };
 void RecordInputLayout(unsigned long long pipeline_handle, const InputElement* elements, unsigned count);
 

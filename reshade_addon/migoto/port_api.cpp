@@ -23,12 +23,18 @@
 #include "HackerDevice.h"
 #include "HackerContext.h"
 #include "frame_analysis_engine.h" // FrameAnalysisContext -- g_ctx IS one
-#include "port_keygate.h"
+#include "key_gate.h"
+#include "command_observer.h"
+#include "selection_watch.h"
+#include "port_compat.h"
 #include "dx12_context.h"
+#include "dx12_context_impl.h"
 #include "dx12_pipeline.h"
+#include "dx12_present_snap.h"
 #include "dx12_wrap.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 
+#include <chrono>
 #include <mutex>
 #include <vector>
 #include <set>
@@ -45,13 +51,13 @@ void InitEngineGlobals();
 
 namespace PortApi {
 
-HackerDevice         g_dev;
+HackerDevice g_dev;
 FrameAnalysisContext g_ctx{ nullptr, nullptr };
-bool                 g_loaded = false;
-static unsigned      g_constants_generation = ~0u;
-unsigned             g_generation = 0;
-static EngineValues  g_step_inputs;               // what the step's [Present] started from: a redraw runs from the same
-static bool          g_step_inputs_taken = false; // ...for this load of the inis
+bool g_loaded = false;
+static unsigned g_constants_generation = ~0u;
+unsigned g_generation = 0;
+static EngineValues g_step_inputs; // what the step's [Present] started from: a redraw runs from the same
+static bool g_step_inputs_taken = false; // ...for this load of the inis
 
 FrameAnalysisContext* FrameAnalysisCtx()
 {
@@ -62,6 +68,18 @@ std::recursive_mutex& EngineLock()
 {
     static auto* m = new std::recursive_mutex();
     return *m;
+}
+
+static void (*g_parse_observer)(void* user) = nullptr;
+static void* g_parse_observer_user = nullptr;
+static double g_last_parse_ms = 0.0;
+
+static void NotifyParse(std::chrono::steady_clock::time_point parse_start)
+{
+    if (!G->gConfigInitialized && G->gSkipEarlyIncludesLoad) return;
+    g_last_parse_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - parse_start).count();
+    if (g_parse_observer) g_parse_observer(g_parse_observer_user);
 }
 
 bool Load(const wchar_t* ini_root)
@@ -83,24 +101,45 @@ bool Load(const wchar_t* ini_root)
     g_dev.mHackerContext = &g_ctx;
     g_ctx.mHackerDevice = &g_dev;
 
+    const auto parse_start = std::chrono::steady_clock::now();
     LoadConfigFile();
     RebuildParseSnapshots();
 
     g_dev.CreateIniParamResources();
 
     g_ctx.Bind3DMigotoResources();
-    logger::write("PORT: IniParams t%d -- texture %p view %p (%d params reserved)",
-        G->IniParamsReg, (void*)g_dev.mIniTexture, (void*)g_dev.mIniResourceView,
-        G->iniParamsReserved);
+    logger::write("PORT: IniParams t%d -- texture %p view %p (%d params reserved)", G->IniParamsReg,
+        (void*)g_dev.mIniTexture, (void*)g_dev.mIniResourceView, G->iniParamsReserved);
 
     g_loaded = true;
     ++g_generation;
     g_step_inputs_taken = false;
     logger::write("PORT: engine loaded -- %zu command lists, %zu custom shaders, %zu resources, "
                   "%zu texture overrides, %zu shader overrides, %d ini params",
-        registered_command_lists.size(), customShaders.size(), customResources.size(),
-        G->mTextureOverrideMap.size(), G->mShaderOverrideMap.size(), G->iniParamsReserved);
+        registered_command_lists.size(), customShaders.size(), customResources.size(), G->mTextureOverrideMap.size(),
+        G->mShaderOverrideMap.size(), G->iniParamsReserved);
+    {
+        std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+        NotifyParse(parse_start);
+    }
     return true;
+}
+
+void SetParseObserver(void (*after_parse)(void* user), void* user)
+{
+    g_parse_observer = after_parse;
+    g_parse_observer_user = user;
+}
+
+void RequestReload()
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    G->gReloadConfigPending = true;
+}
+
+double LastParseMs()
+{
+    return g_last_parse_ms;
 }
 
 void SaveSettingsOnExit()
@@ -121,15 +160,12 @@ void SaveSettingsOnExit()
     }
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     logger::write("PORT-EXIT: saving persistent settings (dirty=%d)", G->user_config_dirty);
-    if (SavePersistentSettings())
-        SaveUnknownPersistentSettings();
+    if (SavePersistentSettings()) SaveUnknownPersistentSettings();
 }
 
-void SetFrameContext(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12CommandQueue* queue,
-    unsigned rt_width, unsigned rt_height,
-    DXGI_FORMAT rt_format, DXGI_FORMAT ds_format,
-    ID3D12Resource* back_buffer, D3D12_RESOURCE_STATES back_buffer_state,
-    void (*restore_game_state)(void*), void*           restore_user)
+void SetFrameContext(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12CommandQueue* queue, unsigned rt_width,
+    unsigned rt_height, DXGI_FORMAT rt_format, DXGI_FORMAT ds_format, ID3D12Resource* back_buffer,
+    D3D12_RESOURCE_STATES back_buffer_state, void (*restore_game_state)(void*), void* restore_user)
 {
     MigotoPort::Dx12Bridge b;
     b.restore_user = restore_user;
@@ -152,8 +188,8 @@ void SetFrameContext(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Com
         if (G->mResolutionInfo.width != (int)rd.Width || G->mResolutionInfo.height != (int)rd.Height) {
             G->mResolutionInfo.width = (int)rd.Width;
             G->mResolutionInfo.height = (int)rd.Height;
-            logger::write("PORT: resolution from swap chain: %dx%d", G->mResolutionInfo.width,
-                G->mResolutionInfo.height);
+            logger::write(
+                "PORT: resolution from swap chain: %dx%d", G->mResolutionInfo.width, G->mResolutionInfo.height);
         }
     }
 }
@@ -173,9 +209,8 @@ unsigned BridgeStackDepth()
     return MigotoPort::BridgeDepth();
 }
 
-DrawListScope::DrawListScope(ID3D12GraphicsCommandList* cl, void (*restore_game_state)(void*),
-    void*                                               restore_user, int (*vs_cb_root)(void*, unsigned),
-    void*                                               vs_cb_root_user)
+DrawListScope::DrawListScope(ID3D12GraphicsCommandList* cl, void (*restore_game_state)(void*), void* restore_user,
+    int (*vs_cb_root)(void*, unsigned), void* vs_cb_root_user)
 {
     MigotoPort::Dx12Bridge b = MigotoPort::GetDx12Bridge();
     b.cl = cl;
@@ -183,7 +218,9 @@ DrawListScope::DrawListScope(ID3D12GraphicsCommandList* cl, void (*restore_game_
     b.restore_user = restore_user;
     b.vs_cb_root = vs_cb_root;
     b.vs_cb_root_user = vs_cb_root_user;
+    b.game = {}; // an outer scope's game draw is not this one's
     b.own_list = false; // a draw scope records onto the GAME's list -- inherit its state
+    b.back_buffer = nullptr; // the present thread's, when it is mid-tick: already presented when this list runs
     MigotoPort::BridgePush(b);
 }
 
@@ -193,8 +230,36 @@ DrawListScope::~DrawListScope()
     MigotoPort::BridgePop();
 }
 
+void DrawListScope::Targets(DXGI_FORMAT rt_format, DXGI_FORMAT ds_format)
+{
+    MigotoPort::BridgeSetTargets(rt_format, ds_format);
+}
+
+bool DrawListScope::BackBuffer(ID3D12Resource* game_rt0)
+{
+    if (!MigotoPort::IsBackBuffer(game_rt0)) return false;
+    MigotoPort::BridgeSetBackBuffer(game_rt0);
+    MigotoPort::BackBufferPublished(game_rt0, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    return true;
+}
+
+void DrawListScope::Inherit(bool (*descriptor)(void*, char, char, unsigned, unsigned, D3D12_CPU_DESCRIPTOR_HANDLE),
+    void (*publish_srv)(void*, char, unsigned), ID3D12PipelineState* (*pipeline)(void*, const MigotoPort::ModPipeline&),
+    void* user)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    MigotoPort::GameBindings g;
+    g.descriptor = descriptor;
+    g.publish_srv = publish_srv;
+    g.pipeline = pipeline;
+    g.user = user;
+    g.srv_gen = MigotoPort::SrvWriteGen();
+    g.cb_gen = MigotoPort::CbWriteGen();
+    MigotoPort::BridgeSetGameBindings(g);
+}
+
 static std::atomic<unsigned> g_refused_no_cl{ 0 };
-unsigned                     TakeRefusedNoCl()
+unsigned TakeRefusedNoCl()
 {
     return g_refused_no_cl.exchange(0);
 }
@@ -248,12 +313,14 @@ static void BumpGeneration()
 static void FrameDriverConfig()
 {
     if (G->gReloadConfigPending) {
+        const auto parse_start = std::chrono::steady_clock::now();
         BumpGeneration();
         ReloadConfig(&g_dev);
         RebuildParseSnapshots(); // MANDATORY after every parse
         BumpGeneration();
         g_step_inputs_taken = false;
-        MigotoPort::ClearSelectionVars();
+        MigotoPort::g_selection_watch.Clear();
+        NotifyParse(parse_start);
     }
 
     if (G->gConfigInitialized) {
@@ -265,11 +332,13 @@ static void FrameDriverConfig()
         logger::write("PORT-FRAME: deferred config reload firing at gTime=%.3f (delay=%d) -- this is what "
                       "loads the [Include] tree when skip_early_includes_load=1",
             G->gTime, G->gConfigInitializationDelay);
+        const auto parse_start = std::chrono::steady_clock::now();
         BumpGeneration();
         ReloadConfig(&g_dev);
         RebuildParseSnapshots(); // THE PARSE THAT ACTUALLY LOADS THE MODS.
         BumpGeneration();
-        MigotoPort::ClearSelectionVars();
+        MigotoPort::g_selection_watch.Clear();
+        NotifyParse(parse_start);
     }
 }
 
@@ -290,10 +359,17 @@ void PresentPre()
     // Before the first [Present]: their load order is [Constants] then everything else.
     RunConstantsOnce();
     G->frame_no++;
-    MigotoPort::SweepSelectionVars();
+    MigotoPort::g_selection_watch.SweepVars();
     g_step_inputs.Take();
     g_step_inputs_taken = true;
+    {
+        using Snap = MigotoPort::PresentSnapshots;
+        const MigotoPort::Dx12Bridge& b = MigotoPort::GetDx12Bridge();
+        const Snap::Mode mode = b.own_list && !b.back_buffer ? Snap::Mode::Capture : Snap::Mode::Off;
+        MigotoPort::g_present_snapshots.Begin(mode, g_generation);
+    }
     RunCommandList(&g_dev, &g_ctx, &G->present_command_list, nullptr, false);
+    MigotoPort::g_present_snapshots.End();
     RunSkelCopyUpdates();
     FrameDriverConfig();
     g_ctx.ResetCallCounters();
@@ -304,7 +380,9 @@ void PresentPost()
     if (!HaveCommandList("[Present] post")) return;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return;
+    MigotoPort::g_present_snapshots.Resume();
     RunCommandList(&g_dev, &g_ctx, &G->post_present_command_list, nullptr, true);
+    MigotoPort::g_present_snapshots.End();
 }
 
 void PresentRedraw()
@@ -316,16 +394,18 @@ void PresentRedraw()
     before.Take();
     if (g_step_inputs_taken) g_step_inputs.PutBack();
     MigotoPort::g_present_redraw = true;
+    MigotoPort::g_present_snapshots.Begin(MigotoPort::PresentSnapshots::Mode::Replay, g_generation);
     RunCommandList(&g_dev, &g_ctx, &G->present_command_list, nullptr, false);
     RunCommandList(&g_dev, &g_ctx, &G->post_present_command_list, nullptr, true);
+    MigotoPort::g_present_snapshots.End();
     MigotoPort::g_present_redraw = false;
     before.PutBack();
     g_ctx.ResetCallCounters();
 }
 
-void SetKeyGate(bool (*fn)(const wchar_t* ns))
+void SetKeyGate(bool (*fn)(const wchar_t* ns, const wchar_t* section))
 {
-    MigotoPort::SetKeyGate(fn);
+    MigotoPort::g_key_gate.SetGate(fn);
 }
 
 void TickInput()
@@ -336,7 +416,7 @@ void TickInput()
 
     CurrentTransition.UpdatePresets(&g_dev);
     CurrentTransition.UpdateTransitions(&g_dev);
-    MigotoPort::SweepSelectionVars();
+    MigotoPort::g_selection_watch.SweepVars();
 }
 
 EngineScope::EngineScope()
@@ -369,11 +449,11 @@ long WrapChurn()
 }
 unsigned SelectionInputsGen()
 {
-    return MigotoPort::SelectionInputsGen();
+    return MigotoPort::g_selection_watch.InputsGen();
 }
 bool SelectionCacheOk()
 {
-    return g_loaded && !G->analyse_frame && !MigotoPort::AnyObserver();
+    return g_loaded && !G->analyse_frame && !MigotoPort::g_command_observer.Any();
 }
 
 Stats GetStats()

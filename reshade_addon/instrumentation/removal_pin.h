@@ -32,19 +32,15 @@
 //
 // Diagnostics: built only with WWMI_DEBUG and, in that build, live only while the debug log is on (every
 // entry returns at once otherwise). Nothing here changes what is drawn. GetDeviceRemovedReason is a
-// dxgkrnl round trip (~40 us): the watchdog thread (device_watch.cpp) raises g_device_removed, from a fence
+// dxgkrnl round trip (~40 us): the watchdog thread (watchdogs.cpp) raises g_device_removed, from a fence
 // event the runtime signals at removal or its 200 ms poll, and the pin asks the device only once that is up.
 #include <d3d12.h>
 #include <atomic>
 #include <cstdint>
-// No reshade.hpp: dx12_pipeline.cpp (the migoto lib) includes this. The RT handlers below need the API's
-// types by value, so they are declared only where reshade.hpp is already in (the addon's own units).
+// No reshade.hpp: dx12_pipeline.cpp (the migoto lib) includes this.
 namespace reshade::api {
 struct command_list;
 }
-#ifdef RESHADE_API_VERSION
-#define WWMI_PIN_HAVE_RESHADE 1
-#endif
 
 namespace RemovalPin {
 inline std::atomic<bool> g_device_removed{ false };
@@ -77,17 +73,3 @@ inline void Describe(const void*, char* out, size_t cap)
 inline void DumpOnStall(unsigned long) {}
 #endif
 }
-#ifdef WWMI_PIN_HAVE_RESHADE
-bool on_build_acceleration_structure(reshade::api::command_list* cmd_list, reshade::api::acceleration_structure_type type,
-    reshade::api::acceleration_structure_build_flags flags, uint32_t input_count,
-    const reshade::api::acceleration_structure_build_input* inputs,
-    reshade::api::resource scratch, uint64_t scratch_offset,
-    reshade::api::resource_view source, reshade::api::resource_view dest,
-    reshade::api::acceleration_structure_build_mode mode);
-bool on_dispatch_rays(reshade::api::command_list* cmd_list, reshade::api::resource raygen, uint64_t raygen_offset,
-    uint64_t raygen_size, reshade::api::resource miss, uint64_t miss_offset, uint64_t miss_size,
-    uint64_t miss_stride, reshade::api::resource hit_group, uint64_t hit_group_offset,
-    uint64_t hit_group_size, uint64_t hit_group_stride, reshade::api::resource callable,
-    uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride,
-    uint32_t width, uint32_t height, uint32_t depth);
-#endif

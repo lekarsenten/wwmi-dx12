@@ -28,7 +28,7 @@
 #include <Strsafe.h>          // StringCchPrintfW / StringCchPrintfExW, as theirs uses
 
 #include "DrawCallInfo.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 
 errno_t wfopen_ensuring_access(FILE** pFile, const wchar_t *filename, const wchar_t *mode);
 

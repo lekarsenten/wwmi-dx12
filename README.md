@@ -21,8 +21,13 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
   the match is learned there and kept
 - **Meshes** - mesh replacement on merged skeletons; several mods on one mesh (a body mod and a face mod)
   all draw, as on DX11
+- **UI mods** - loading screens, team-screen backgrounds and portraits, skills-tab art, icons, cards and
+  menus, with their hotkeys, timers and screen flags
+- **Mods made for DX11 shaders** - mods that name the game's DX11 pixel shaders work for the characters
+  the shipped shader list (`wwmi_dx12\cache\wwmi_dx12_seed.shaderpairs`) covers
 - **Copies of a character** - two copies of one modded character at once (an idle pose, an ult's clone) each
-  keep their own skeleton instead of mixing as on DX11; tested on two characters
+  keep their own skeleton instead of mixing as on DX11; tested on two characters, and with a mod that keeps
+  one skeleton per copy
 - **Shape keys**
 - **RabbitFX**
 - **Decensor**
@@ -71,14 +76,15 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
 5. Start the game in DirectX 12, either way:
    - **Easy:** double-click `wwmi_dx12_launch.bat`. It finds your WWMI folder (or asks), saves it in
      `wwmi_dx12.ini`, writes the settings mods need into `Engine.ini` and `UserEngine.ini` and starts DX12.
-     It shows the add-on and ReShade versions and both folders first; the arrow keys pick the graphics
+     It shows the add-on, WWMI and ReShade versions and both folders first; the arrow keys pick the graphics
      files (UHD, HD, SD), any other key starts the game.
-   - **By hand:** set `wwmi_dir` in `wwmi_dx12.ini` once, choose DirectX 12 in the game's settings and
-     start the game as usual. XXMI Launcher already writes these lines when it starts WWMI; if mod
+   - **By hand:** copy `wwmi_dx12.ini.seed` to `wwmi_dx12.ini` and set `wwmi_dir` in it once, choose
+     DirectX 12 in the game's settings and start the game as usual. XXMI Launcher already writes these lines when it starts WWMI; if mod
      textures, or whole characters at a distance, stay vanilla, add them (see What it changes) or run the
      bat once.
 
-To update, unzip over the old files and keep your `wwmi_dx12.ini`.
+To update, unzip over the old files. The package has no `wwmi_dx12.ini`, so your settings stay; a new
+install gets one from `wwmi_dx12.ini.seed`, which the launcher copies when there is none.
 
 **Checklist** (Windows may hide `.dll`): `<Win64>` holds `dxgi.dll` (ReShade), `wwmi_dx12.addon64`, the
 `wwmi_dx12` folder with `IbVbHash.cso` and `dxc`, and the launcher files. In game, Home opens ReShade
@@ -87,7 +93,7 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 ## Known Issues
 
 - WWMI's own hotkeys and guides are not available
-- Mods load when the game starts; restart the game after adding or changing a mod
+- After adding or changing a mod, press F10 (or restart the game)
 - Decensor and RabbitFX mods prepare shaders on first sight (one-time stutter, saved for next launch)
 
 ## Mod Installation
@@ -99,7 +105,8 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 
 - `[Home]` - ReShade, with the `wwmi-dx12` window
 - `[F6]` - turn the add-on off and on
-- Keys a mod defines work as in DX11; WWMI's own (`[F10]`, `[F12]`, hunting mode) do nothing here.
+- `[F10]` - reload mods
+- Keys a mod defines work as in DX11; WWMI's own (`[F12]`, hunting mode) do nothing here.
 
 ## The wwmi-dx12 window
 

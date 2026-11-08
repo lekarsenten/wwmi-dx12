@@ -19,12 +19,15 @@ namespace MigotoPort {
 ID3D12GraphicsCommandList* DumpReadbackList();
 
 bool DumpReadbackFlush();
+// A staging buffer's release: held until the open dump batch has flushed, retired like any resource if that
+// batch went stale, released at once otherwise.
+void RetireReadback(ID3D12Resource* res);
 
 // Begin a new pre-drain batch (drops whatever the previous draw cached).
 void PreDrainBegin();
 void PreDrainAdd(ID3D12Resource* res);
 // Execute the batch: ONE command list, ONE fence, then map once and keep the bytes.
-void        PreDrainFlush();
+void PreDrainFlush();
 const void* PreDrainLookup(ID3D12Resource* res, unsigned* out_bytes, unsigned* out_row_pitch);
 
 } // namespace MigotoPort

@@ -17,9 +17,10 @@
 //  handler is in our module and on every stack it captures. The '*' markers say which frames are ours.
 // ===========================================================================
 #include "crash_handler.h"
-#include "../config.h" // g_faulted
+#include "diag_gate.h"
+#include "../addon/addon.h"
 #include "../build_stamp.h" // WWMI_VERSION / WWMI_BUILD_SHA -- which build's map the offsets need
-#include "../../src/log.h" // logger::utf8_locale -- the context is a wide section name
+#include "../core/log.h" // logger::utf8_locale -- the context is a wide section name
 
 #include <windows.h>
 #include <psapi.h>
@@ -33,13 +34,13 @@ namespace CrashHandler {
 namespace {
 
 LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter = nullptr;
-bool                         g_installed = false;
-HMODULE                      g_self = nullptr;
-uintptr_t                    g_self_base = 0;
-size_t                       g_self_size = 0;
-std::atomic<int>             g_reports{ 0 };
-CRITICAL_SECTION             g_cs;
-bool                         g_cs_ready = false;
+bool g_installed = false;
+HMODULE g_self = nullptr;
+uintptr_t g_self_base = 0;
+size_t g_self_size = 0;
+std::atomic<int> g_reports{ 0 };
+CRITICAL_SECTION g_cs;
+bool g_cs_ready = false;
 
 // Thread-local so concurrent draw-recording threads do not overwrite each other's breadcrumb.
 thread_local const wchar_t* t_context = nullptr;
@@ -49,8 +50,7 @@ wchar_t g_path[MAX_PATH] = L"wwmi_dx12_crash.log";
 
 void ResolveSelf()
 {
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             (LPCSTR)&ResolveSelf, &g_self) ||
         !g_self)
         return;
@@ -94,13 +94,13 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep)
 {
     if (!ep) return EXCEPTION_CONTINUE_SEARCH;
     const EXCEPTION_RECORD* rec = ep->ExceptionRecord;
-    const DWORD             code = rec ? rec->ExceptionCode : 0;
-    const char*             name = CodeName(code);
+    const DWORD code = rec ? rec->ExceptionCode : 0;
+    const char* name = CodeName(code);
     if (!rec || !name) return g_prev_filter ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 
     if (g_reports.load() >= 8) return g_prev_filter ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 
-    void*        frames[62] = {};
+    void* frames[62] = {};
     const USHORT n = RtlCaptureStackBackTrace(0, 62, frames, nullptr);
 
     if (g_reports.fetch_add(1) >= 8) return EXCEPTION_EXECUTE_HANDLER;
@@ -115,14 +115,14 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep)
     SYSTEMTIME st;
     GetLocalTime(&st);
     Write(f, "\n=============================================================================\n");
-    Write(f, "[%02u:%02u:%02u.%03u] %s (0x%08X) at %p  thread %lu\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, name, code,
-        rec->ExceptionAddress, GetCurrentThreadId());
+    Write(f, "[%02u:%02u:%02u.%03u] %s (0x%08X) at %p  thread %lu\n", st.wHour, st.wMinute, st.wSecond,
+        st.wMilliseconds, name, code, rec->ExceptionAddress, GetCurrentThreadId());
     if (code == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
         const ULONG_PTR op = rec->ExceptionInformation[0];
         Write(f, "  %s address %p\n",
-            op == 0 ? "reading" : op == 1 ? "writing"
-                                          : "executing",
+            op == 0       ? "reading"
+                : op == 1 ? "writing"
+                          : "executing",
             (void*)rec->ExceptionInformation[1]);
     }
     if (t_context) Write(f, "  context: %ls\n", t_context);
@@ -132,11 +132,10 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep)
     Write(f, "  stack (%u frames, '*' = ours):\n", (unsigned)n);
     for (USHORT i = 0; i < n; ++i) {
         const uintptr_t a = (uintptr_t)frames[i];
-        const bool      mine = AddressIsOurs(a);
-        char            modname[MAX_PATH] = "?";
-        HMODULE         hm = nullptr;
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        const bool mine = AddressIsOurs(a);
+        char modname[MAX_PATH] = "?";
+        HMODULE hm = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 (LPCSTR)a, &hm) &&
             hm) {
             char full[MAX_PATH];
@@ -159,8 +158,8 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep)
 
 int Filter(void* exception_pointers, const char* where)
 {
-    EXCEPTION_POINTERS*     ep = (EXCEPTION_POINTERS*)exception_pointers;
-    const DWORD             code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    EXCEPTION_POINTERS* ep = (EXCEPTION_POINTERS*)exception_pointers;
+    const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
     static std::atomic<int> n{ 0 };
     if (n.fetch_add(1) < 16) {
         const char* nm = CodeName(code);
@@ -169,21 +168,18 @@ int Filter(void* exception_pointers, const char* where)
         if (!_wfopen_s(&f, g_path, L"a") && f) {
             SYSTEMTIME st;
             GetLocalTime(&st);
-            Write(f, "\n[%02u:%02u:%02u.%03u] CAUGHT in %s: %s (0x%08X) at %p  thread %lu\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, where ? where : "?",
-                nm ? nm : "exception", code,
-                ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr,
-                GetCurrentThreadId());
+            Write(f, "\n[%02u:%02u:%02u.%03u] CAUGHT in %s: %s (0x%08X) at %p  thread %lu\n", st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds, where ? where : "?", nm ? nm : "exception", code,
+                ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr, GetCurrentThreadId());
             if (t_context) Write(f, "  context: %ls\n", t_context);
-            Write(f, "  module base %p, build %s %s  (offsets resolve in that build's wwmi_dx12.map)\n", (void*)g_self_base,
-                WWMI_VERSION, WWMI_BUILD_SHA);
-            void*        frames[32] = {};
+            Write(f, "  module base %p, build %s %s  (offsets resolve in that build's wwmi_dx12.map)\n",
+                (void*)g_self_base, WWMI_VERSION, WWMI_BUILD_SHA);
+            void* frames[32] = {};
             const USHORT fn = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
             for (USHORT i = 0; i < fn; ++i) {
                 const uintptr_t a = (uintptr_t)frames[i];
                 if (AddressIsOurs(a))
-                    Write(f, "   * [%02u] %p  +0x%zx\n", (unsigned)i, (void*)a,
-                        (size_t)(a - g_self_base));
+                    Write(f, "   * [%02u] %p  +0x%zx\n", (unsigned)i, (void*)a, (size_t)(a - g_self_base));
                 else
                     Write(f, "     [%02u] %p\n", (unsigned)i, (void*)a);
             }
@@ -193,7 +189,7 @@ int Filter(void* exception_pointers, const char* where)
         }
         if (g_cs_ready) LeaveCriticalSection(&g_cs);
     }
-    g_faulted.store(true);
+    g_addon.faulted.store(true);
     return EXCEPTION_EXECUTE_HANDLER; // swallow: skip this callback, keep the frame alive
 }
 
@@ -214,16 +210,15 @@ void FormatCallers(char* buf, size_t cap, unsigned skip)
 {
     if (!buf || !cap) return;
     buf[0] = 0;
-    void*        frames[40] = {};
+    void* frames[40] = {};
     const USHORT n = RtlCaptureStackBackTrace(skip + 1, 40, frames, nullptr);
-    size_t       at = 0;
+    size_t at = 0;
     for (USHORT i = 0; i < n && at + 1 < cap; ++i) {
         const uintptr_t a = (uintptr_t)frames[i];
-        char            modname[MAX_PATH] = "?";
-        uintptr_t       base = 0;
-        HMODULE         hm = nullptr;
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        char modname[MAX_PATH] = "?";
+        uintptr_t base = 0;
+        HMODULE hm = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 (LPCSTR)a, &hm) &&
             hm) {
             base = (uintptr_t)hm;

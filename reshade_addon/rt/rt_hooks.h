@@ -1,60 +1,7 @@
 #pragma once
-#include <cstddef>
-#include <cstdint>
-#include <reshade.hpp>
-#include "../hooks/cmd_state.h" // CmdState
-#include "../mods/wwmi_mod.h"   // WwmiMod::Component
-
-struct ID3D12GraphicsCommandList;
-
-// The skin-cache output rings mod characters' BLAS are built from. `mod`: g_geomods index, -1 unknown.
-void RtNoteSkinOut(uint64_t va, uint64_t bytes, int mod = -1);
-bool RtIsSkinOut(uint64_t va, uint64_t bytes); // does [va, va+bytes) overlap a recorded range?
-// The mod whose ring is EXACTLY a view's window [va, va+bytes), or -1; `overlap_mod` gets one it merely overlaps.
-int    RtSkinOutMod(uint64_t va, uint64_t bytes, int* overlap_mod = nullptr);
-size_t RtSkinOutCount();
-// A destroyed buffer's rings go with it.
-void RtForgetSkinOutRange(uint64_t va, uint64_t bytes);
-// Bumped whenever RtNoteSkinOut records a ring it did not have: a shader judged before then is judged again.
-uint32_t RtSkinOutGen();
-// RTDBG: the vb0 range a claimed draw of (mod, comp) last read.
-struct RtDrawVb {
-    uint32_t frame = 0;
-    uint64_t va = 0;
-    uint32_t size = 0;
-    uint32_t stride = 0;
-    uint64_t vs = 0;
-};
-void RtNoteDrawVb(int mod_id, int comp_idx, const RtDrawVb& v);
-bool RtDrawVbOf(int mod_id, int comp_idx, RtDrawVb* out);
-
-void RtPalRecord(reshade::api::command_list* cmd_list, const CmdState& state, uint64_t cs_hash);
-// RTBONES / RTSKINREAD (g_debug): what her skin-cache dispatches bind, read once.
-bool RtBonesWindowOpen();
-void RtBonesLog(reshade::api::command_list* cmd_list, const CmdState& state, uint32_t groups_x, uint64_t cs_hash, bool learned);
-void RtSkinReadDrain();
-void RtSkinReadRecord(reshade::api::command_list* cmd_list, const CmdState& state, uint64_t cs_hash, uint32_t groups_x);
-
-bool RtOnBlasBuild(reshade::api::command_list* cmd_list, reshade::api::acceleration_structure_type type,
-    reshade::api::acceleration_structure_build_flags build_flags, uint32_t input_count,
-    const reshade::api::acceleration_structure_build_input* inputs, reshade::api::resource_view dest,
-    reshade::api::acceleration_structure_build_mode mode, unsigned long long n);
-
-struct VfRestore {
-    uint8_t  param = 0xFF;
-    uint64_t va = 0;
-};
-// PTSKIN + RTFETCH + H27 on a pass-through draw of component `wc`; any other draw is left alone.
-VfRestore RtSkinDraw(reshade::api::command_list* cmd_list, ID3D12GraphicsCommandList* d3d12_cl, int dm,
-    const WwmiMod::Component* wc, uint32_t c, uint32_t s2, uint32_t first_index, uint32_t index_count,
-    int32_t vertex_offset, uint64_t vs_hash, uint64_t game_cb13_va, int game_cb13_root,
-    bool rtpal_no_merge);
-struct RtPalResult {
-    bool tried = false;
-    bool published = false;
-    bool no_merge = false;
-};
-RtPalResult RtPalPublish(uint64_t draw_pso, int dm, const WwmiMod::Component* wc, uint64_t port_cb4_va);
+// The RT module's entry points that are not a class: its overlay section, and whether the module is in this build.
+// The rest: rt_rings.h, rt_pal_record.h, rt_diag_dispatch.h, rt_blas.h, rt_draw.h -- each stubbed by rt_stub.cpp
+// when WWMI_RT=0.
 
 // ---- overlay (rt/rt_overlay.cpp) ----
 void RtDrawOverlay();

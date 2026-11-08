@@ -6,7 +6,7 @@ typedef int NvAPI_Status;
 
 // Error reporting (nvprofile.cpp log_nv_error).
 #define NVAPI_SHORT_STRING_MAX 64
-typedef char        NvAPI_ShortString[NVAPI_SHORT_STRING_MAX];
+typedef char NvAPI_ShortString[NVAPI_SHORT_STRING_MAX];
 inline NvAPI_Status NvAPI_GetErrorMessage(NvAPI_Status /*status*/, NvAPI_ShortString msg)
 {
     if (msg) {

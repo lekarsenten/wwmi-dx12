@@ -31,12 +31,13 @@
 // ===========================================================================================
 #include "dx12_dump_readback.h"
 #include "dx12_wrap.h"
+#include "dx12_pipeline.h"
 #include "dx12_context.h"
 #include "dump_watchdog.h"
-#include "../../src/log.h"
-#include "../../src/d3d12_buffer.h"
-#include "../../src/d3d12_barrier.h"
-#include "../../src/gpu_queue.h"
+#include "../core/log.h"
+#include "../core/d3d12_buffer.h"
+#include "../core/d3d12_barrier.h"
+#include "../core/gpu_queue.h"
 
 #include <atomic>
 #include <mutex>
@@ -48,27 +49,27 @@ namespace MigotoPort {
 namespace {
 
 struct DumpQueue {
-    ID3D12CommandQueue*        queue = nullptr;
-    ID3D12CommandAllocator*    alloc = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
-    ID3D12Fence*               fence = nullptr;
-    UINT64                     value = 0;
-    bool                       open = false; // list is recording and has work
-    bool                       failed = false;
-    ID3D12Fence*               gfence = nullptr;
-    UINT64                     gvalue = 0;
-    HANDLE                     event = nullptr; // created once, reused: this waits per dumped resource
-    bool                       stale = false;
+    ID3D12Fence* fence = nullptr;
+    UINT64 value = 0;
+    bool open = false; // list is recording and has work
+    bool failed = false;
+    ID3D12Fence* gfence = nullptr;
+    UINT64 gvalue = 0;
+    HANDLE event = nullptr; // created once, reused: this waits per dumped resource
+    bool stale = false;
 };
 
-DumpQueue                    g_dq;
-std::mutex                   g_dq_mtx;
+DumpQueue g_dq;
+std::mutex g_dq_mtx;
 std::vector<ID3D12Resource*> g_rb_retired;
 
 void LogQueueFailure(const char* what, HRESULT hr)
 {
     static std::atomic<int> n{ 0 };
-    const int               k = n.fetch_add(1);
+    const int k = n.fetch_add(1);
     if (k >= 24) return;
     HRESULT removed = S_OK;
     if (const Dx12Bridge& b = GetDx12Bridge(); b.device) removed = b.device->GetDeviceRemovedReason();
@@ -93,8 +94,8 @@ bool Ensure()
     }
 
     // DIRECT, not COPY: a copy queue cannot do the transitions the texture path needs.
-    if (FAILED(CreateGpuQueue(b.device, D3D12_COMMAND_LIST_TYPE_DIRECT, nullptr, nullptr,
-            &g_dq.queue, &g_dq.alloc, &g_dq.list)) ||
+    if (FAILED(CreateGpuQueue(
+            b.device, D3D12_COMMAND_LIST_TYPE_DIRECT, nullptr, nullptr, &g_dq.queue, &g_dq.alloc, &g_dq.list)) ||
         FAILED(b.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dq.fence))) ||
         FAILED(b.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dq.gfence)))) {
         logger::write("DUMPRB: could not create the private dump queue -- frame analysis readback "
@@ -166,15 +167,15 @@ ID3D12GraphicsCommandList* DumpReadbackList()
 namespace {
 
 struct PreEntry {
-    ID3D12Resource*      res;
-    unsigned             row_pitch;
+    ID3D12Resource* res;
+    unsigned row_pitch;
     std::vector<uint8_t> bytes;
 };
 
 constexpr unsigned kPreDrainChunkBytes = 128u * 1024u * 1024u;
 
-ID3D12Resource*              g_pre_rb = nullptr; // one READBACK buffer, reused chunk after chunk
-std::vector<PreEntry>        g_pre_list;
+ID3D12Resource* g_pre_rb = nullptr; // one READBACK buffer, reused chunk after chunk
+std::vector<PreEntry> g_pre_list;
 std::vector<ID3D12Resource*> g_pre_queue;
 
 } // namespace
@@ -217,29 +218,29 @@ void PreDrainFlush()
     if (!b.device) return;
 
     if (!g_pre_rb) {
-        if (FAILED(CreateD3D12Buffer(b.device, D3D12_HEAP_TYPE_READBACK, kPreDrainChunkBytes,
-                D3D12_RESOURCE_STATE_COPY_DEST, &g_pre_rb)))
+        if (FAILED(CreateD3D12Buffer(
+                b.device, D3D12_HEAP_TYPE_READBACK, kPreDrainChunkBytes, D3D12_RESOURCE_STATE_COPY_DEST, &g_pre_rb)))
             return;
     }
 
     struct Pending {
         ID3D12Resource* res;
-        unsigned        offset;
-        unsigned        bytes;
-        unsigned        row_pitch;
+        unsigned offset;
+        unsigned bytes;
+        unsigned row_pitch;
     };
     std::vector<Pending> chunk;
-    size_t               i = 0;
+    size_t i = 0;
     while (i < g_pre_queue.size()) {
         if (!BeginBatch()) return;
         chunk.clear();
         unsigned cursor = 0;
-        bool     any = false;
+        bool any = false;
 
         for (; i < g_pre_queue.size(); ++i) {
             ID3D12Resource* res = g_pre_queue[i];
-            const uint32_t  live = ObservedResourceState(res); // COMMON (0) is a real answer: a mod texture
-            if (live == kResStateUnknown) {                    // unknown -> skip, never guess
+            const uint32_t live = ObservedResourceState(res); // COMMON (0) is a real answer: a mod texture
+            if (live == kResStateUnknown) { // unknown -> skip, never guess
                 static bool once = false;
                 if (!once) {
                     once = true;
@@ -252,9 +253,9 @@ void PreDrainFlush()
             if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue; // buffers already cheap
 
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-            UINT                               rows = 0;
-            UINT64                             rsz = 0;
-            UINT64                             tot = 0;
+            UINT rows = 0;
+            UINT64 rsz = 0;
+            UINT64 tot = 0;
             b.device->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &rsz, &tot);
             const unsigned base = (cursor + 511u) & ~511u;
             if ((UINT64)base + tot > kPreDrainChunkBytes) {
@@ -271,7 +272,9 @@ void PreDrainFlush()
             src.pResource = res;
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             src.SubresourceIndex = 0;
-            CopyAsSource(g_dq.list, res, (D3D12_RESOURCE_STATES)live, [&] { g_dq.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr); }, /*subresource*/ 0);
+            CopyAsSource(
+                g_dq.list, res, (D3D12_RESOURCE_STATES)live,
+                [&] { g_dq.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr); }, /*subresource*/ 0);
 
             chunk.push_back({ res, base, (unsigned)tot, fp.Footprint.RowPitch });
             cursor = base + (unsigned)tot;
@@ -293,9 +296,11 @@ void PreDrainFlush()
             if (listed++ < 2)
                 for (const Pending& c : chunk) {
                     const D3D12_RESOURCE_DESC cd = c.res->GetDesc();
-                    logger::write("DUMPRB:   chunk res=%p %llux%u mips=%u array=%u fmt=%u flags=0x%x samples=%u state=0x%x bytes=%u",
+                    logger::write(
+                        "DUMPRB:   chunk res=%p %llux%u mips=%u array=%u fmt=%u flags=0x%x samples=%u state=0x%x bytes=%u",
                         (void*)c.res, (unsigned long long)cd.Width, cd.Height, cd.MipLevels, cd.DepthOrArraySize,
-                        (unsigned)cd.Format, (unsigned)cd.Flags, cd.SampleDesc.Count, ObservedResourceState(c.res), c.bytes);
+                        (unsigned)cd.Format, (unsigned)cd.Flags, cd.SampleDesc.Count, ObservedResourceState(c.res),
+                        c.bytes);
                 }
             g_dq.open = false;
             g_dq.stale = true;
@@ -303,7 +308,7 @@ void PreDrainFlush()
         }
         if (const ID3D12CommandQueue* gq = GetDx12Bridge().queue) {
             ID3D12CommandQueue* game_queue = const_cast<ID3D12CommandQueue*>(gq);
-            const UINT64        gv = ++g_dq.gvalue;
+            const UINT64 gv = ++g_dq.gvalue;
             if (SUCCEEDED(game_queue->Signal(g_dq.gfence, gv))) g_dq.queue->Wait(g_dq.gfence, gv);
         }
         ID3D12CommandList* lists[] = { g_dq.list };
@@ -321,7 +326,7 @@ void PreDrainFlush()
                         (unsigned long)wr, cursor);
                     g_dq.open = false;
                     g_dq.stale = true; // rebuild before the next batch
-                    return;            // do NOT Map: that would publish whatever the buffer held
+                    return; // do NOT Map: that would publish whatever the buffer held
                 }
             }
         }
@@ -329,7 +334,7 @@ void PreDrainFlush()
 
         DumpStage("PreDrain: map + copy out", cursor);
         // Take the bytes out before the buffer is reused by the next chunk.
-        void*       p = nullptr;
+        void* p = nullptr;
         D3D12_RANGE rr{ 0, cursor };
         if (SUCCEEDED(g_pre_rb->Map(0, &rr, &p)) && p) {
             static bool once = false;
@@ -338,7 +343,7 @@ void PreDrainFlush()
                 size_t zero_entries = 0;
                 for (const Pending& c : chunk) {
                     const uint8_t* src = (const uint8_t*)p + c.offset;
-                    bool           nz = false;
+                    bool nz = false;
                     for (unsigned k = 0; k < c.bytes && !nz; ++k)
                         if (src[k]) nz = true;
                     if (!nz) ++zero_entries;
@@ -378,7 +383,7 @@ bool DumpReadbackFlush()
 {
     DumpStage("Flush: wait g_dq_mtx");
     std::lock_guard<std::mutex> l(g_dq_mtx);
-    const bool                  ok = FlushLocked();
+    const bool ok = FlushLocked();
     for (ID3D12Resource* r : g_rb_retired)
         if (ok)
             r->Release();
@@ -404,9 +409,8 @@ static bool FlushLocked()
     DumpStage("Flush: order after the game queue");
     if (const ID3D12CommandQueue* gq = GetDx12Bridge().queue) {
         ID3D12CommandQueue* game_queue = const_cast<ID3D12CommandQueue*>(gq);
-        const UINT64        gv = ++g_dq.gvalue;
-        if (SUCCEEDED(game_queue->Signal(g_dq.gfence, gv)))
-            g_dq.queue->Wait(g_dq.gfence, gv);
+        const UINT64 gv = ++g_dq.gvalue;
+        if (SUCCEEDED(game_queue->Signal(g_dq.gfence, gv))) g_dq.queue->Wait(g_dq.gfence, gv);
     }
 
     DumpStage("Flush: execute");
@@ -422,7 +426,8 @@ static bool FlushLocked()
     if (g_dq.fence->GetCompletedValue() < v) {
         if (!g_dq.event) g_dq.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         DumpStage("Flush: fence wait", v);
-        const DWORD wr = WaitForFence(g_dq.fence, v, g_dq.event, 10000); // bounded: a hung GPU must not hang the game too
+        const DWORD wr =
+            WaitForFence(g_dq.fence, v, g_dq.event, 10000); // bounded: a hung GPU must not hang the game too
         if (wr != WAIT_OBJECT_0) {
             logger::write("DUMPRB: per-resource fence wait returned %lu (NOT signalled) -- the GPU still owns "
                           "this allocator; this resource is NOT mapped, the queue is rebuilt",

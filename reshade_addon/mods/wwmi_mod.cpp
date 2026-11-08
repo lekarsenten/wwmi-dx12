@@ -10,7 +10,7 @@
 // ===========================================================================
 #include "wwmi_mod.h"
 #include "../migoto/port_api.h" // GetBufferResource -- their object, not a second copy
-#include "../../src/log.h"
+#include "../core/log.h"
 #include <cwctype>
 #include <cstring>
 #include <string>
@@ -23,7 +23,7 @@ static std::wstring lower(std::wstring s)
     return s;
 }
 
-int LoadResources(Mod& m, ID3D12Device* /*dev*/)
+int LoadResources(Mod& m, std::vector<PortApi::HeldBuffer>& held)
 {
     int n = 0;
     int missing = 0;
@@ -38,6 +38,8 @@ int LoadResources(Mod& m, ID3D12Device* /*dev*/)
             if (dot != std::wstring::npos && _wcsicmp(r.filename.c_str() + dot, L".buf") == 0) ++missing;
             continue;
         }
+        void* wrapper = PortApi::AcquireBufferObject(r.fq.c_str());
+        if (wrapper) held.push_back({ wrapper, r.fq });
         r.res = bi.dx12;
         r.gpu_va = bi.gpu_va;
         r.size = bi.byte_width;
@@ -48,8 +50,7 @@ int LoadResources(Mod& m, ID3D12Device* /*dev*/)
         missing ? " (some file resources had no DX12 buffer -- see below)" : "");
     if (missing)
         for (const auto& r : m.resources)
-            if (!r.res && r.filename.size() >= 4 &&
-                _wcsicmp(r.filename.c_str() + r.filename.size() - 4, L".buf") == 0)
+            if (!r.res && r.filename.size() >= 4 && _wcsicmp(r.filename.c_str() + r.filename.size() - 4, L".buf") == 0)
                 logger::write("  no DX12 buffer for %ls ('%ls')", r.name.c_str(), r.filename.c_str());
     return n;
 }
@@ -64,19 +65,19 @@ const Resource* Find(const Mod& m, const wchar_t* name)
 
 void LogSelfCheck(const Mod& m)
 {
-    logger::write("WwmiMod self-check: %zu components, %zu resources, fwdmap='%ls'",
-        m.comps.size(), m.resources.size(), m.forward_map_file.c_str());
+    logger::write("WwmiMod self-check: %zu components, %zu resources, fwdmap='%ls'", m.comps.size(), m.resources.size(),
+        m.forward_map_file.c_str());
     for (const auto& c : m.comps) {
         int ndraws = (int)c.draws.size();
         if (c.remapped)
-            logger::write("  comp%d first=%u count=%u vg_off=%u vg_cnt=%u REMAPPED id=%d remap_vg=%u draws=%d",
-                c.index, c.match_first_index, c.match_index_count, c.vg_offset, c.vg_count, c.remap_id, c.remap_vg, ndraws);
+            logger::write("  comp%d first=%u count=%u vg_off=%u vg_cnt=%u REMAPPED id=%d remap_vg=%u draws=%d", c.index,
+                c.match_first_index, c.match_index_count, c.vg_offset, c.vg_count, c.remap_id, c.remap_vg, ndraws);
         else
-            logger::write("  comp%d first=%u count=%u vg_off=%u vg_cnt=%u direct draws=%d",
-                c.index, c.match_first_index, c.match_index_count, c.vg_offset, c.vg_count, ndraws);
+            logger::write("  comp%d first=%u count=%u vg_off=%u vg_cnt=%u direct draws=%d", c.index,
+                c.match_first_index, c.match_index_count, c.vg_offset, c.vg_count, ndraws);
         for (const auto& d : c.draws)
-            logger::write("      draw count=%u start=%u%s%ls", d.count, d.start,
-                d.cond.empty() ? "" : "  if ", d.cond.c_str());
+            logger::write(
+                "      draw count=%u start=%u%s%ls", d.count, d.start, d.cond.empty() ? "" : "  if ", d.cond.c_str());
     }
     int nfile = 0;
     for (const auto& r : m.resources)
@@ -86,8 +87,9 @@ void LogSelfCheck(const Mod& m)
         L"ResourceTexcoordBuffer", L"ResourceColorBuffer", L"ResourceIndexBuffer" };
     for (const wchar_t* nm : key) {
         const Resource* r = Find(m, nm);
-        if (r) logger::write("  %ls: file='%ls' size=%u stride=%u va=%llx%s", nm, r->filename.c_str(),
-            r->size, r->stride, r->gpu_va, r->res ? "" : " (NOT LOADED)");
+        if (r)
+            logger::write("  %ls: file='%ls' size=%u stride=%u va=%llx%s", nm, r->filename.c_str(), r->size, r->stride,
+                r->gpu_va, r->res ? "" : " (NOT LOADED)");
     }
 }
 

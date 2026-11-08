@@ -9,12 +9,14 @@
 #include "HackerContext.h"
 #include "frame_analysis_engine.h"
 #include "profiling.h"
-#include "port_keygate.h"
+#include "command_observer.h"
+#include "selection_watch.h"
 #include "port_toggles.h" // g_port_post_split
 #include "dx12_context.h"
+#include "dx12_context_impl.h"
 #include "dx12_pipeline.h"
 #include "dx12_wrap.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 #include "prof_core.h" // PROF(PL_*): the engine-lock WAITs measured apart from the work, the lookups
 
 #include <algorithm>
@@ -70,7 +72,8 @@ bool ReplayExpr(const CommandListEvaluatable* e, std::vector<const float*>& vars
         return true;
     }
     if (const CommandListOperator* op = dynamic_cast<const CommandListOperator*>(e))
-        return (!op->lhs || ReplayExpr(op->lhs.get(), vars, ress)) && (!op->rhs || ReplayExpr(op->rhs.get(), vars, ress));
+        return (!op->lhs || ReplayExpr(op->lhs.get(), vars, ress)) &&
+            (!op->rhs || ReplayExpr(op->rhs.get(), vars, ress));
     return false;
 }
 
@@ -78,7 +81,7 @@ bool ReplayList(CommandList* cl, bool post, std::vector<const float*>& vars, std
 {
     if (!cl || cl->ResolveCommandList() != cl) return false;
     for (const auto& cmd : cl->commands) {
-        CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
+        CommandListCommand* c = MigotoPort::g_command_observer.Unwrap(cmd.get());
         if (c == cmd.get()) return false;
         auto* ic = dynamic_cast<IfCommand*>(c);
         if (!ic) continue;
@@ -92,38 +95,39 @@ bool ReplayList(CommandList* cl, bool post, std::vector<const float*>& vars, std
 
 struct ResSnap {
     ID3D11Resource* res;
-    bool            is_null;
+    bool is_null;
 };
 
 struct Trace {
-    bool                             ok = false;
-    std::vector<CustomResource*>     ress;
-    std::vector<ResSnap>             snap;
+    bool ok = false;
+    std::vector<CustomResource*> ress;
+    std::vector<ResSnap> snap;
     std::vector<CommandListCommand*> leaves;
-    unsigned                         gen = 0;
+    unsigned gen = 0;
 };
 
 Trace* TraceOf(CommandList* list, bool post)
 {
-    if (G->analyse_frame || MigotoPort::ObserverActive() || Profiling::mode != Profiling::Mode::NONE) return nullptr;
+    if (G->analyse_frame || MigotoPort::g_command_observer.Active() || Profiling::mode != Profiling::Mode::NONE)
+        return nullptr;
     if (!list || list->ResolveCommandList() != list) return nullptr;
     static std::unordered_map<uintptr_t, Trace> s_traces;
-    static unsigned                             s_gen = ~0u;
-    const unsigned                              gen = LoadGeneration();
+    static unsigned s_gen = ~0u;
+    const unsigned gen = LoadGeneration();
     if (gen != s_gen) {
         s_traces.clear();
         s_gen = gen;
     }
     const uintptr_t key = (uintptr_t)list | (post ? 1 : 0);
-    auto            it = s_traces.find(key);
+    auto it = s_traces.find(key);
     if (it == s_traces.end()) {
-        Trace                     t;
+        Trace t;
         std::vector<const float*> vars;
         t.ok = ReplayList(list, post, vars, t.ress);
         if (!t.ok)
             t.ress.clear();
         else
-            for (const float* v : vars) MigotoPort::WatchSelectionVar(v);
+            for (const float* v : vars) MigotoPort::g_selection_watch.WatchVar(v);
         it = s_traces.emplace(key, std::move(t)).first;
     }
     return it->second.ok ? &it->second : nullptr;
@@ -157,14 +161,13 @@ void ReplayLeaves(Trace& t, DrawCallInfo* ci, bool post)
 
     if (!t.leaves.empty()) {
         state.recursion++;
-        for (size_t i = 0; i < t.leaves.size() && !state.aborted; ++i)
-            t.leaves[i]->run(&state);
+        for (size_t i = 0; i < t.leaves.size() && !state.aborted; ++i) t.leaves[i]->run(&state);
         state.recursion--;
     }
 
     if (state.update_params && g_dev.mIniTexture) {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT                  hr = state.mOrigContext1->Map(g_dev.mIniTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        HRESULT hr = state.mOrigContext1->Map(g_dev.mIniTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(hr)) {
             LogInfo("CommandListFlushState: Map failed\n");
             return;
@@ -176,15 +179,7 @@ void ReplayLeaves(Trace& t, DrawCallInfo* ci, bool post)
     }
 }
 
-enum ReplayCount {
-    RC_TopReplayed,
-    RC_TopRecorded,
-    RC_TopPlain,
-    RC_SubReplayed,
-    RC_SubRecorded,
-    RC_SubPlain,
-    RC_COUNT
-};
+enum ReplayCount { RC_TopReplayed, RC_TopRecorded, RC_TopPlain, RC_SubReplayed, RC_SubRecorded, RC_SubPlain, RC_COUNT };
 unsigned g_replay_n[RC_COUNT] = {};
 
 void RunList(CommandList* list, DrawCallInfo* ci, bool post)
@@ -195,7 +190,7 @@ void RunList(CommandList* list, DrawCallInfo* ci, bool post)
         RunCommandList(&g_dev, &g_ctx, list, ci, post);
         return;
     }
-    const unsigned gen = MigotoPort::SelectionInputsGen();
+    const unsigned gen = MigotoPort::g_selection_watch.InputsGen();
     if (t->gen == gen && SnapHolds(*t, t->snap)) {
         ++g_replay_n[RC_TopReplayed];
         ReplayLeaves(*t, ci, post);
@@ -205,10 +200,10 @@ void RunList(CommandList* list, DrawCallInfo* ci, bool post)
     t->gen = 0;
     t->leaves.clear();
     TakeSnap(*t, t->snap);
-    std::vector<CommandListCommand*>* const outer = MigotoPort::SetCommandTrace(&t->leaves);
+    std::vector<CommandListCommand*>* const outer = MigotoPort::g_command_observer.SetTrace(&t->leaves);
     RunCommandList(&g_dev, &g_ctx, list, ci, post);
-    MigotoPort::SetCommandTrace(outer);
-    if (MigotoPort::SelectionInputsGen() != gen || !SnapHolds(*t, t->snap)) return;
+    MigotoPort::g_command_observer.SetTrace(outer);
+    if (MigotoPort::g_selection_watch.InputsGen() != gen || !SnapHolds(*t, t->snap)) return;
     t->gen = gen;
 }
 
@@ -218,19 +213,19 @@ bool RunExplicitHook(CommandListCommand* inner, CommandListState* state)
     if (MigotoPort::g_present_redraw || !rc->command_list_section || rc->run_pre_and_post_together ||
         state->recursion > MAX_COMMAND_LIST_RECURSION)
         return false;
-    CommandList* list = state->post ? &rc->command_list_section->post_command_list : &rc->command_list_section->command_list;
-    Trace*       t = TraceOf(list, state->post);
+    CommandList* list =
+        state->post ? &rc->command_list_section->post_command_list : &rc->command_list_section->command_list;
+    Trace* t = TraceOf(list, state->post);
     if (!t) {
         ++g_replay_n[RC_SubPlain];
         return false;
     }
-    const unsigned gen = MigotoPort::SelectionInputsGen();
+    const unsigned gen = MigotoPort::g_selection_watch.InputsGen();
     if (t->gen == gen && SnapHolds(*t, t->snap)) {
         ++g_replay_n[RC_SubReplayed];
         if (!t->leaves.empty()) {
             state->recursion++;
-            for (size_t i = 0; i < t->leaves.size() && !state->aborted; ++i)
-                t->leaves[i]->run(state);
+            for (size_t i = 0; i < t->leaves.size() && !state->aborted; ++i) t->leaves[i]->run(state);
             state->recursion--;
         }
         return true;
@@ -239,14 +234,14 @@ bool RunExplicitHook(CommandListCommand* inner, CommandListState* state)
     t->gen = 0;
     t->leaves.clear();
     TakeSnap(*t, t->snap);
-    std::vector<CommandListCommand*>* const outer = MigotoPort::SetCommandTrace(&t->leaves);
+    std::vector<CommandListCommand*>* const outer = MigotoPort::g_command_observer.SetTrace(&t->leaves);
     inner->run(state);
-    MigotoPort::SetCommandTrace(outer);
-    if (MigotoPort::SelectionInputsGen() == gen && SnapHolds(*t, t->snap)) t->gen = gen;
+    MigotoPort::g_command_observer.SetTrace(outer);
+    if (MigotoPort::g_selection_watch.InputsGen() == gen && SnapHolds(*t, t->snap)) t->gen = gen;
     return true;
 }
 
-const bool s_run_hook_set = (MigotoPort::SetRunExplicitHook(&RunExplicitHook), true);
+const bool s_run_hook_set = (MigotoPort::CommandObserverInstance().SetRunExplicitHook(&RunExplicitHook), true);
 
 } // namespace
 
@@ -269,9 +264,11 @@ namespace {
 struct PendingPost {
     CommandList* list;
     DrawCallInfo ci; // by value: theirs passes the same call_info to both phases, and the caller's
-                     // DrawCallInfo is a stack local that is gone by the time After* runs.
+    // DrawCallInfo is a stack local that is gone by the time After* runs.
 };
 thread_local std::vector<PendingPost> t_pending_post;
+thread_local std::vector<PendingPost> t_late_post;
+thread_local bool t_post_late = false;
 
 void QueuePost(CommandList* list, const DrawCallInfo& ci)
 {
@@ -281,28 +278,41 @@ void QueuePost(CommandList* list, const DrawCallInfo& ci)
         RunList(list, &tmp, true);
         return;
     }
-    if (t_pending_post.size() == 64) {
+    std::vector<PendingPost>& queue = t_post_late ? t_late_post : t_pending_post;
+    if (queue.size() == 64) {
         static bool once = false;
         if (!once) {
             once = true;
             logger::write("PENDING-POST LEAK: %zu queued post lists with no drain -- a QueuePost site is "
                           "missing its RunPendingPost()",
-                t_pending_post.size());
+                queue.size());
         }
     }
-    t_pending_post.push_back({ list, ci });
+    queue.push_back({ list, ci });
 }
 
 } // namespace
 
+LateStagePost::LateStagePost()
+    : was_(t_post_late)
+{
+    t_post_late = true;
+}
+
+LateStagePost::~LateStagePost()
+{
+    t_post_late = was_;
+}
+
 void RunPendingPost()
 {
-    if (t_pending_post.empty()) return;
+    if (t_pending_post.empty() && t_late_post.empty()) return;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    std::vector<PendingPost>              run;
+    std::vector<PendingPost> run;
     run.swap(t_pending_post);
-    for (PendingPost& p : run)
-        RunList(p.list, &p.ci, true);
+    run.insert(run.end(), t_late_post.begin(), t_late_post.end());
+    t_late_post.clear();
+    for (PendingPost& p : run) RunList(p.list, &p.ci, true);
 }
 
 void RunResolvedCommandList(const void* explicit_section, DrawInfo* draw)
@@ -314,7 +324,7 @@ void RunResolvedCommandList(const void* explicit_section, DrawInfo* draw)
     }
     if (!g_loaded || !explicit_section) return;
     ExplicitCommandListSection* s = (ExplicitCommandListSection*)explicit_section;
-    DrawCallInfo                ci = ToCallInfo(draw);
+    DrawCallInfo ci = ToCallInfo(draw);
     RunList(&s->command_list, &ci, false);
     QueuePost(&s->post_command_list, ci);
     if (draw && ci.skip) draw->skip = true;
@@ -335,7 +345,7 @@ bool DispatchShaderOverride(uint64_t shader_hash, DrawInfo* draw)
 
     DrawCallInfo ci = ToCallInfo(draw);
 
-    bool            use_orig = false;
+    bool use_orig = false;
     ShaderOverride& so = it->second;
     if (so.depth_filter != DepthBufferFilter::NONE && draw && draw->depth_known) {
         if (so.depth_filter == DepthBufferFilter::DEPTH_ACTIVE && !draw->depth_active)
@@ -419,7 +429,7 @@ void RegisterShaderHash(uint64_t ini_hash)
 {
     if (!g_loaded || !ini_hash) return;
     std::lock_guard<std::mutex> lk(g_shader_state_mutex);
-    auto                        it = ShaderTokens().find(ini_hash);
+    auto it = ShaderTokens().find(ini_hash);
     if (it != ShaderTokens().end()) return; // already registered: no write, no rehash
     uint64_t& slot = ShaderTokens()[ini_hash];
     slot = ini_hash; // content is for debugging; the ADDRESS is the key
@@ -433,9 +443,8 @@ void SetBoundShader(char stage, uint64_t ini_hash)
     ID3D11DeviceChild* handle = nullptr;
     if (ini_hash) {
         std::lock_guard<std::mutex> lk(g_shader_state_mutex);
-        auto                        it = ShaderTokens().find(ini_hash);
-        if (it != ShaderTokens().end())
-            handle = reinterpret_cast<ID3D11DeviceChild*>(&it->second);
+        auto it = ShaderTokens().find(ini_hash);
+        if (it != ShaderTokens().end()) handle = reinterpret_cast<ID3D11DeviceChild*>(&it->second);
     }
 
     switch (stage) {
@@ -476,7 +485,7 @@ float BoundShaderFilter(char stage, uint64_t* out_hash, int* out_have_handle, in
 
     // Same switch as theirs, same "negative zero means no shader bound" convention.
     ID3D11DeviceChild* handle = nullptr;
-    uint64_t           h = 0;
+    uint64_t h = 0;
     switch (stage) {
     case 'v':
         handle = g_ctx.mCurrentVertexShaderHandle;
@@ -509,7 +518,7 @@ float BoundShaderFilter(char stage, uint64_t* out_hash, int* out_have_handle, in
     if (out_have_handle) *out_have_handle = 1;
 
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    ShaderMap::iterator                   si = G->mShaders.find(handle);
+    ShaderMap::iterator si = G->mShaders.find(handle);
     if (si == G->mShaders.end()) return 0.0f;
     if (out_in_mshaders) *out_in_mshaders = 1;
 
@@ -525,14 +534,14 @@ void ShaderOverrideSection(uint64_t shader_hash, wchar_t* out, size_t out_chars)
     out[0] = 0;
     if (!g_loaded) return;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    ShaderOverrideMap::iterator           it = lookup_shaderoverride(shader_hash);
+    ShaderOverrideMap::iterator it = lookup_shaderoverride(shader_hash);
     if (it == G->mShaderOverrideMap.end()) return;
     wcsncpy_s(out, out_chars, it->second.first_ini_section.c_str(), _TRUNCATE);
 }
 
 namespace {
 struct SectionHit {
-    TextureOverride*            to = nullptr;
+    TextureOverride* to = nullptr;
     ExplicitCommandListSection* ex = nullptr;
 };
 
@@ -547,25 +556,25 @@ bool SameName(const std::wstring& a, const wchar_t* b, size_t nb)
 SectionHit FindSection(const wchar_t* fq)
 {
     struct Memo {
-        unsigned     gen = ~0u;
+        unsigned gen = ~0u;
         std::wstring key;
-        SectionHit   hit;
+        SectionHit hit;
     };
-    thread_local Memo     t_memo[16];
+    thread_local Memo t_memo[16];
     thread_local unsigned t_next = 0;
-    const unsigned        gen = LoadGeneration();
-    const size_t          n = wcslen(fq);
+    const unsigned gen = LoadGeneration();
+    const size_t n = wcslen(fq);
     for (const Memo& m : t_memo)
         if (m.gen == gen && SameName(m.key, fq, n)) return m.hit;
-    SectionHit         h;
+    SectionHit h;
     const std::wstring w(fq, n);
-    auto&              idx = SectionIndex();
-    auto               it = idx.find(w);
+    auto& idx = SectionIndex();
+    auto it = idx.find(w);
     if (it != idx.end()) {
         h.to = it->second;
     } else {
         auto& xidx = ExplicitIndex();
-        auto  xit = xidx.find(w);
+        auto xit = xidx.find(w);
         if (xit != xidx.end()) h.ex = xit->second;
     }
     Memo& m = t_memo[t_next++ & 15];
@@ -579,12 +588,13 @@ SectionHit FindSection(const wchar_t* fq)
 bool RunSectionByName(const wchar_t* fq_section, DrawInfo* draw)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    if (draw) draw->srv_gen_at_entry = MigotoPort::SrvWriteGen(); // under the lock: nothing of another section's can follow
+    if (draw)
+        draw->srv_gen_at_entry = MigotoPort::SrvWriteGen(); // under the lock: nothing of another section's can follow
     if (!g_loaded || !fq_section) return false;
     g_ctx.RestoreInputLayout();
     g_ctx.mDrawPipeline = draw ? draw->pso : 0;
-    ProfScope        lookup_scope(PL_DI_PsLookup); // name -> section, ended before the list runs
-    DrawCallInfo     ci = ToCallInfo(draw);
+    ProfScope lookup_scope(PL_DI_PsLookup); // name -> section, ended before the list runs
+    DrawCallInfo ci = ToCallInfo(draw);
     const SectionHit hit = FindSection(fq_section);
     lookup_scope.End();
     if (hit.to) {
@@ -605,7 +615,7 @@ bool RunSectionByName(const wchar_t* fq_section, DrawInfo* draw)
 bool RunSectionThenPost(const wchar_t* fq_section, DrawInfo* draw)
 {
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    const bool                            ran = RunSectionByName(fq_section, draw);
+    const bool ran = RunSectionByName(fq_section, draw);
     RunPendingPost();
     return ran;
 }
@@ -614,8 +624,8 @@ namespace {
 thread_local void (*g_draw_cb)(const ModDraw&, void*) = nullptr;
 thread_local void* g_draw_cb_user = nullptr;
 
-void DrawTrampoline(unsigned count, unsigned start, int base, unsigned instances,
-    unsigned start_instance, bool indexed, void* /*unused*/)
+void DrawTrampoline(unsigned count, unsigned start, int base, unsigned instances, unsigned start_instance, bool indexed,
+    void* /*unused*/)
 {
     if (!g_draw_cb) return;
     ModDraw d;
@@ -645,7 +655,7 @@ void SetCommandObserver(void (*fn)(const wchar_t* ini_line, void* user), void* u
 {
     g_cmd_cb = fn;
     g_cmd_cb_user = user;
-    MigotoPort::SetCommandObserver(fn ? &CommandTrampoline : nullptr, nullptr);
+    MigotoPort::g_command_observer.SetObserver(fn ? &CommandTrampoline : nullptr, nullptr);
 }
 
 namespace {
@@ -685,7 +695,8 @@ void TypedTrampoline(const MigotoPort::ObservedCmd& in, void*)
         if (!o.run_target && in.run_target && *in.run_target) o.run_target = in.run_target;
     } else {
         if (o.dst_is_custom) o.dst_resource = key_of(CustomResourceNameIndex(), in.dst_custom);
-        if (o.dst_is_custom || o.dst_is_vb || o.dst_is_ib) o.src_resource = key_of(CustomResourceNameIndex(), in.src_custom);
+        if (o.dst_is_custom || o.dst_is_vb || o.dst_is_ib)
+            o.src_resource = key_of(CustomResourceNameIndex(), in.src_custom);
         o.src_custom = in.src_custom;
     }
     g_typed_cb(o, g_typed_cb_user);
@@ -696,7 +707,7 @@ void SetTypedObserver(void (*fn)(const ObservedCommand&, void* user), void* user
 {
     g_typed_cb = fn;
     g_typed_cb_user = user;
-    MigotoPort::SetTypedCommandObserver(fn ? &TypedTrampoline : nullptr, nullptr);
+    MigotoPort::g_command_observer.SetTypedObserver(fn ? &TypedTrampoline : nullptr, nullptr);
 }
 
 void SetDrawCallback(void (*fn)(const ModDraw&, void* user), void* user)
@@ -731,12 +742,14 @@ bool ListAssignsThis(const CommandList* cl, std::vector<const void*>& seen)
 {
     if (!cl) return false;
     for (const auto& cmd : cl->commands) {
-        CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
+        CommandListCommand* c = MigotoPort::g_command_observer.Unwrap(cmd.get());
         if (auto* rc = dynamic_cast<ResourceCopyOperation*>(c))
             if (rc->dst.type == ResourceCopyTargetType::THIS_RESOURCE) return true;
         if (auto* ic = dynamic_cast<IfCommand*>(c)) {
-            if (ListAssignsThis(ic->true_commands_pre.get(), seen) || ListAssignsThis(ic->true_commands_post.get(), seen) ||
-                ListAssignsThis(ic->false_commands_pre.get(), seen) || ListAssignsThis(ic->false_commands_post.get(), seen))
+            if (ListAssignsThis(ic->true_commands_pre.get(), seen) ||
+                ListAssignsThis(ic->true_commands_post.get(), seen) ||
+                ListAssignsThis(ic->false_commands_pre.get(), seen) ||
+                ListAssignsThis(ic->false_commands_post.get(), seen))
                 return true;
         }
         if (auto* rc = dynamic_cast<RunExplicitCommandList*>(c)) {
@@ -753,7 +766,7 @@ bool ListAssignsThis(const CommandList* cl, std::vector<const void*>& seen)
 void LogSelClass(TextureOverride* to, bool sel)
 {
     static std::vector<const TextureOverride*> s_logged;
-    static bool                                s_was_armed = false;
+    static bool s_was_armed = false;
     if (!G->analyse_frame) {
         s_was_armed = false;
         return;
@@ -767,7 +780,7 @@ void LogSelClass(TextureOverride* to, bool sel)
     {
         std::string cmds;
         for (const auto& cmd : to->command_list.commands) {
-            CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
+            CommandListCommand* c = MigotoPort::g_command_observer.Unwrap(cmd.get());
             cmds += " ";
             cmds += typeid(*c).name();
             if (auto* ic = dynamic_cast<IfCommand*>(c))
@@ -784,8 +797,8 @@ void LogSelClass(TextureOverride* to, bool sel)
 bool SelectsResource(TextureOverride* to)
 {
     static std::unordered_map<const TextureOverride*, bool> s_cache;
-    static unsigned                                         s_gen = ~0u;
-    const unsigned                                          gen = LoadGeneration();
+    static unsigned s_gen = ~0u;
+    const unsigned gen = LoadGeneration();
     if (gen != s_gen) {
         s_cache.clear();
         s_gen = gen;
@@ -806,25 +819,25 @@ bool SelectsResource(TextureOverride* to)
 bool ModSwitchedOff(const TextureOverride* to)
 {
     static std::unordered_map<const TextureOverride*, const float*> s_switch;
-    static unsigned                                                 s_gen = ~0u;
-    const unsigned                                                  gen = LoadGeneration();
+    static unsigned s_gen = ~0u;
+    const unsigned gen = LoadGeneration();
     if (gen != s_gen) {
         s_switch.clear();
         s_gen = gen;
     }
     auto it = s_switch.find(to);
     if (it == s_switch.end()) {
-        const float*        v = nullptr;
+        const float* v = nullptr;
         const std::wstring& sec = to->ini_section; // TextureOverride\<namespace>\<name>
-        const size_t        a = sec.find(L'\\');
-        const size_t        b = sec.rfind(L'\\');
+        const size_t a = sec.find(L'\\');
+        const size_t b = sec.rfind(L'\\');
         if (a != std::wstring::npos && b != std::wstring::npos && b > a) {
             std::wstring key = L"$\\" + sec.substr(a + 1, b - a - 1) + L"\\mod_enabled";
             for (auto& ch : key) ch = (wchar_t)towlower(ch);
             auto vi = command_list_globals.find(key);
             if (vi != command_list_globals.end()) v = &vi->second.fval;
         }
-        if (v) MigotoPort::WatchSelectionVar(v);
+        if (v) MigotoPort::g_selection_watch.WatchVar(v);
         it = s_switch.emplace(to, v).first;
     }
     return it->second && *it->second == 0.f;
@@ -848,11 +861,13 @@ bool PureSelectList(CommandList* cl, std::vector<CustomResource*>& srcs, std::ve
     if (!cl) return true;
     if (cl->ResolveCommandList() != cl) return false;
     for (const auto& cmd : cl->commands) {
-        CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
+        CommandListCommand* c = MigotoPort::g_command_observer.Unwrap(cmd.get());
         if (auto* ic = dynamic_cast<IfCommand*>(c)) {
             if (!ic->expression.evaluatable || !PureExpr(ic->expression.evaluatable.get(), vars)) return false;
-            if (!PureSelectList(ic->true_commands_pre.get(), srcs, vars, runs) || !PureSelectList(ic->true_commands_post.get(), srcs, vars, runs) ||
-                !PureSelectList(ic->false_commands_pre.get(), srcs, vars, runs) || !PureSelectList(ic->false_commands_post.get(), srcs, vars, runs))
+            if (!PureSelectList(ic->true_commands_pre.get(), srcs, vars, runs) ||
+                !PureSelectList(ic->true_commands_post.get(), srcs, vars, runs) ||
+                !PureSelectList(ic->false_commands_pre.get(), srcs, vars, runs) ||
+                !PureSelectList(ic->false_commands_post.get(), srcs, vars, runs))
                 return false;
             continue;
         }
@@ -884,7 +899,7 @@ void SelectionWrites(CommandList* cl, std::vector<CommandListVariable*>& vars, s
 {
     if (!cl || depth > 8) return;
     for (const auto& cmd : cl->ResolveCommandList()->commands) {
-        CommandListCommand* c = MigotoPort::UnwrapObserved(cmd.get());
+        CommandListCommand* c = MigotoPort::g_command_observer.Unwrap(cmd.get());
         if (auto* va = dynamic_cast<VariableAssignment*>(c)) {
             if (va->var) vars.push_back(va->var);
         } else if (auto* po = dynamic_cast<ParamOverride*>(c)) {
@@ -904,44 +919,48 @@ void SelectionWrites(CommandList* cl, std::vector<CommandListVariable*>& vars, s
 
 struct SelSnap {
     ID3D11Resource* res;
-    bool            is_null;
+    bool is_null;
 };
 struct SelEntry {
-    bool                              pure = false;
-    std::vector<CustomResource*>      srcs;
-    unsigned                          gen = 0;
-    ID3D11Resource*                   pre = nullptr;
-    ID3D11Resource*                   post = nullptr;
-    std::vector<SelSnap>              snap;
-    std::vector<CommandListVariable*> writes;       // an impure list's `$var =` targets: put back after each selection,
-    std::vector<int>                  param_writes; // and its `xN =` ini params -- DX11 runs these lists only in draws
+    bool pure = false;
+    std::vector<CustomResource*> srcs;
+    unsigned gen = 0;
+    ID3D11Resource* pre = nullptr;
+    ID3D11Resource* post = nullptr;
+    std::vector<SelSnap> snap;
+    std::vector<CommandListVariable*> writes; // an impure list's `$var =` targets: put back after each selection,
+    std::vector<int> param_writes; // and its `xN =` ini params -- DX11 runs these lists only in draws
+    CustomResource* pre_loading = nullptr; // what `this` got while it still loads, when nothing loaded did
+    CustomResource* post_loading = nullptr;
 };
 
 SelEntry& SelEntryOf(TextureOverride* to)
 {
     static std::unordered_map<const TextureOverride*, SelEntry> s_sel;
-    static unsigned                                             s_gen = ~0u;
-    const unsigned                                              gen = LoadGeneration();
+    static unsigned s_gen = ~0u;
+    const unsigned gen = LoadGeneration();
     if (gen != s_gen) {
         s_sel.clear();
         s_gen = gen;
     }
     auto it = s_sel.find(to);
     if (it != s_sel.end()) return it->second;
-    SelEntry                  e;
+    SelEntry e;
     std::vector<const float*> vars;
-    e.pure = PureSelectList(&to->command_list, e.srcs, vars, 0) && PureSelectList(&to->post_command_list, e.srcs, vars, 0);
+    e.pure =
+        PureSelectList(&to->command_list, e.srcs, vars, 0) && PureSelectList(&to->post_command_list, e.srcs, vars, 0);
     if (!e.pure) {
         e.srcs.clear();
         SelectionWrites(&to->command_list, e.writes, e.param_writes, 0);
         SelectionWrites(&to->post_command_list, e.writes, e.param_writes, 0);
         if (logger::enabled(1) && (!e.writes.empty() || !e.param_writes.empty()))
-            logger::write("SELWRITES %ls: choosing its texture writes %zu variable(s) and %zu ini param(s) -- put back after "
-                          "each choice, as DX11 runs this list only in the draws that bind the texture",
+            logger::write(
+                "SELWRITES %ls: choosing its texture writes %zu variable(s) and %zu ini param(s) -- put back after "
+                "each choice, as DX11 runs this list only in the draws that bind the texture",
                 to->ini_section.c_str(), e.writes.size(), e.param_writes.size());
     } else {
-        for (const float* v : vars) MigotoPort::WatchSelectionVar(v);
-        for (CustomResource* cr : e.srcs) MigotoPort::WatchSelectionRes(cr);
+        for (const float* v : vars) MigotoPort::g_selection_watch.WatchVar(v);
+        for (CustomResource* cr : e.srcs) MigotoPort::g_selection_watch.WatchRes(cr);
     }
     return s_sel.emplace(to, std::move(e)).first->second;
 }
@@ -954,21 +973,37 @@ bool SnapHolds(const SelEntry& e)
     return true;
 }
 
-bool RunSelection(TextureOverride* to, ID3D11Resource*& picked)
+struct SelLoading {
+    CustomResource* res = nullptr;
+    unsigned gen = 0;
+};
+thread_local SelLoading t_sel_loading; // PortApi::SelectionLoading
+
+void TakeList(ID3D11Resource* slot, CustomResource* slot_loading, ID3D11Resource*& picked, CustomResource*& loading)
+{
+    if (slot) {
+        picked = slot;
+        loading = nullptr;
+    } else if (slot_loading) {
+        loading = slot_loading;
+    }
+}
+
+bool RunSelection(TextureOverride* to, ID3D11Resource*& picked, CustomResource*& loading)
 {
     SelEntry& e = SelEntryOf(to);
-    if (G->analyse_frame) MigotoPort::BumpSelectionInputs();
-    const unsigned gen = MigotoPort::SelectionInputsGen();
-    const bool     memo = e.pure && !G->analyse_frame && !MigotoPort::AnyObserver() &&
+    if (G->analyse_frame) MigotoPort::g_selection_watch.BumpInputs();
+    const unsigned gen = MigotoPort::g_selection_watch.InputsGen();
+    const bool memo = e.pure && !G->analyse_frame && !MigotoPort::g_command_observer.Any() &&
         to->command_list.ResolveCommandList() == &to->command_list &&
         to->post_command_list.ResolveCommandList() == &to->post_command_list;
     if (memo && e.gen == gen && SnapHolds(e)) {
-        if (e.pre) picked = e.pre;
-        if (e.post) picked = e.post;
+        TakeList(e.pre, e.pre_loading, picked, loading);
+        TakeList(e.post, e.post_loading, picked, loading);
         return true;
     }
-    const bool                     keep = !e.writes.empty() || !e.param_writes.empty();
-    std::vector<float>             vars_were;
+    const bool keep = !e.writes.empty() || !e.param_writes.empty();
+    std::vector<float> vars_were;
     std::vector<DirectX::XMFLOAT4> params_were;
     if (keep) {
         vars_were.reserve(e.writes.size());
@@ -978,13 +1013,17 @@ bool RunSelection(TextureOverride* to, ID3D11Resource*& picked)
             params_were.push_back(p < (int)G->iniParams.size() ? G->iniParams[p] : DirectX::XMFLOAT4{});
     }
     ID3D11Resource* slot = nullptr;
+    MigotoPort::g_command_observer.ClearThisLoading();
     RunResourceCommandList(&g_dev, &g_ctx, &to->command_list, &slot, false);
-    if (slot) picked = slot;
     e.pre = slot;
+    e.pre_loading = slot ? nullptr : MigotoPort::g_command_observer.ThisLoading();
+    TakeList(e.pre, e.pre_loading, picked, loading);
     slot = nullptr;
+    MigotoPort::g_command_observer.ClearThisLoading();
     RunResourceCommandList(&g_dev, &g_ctx, &to->post_command_list, &slot, true);
-    if (slot) picked = slot;
     e.post = slot;
+    e.post_loading = slot ? nullptr : MigotoPort::g_command_observer.ThisLoading();
+    TakeList(e.post, e.post_loading, picked, loading);
     e.gen = 0;
     if (keep) {
         for (size_t i = 0; i < e.writes.size(); ++i) e.writes[i]->fval = vars_were[i];
@@ -1017,8 +1056,62 @@ bool EqNoCase(const wchar_t* a, const wchar_t* b, size_t n)
 
 } // namespace
 
-void ReplayCounts(unsigned* top_replayed, unsigned* top_recorded, unsigned* top_plain,
-    unsigned* sub_replayed, unsigned* sub_recorded, unsigned* sub_plain)
+bool TextureOverrideAssignsThis(TextureOverride* to)
+{
+    std::vector<const void*> seen;
+    return to && (ListAssignsThis(&to->command_list, seen) || ListAssignsThis(&to->post_command_list, seen));
+}
+
+namespace {
+
+void ExprVars(const CommandListEvaluatable* e, std::vector<const float*>& vars)
+{
+    if (const auto* o = dynamic_cast<const CommandListOperand*>(e)) {
+        if (o->type == ParamOverrideType::VARIABLE && o->var_ftarget) vars.push_back(o->var_ftarget);
+        return;
+    }
+    if (const auto* op = dynamic_cast<const CommandListOperator*>(e)) {
+        if (op->lhs) ExprVars(op->lhs.get(), vars);
+        if (op->rhs) ExprVars(op->rhs.get(), vars);
+    }
+}
+
+void ListReadVars(const CommandList* cl, std::vector<const float*>& vars, std::vector<const void*>& seen)
+{
+    if (!cl) return;
+    for (const auto& cmd : cl->commands) {
+        CommandListCommand* c = MigotoPort::g_command_observer.Unwrap(cmd.get());
+        if (auto* ic = dynamic_cast<IfCommand*>(c)) {
+            if (ic->expression.evaluatable) ExprVars(ic->expression.evaluatable.get(), vars);
+            ListReadVars(ic->true_commands_pre.get(), vars, seen);
+            ListReadVars(ic->true_commands_post.get(), vars, seen);
+            ListReadVars(ic->false_commands_pre.get(), vars, seen);
+            ListReadVars(ic->false_commands_post.get(), vars, seen);
+        } else if (auto* rc = dynamic_cast<ResourceCopyOperation*>(c)) {
+            const CommandListExpression* idx = rc->src.pool_dynamic_index_expression.get();
+            if (idx && idx->evaluatable) ExprVars(idx->evaluatable.get(), vars);
+        } else if (auto* re = dynamic_cast<RunExplicitCommandList*>(c)) {
+            ExplicitCommandListSection* s = re->command_list_section;
+            if (!s || std::find(seen.begin(), seen.end(), (const void*)s) != seen.end()) continue;
+            seen.push_back(s);
+            ListReadVars(&s->command_list, vars, seen);
+            ListReadVars(&s->post_command_list, vars, seen);
+        }
+    }
+}
+
+} // namespace
+
+void TextureOverrideReadVars(TextureOverride* to, std::vector<const float*>& vars)
+{
+    if (!to) return;
+    std::vector<const void*> seen;
+    ListReadVars(&to->command_list, vars, seen);
+    ListReadVars(&to->post_command_list, vars, seen);
+}
+
+void ReplayCounts(unsigned* top_replayed, unsigned* top_recorded, unsigned* top_plain, unsigned* sub_replayed,
+    unsigned* sub_recorded, unsigned* sub_plain)
 {
     *top_replayed = g_replay_n[RC_TopReplayed];
     *top_recorded = g_replay_n[RC_TopRecorded];
@@ -1031,6 +1124,7 @@ void ReplayCounts(unsigned* top_replayed, unsigned* top_recorded, unsigned* top_
 ID3D12Resource* SelectTextureOverride(uint32_t texture_hash, bool* cacheable)
 {
     if (cacheable) *cacheable = true;
+    t_sel_loading = {};
     if (!TextureOverrideHashKnown(texture_hash)) return nullptr; // no section: cannot select, no lock
     PROF(PL_TexSel_Engine);
     std::unique_lock<std::recursive_mutex> engine_lk(EngineLock(), std::defer_lock);
@@ -1044,11 +1138,15 @@ ID3D12Resource* SelectTextureOverride(uint32_t texture_hash, bool* cacheable)
     if (matches.empty()) return nullptr;
 
     ID3D11Resource* picked = nullptr;
+    CustomResource* loading = nullptr;
     for (TextureOverride* to : matches) {
         if (!SelectsResource(to) || ModSwitchedOff(to)) continue;
-        if (!RunSelection(to, picked) && cacheable) *cacheable = false;
+        if (!RunSelection(to, picked, loading) && cacheable) *cacheable = false;
     }
-    if (!picked) return nullptr;
+    if (!picked) {
+        if (loading) t_sel_loading = SelLoading{ loading, LoadGeneration() };
+        return nullptr;
+    }
 
     MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(picked);
     return wr ? wr->dx12 : nullptr;
@@ -1057,9 +1155,9 @@ ID3D12Resource* SelectTextureOverride(uint32_t texture_hash, bool* cacheable)
 static bool SectionInNs(const std::wstring& sec, const wchar_t* ns, size_t nlen)
 {
     static const wchar_t kPrefix[] = L"TextureOverride\\";
-    constexpr size_t     plen = _countof(kPrefix) - 1;
-    return sec.size() > plen + nlen && EqNoCase(sec.c_str(), kPrefix, plen) &&
-        EqNoCase(sec.c_str() + plen, ns, nlen) && sec[plen + nlen] == L'\\';
+    constexpr size_t plen = _countof(kPrefix) - 1;
+    return sec.size() > plen + nlen && EqNoCase(sec.c_str(), kPrefix, plen) && EqNoCase(sec.c_str() + plen, ns, nlen) &&
+        sec[plen + nlen] == L'\\';
 }
 
 bool TextureOverrideInNs(uint32_t texture_hash, const wchar_t* ns)
@@ -1078,6 +1176,7 @@ bool TextureOverrideInNs(uint32_t texture_hash, const wchar_t* ns)
 ID3D12Resource* SelectTextureOverrideNs(uint32_t texture_hash, const wchar_t* ns, bool* cacheable)
 {
     if (cacheable) *cacheable = true;
+    t_sel_loading = {};
     if (!ns || !*ns) return SelectTextureOverride(texture_hash, cacheable);
     if (!TextureOverrideHashKnown(texture_hash)) return nullptr;
     PROF(PL_TexSel_Engine);
@@ -1091,19 +1190,29 @@ ID3D12Resource* SelectTextureOverrideNs(uint32_t texture_hash, const wchar_t* ns
     FindTextureOverridesByHash(texture_hash, &matches, nullptr);
     if (matches.empty()) return nullptr;
 
-    bool            own = false;
+    bool own = false;
     ID3D11Resource* picked = nullptr;
-    const size_t    nlen = wcslen(ns);
+    CustomResource* loading = nullptr;
+    const size_t nlen = wcslen(ns);
     for (TextureOverride* to : matches) {
         if (!SectionInNs(to->ini_section, ns, nlen)) continue;
         own = true;
         if (!SelectsResource(to) || ModSwitchedOff(to)) continue;
-        if (!RunSelection(to, picked) && cacheable) *cacheable = false;
+        if (!RunSelection(to, picked, loading) && cacheable) *cacheable = false;
     }
     if (!own) return SelectTextureOverride(texture_hash, cacheable);
-    if (!picked) return nullptr;
+    if (!picked) {
+        if (loading) t_sel_loading = SelLoading{ loading, LoadGeneration() };
+        return nullptr;
+    }
     MigotoPort::WrapResource* wr = MigotoPort::AsWrapResource(picked);
     return wr ? wr->dx12 : nullptr;
+}
+
+const void* SelectionLoading(unsigned* gen)
+{
+    if (gen) *gen = t_sel_loading.gen;
+    return t_sel_loading.res;
 }
 
 uint32_t SwitchOfResource(const wchar_t* res_fq)
@@ -1112,16 +1221,16 @@ uint32_t SwitchOfResource(const wchar_t* res_fq)
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
     if (!g_loaded) return 0;
     static std::unordered_map<const CustomResource*, uint32_t> s_switch;
-    static unsigned                                            s_gen = ~0u;
-    const unsigned                                             gen = LoadGeneration();
+    static unsigned s_gen = ~0u;
+    const unsigned gen = LoadGeneration();
     if (gen != s_gen) {
         s_switch.clear();
         s_gen = gen;
         const auto t0 = std::chrono::steady_clock::now();
-        size_t     sections = 0;
+        size_t sections = 0;
         for (auto& [hash, tos] : G->mTextureOverrideMap)
             for (TextureOverride& to : tos) {
-                const SelEntry&                    e = SelEntryOf(&to);
+                const SelEntry& e = SelEntryOf(&to);
                 std::vector<const CustomResource*> distinct(e.srcs.begin(), e.srcs.end());
                 std::sort(distinct.begin(), distinct.end());
                 distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
@@ -1129,8 +1238,10 @@ uint32_t SwitchOfResource(const wchar_t* res_fq)
                 ++sections;
                 for (const CustomResource* cr : distinct) s_switch.emplace(cr, hash);
             }
-        logger::write("RFX-SWITCHES gen=%u: %zu [TextureOverride] section(s) switch among %zu resource(s), found in %.2f ms",
-            gen, sections, s_switch.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        logger::write(
+            "RFX-SWITCHES gen=%u: %zu [TextureOverride] section(s) switch among %zu resource(s), found in %.2f ms", gen,
+            sections, s_switch.size(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
     auto it = customResources.find(res_fq);
     if (it == customResources.end()) return 0;
@@ -1144,7 +1255,7 @@ void TextureOverrideSection(uint32_t texture_hash, wchar_t* out, size_t out_char
     out[0] = 0;
     if (!g_loaded || !TextureOverrideHashKnown(texture_hash)) return;
     std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
-    TextureOverrideMatches                matches;
+    TextureOverrideMatches matches;
     FindTextureOverridesByHash(texture_hash, &matches, nullptr); // exact hash only
     if (matches.empty()) return;
     wcsncpy_s(out, out_chars, matches.front()->ini_section.c_str(), _TRUNCATE);

@@ -31,15 +31,16 @@ ID3D11Texture2D* BackBufferAsD3D11();
 
 void BackBufferPublished(ID3D12Resource* bb, D3D12_RESOURCE_STATES state);
 
+bool IsBackBuffer(ID3D12Resource* res);
+
 void BackBufferForget();
 
 void BackBufferRestore(ID3D12GraphicsCommandList* cl, D3D12_RESOURCE_STATES to);
 
-template <class I>
-class WrapBase : public I {
+template <class I> class WrapBase : public I {
 public:
     ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&rc_); }
-    LONG                    RefCount() const { return rc_; }
+    LONG RefCount() const { return rc_; }
     ULONG STDMETHODCALLTYPE Release() override
     {
         LONG n = InterlockedDecrement(&rc_);
@@ -88,44 +89,30 @@ protected:
 
 void WrapResourceBorn();
 void WrapResourceDied();
-void RetireDx12Resource(ID3D12Resource* res);
-void SetRetireObserver(void (*fn)(ID3D12Resource* res)); // told of each, on the thread whose release it was
-void SetTextureUseObserver(void (*fn)(ID3D12Resource* res)); // a 2D texture bound for one of our draws or dispatches
-void NoteTextureUse(ID3D11Resource* res);                     // ... or a texture a mod's list assigns to a slot
-void RetireReadback(ID3D12Resource* res);
-void DisownBuffer(ID3D12Resource* res);
 
 struct UploadRecord {
-    uint64_t                   seq = 0;
+    uint64_t seq = 0;
     ID3D12GraphicsCommandList* list = nullptr;
-    uint64_t                   recording = 0;
+    uint64_t recording = 0;
 };
 
 struct WrapResource {
     WrapResource() { WrapResourceBorn(); }
-    ID3D12Resource*                    dx12 = nullptr;
-    D3D11_RESOURCE_DIMENSION           dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-    D3D12_GPU_VIRTUAL_ADDRESS          gpu_va = 0;
-    D3D12_RESOURCE_STATES              state = D3D12_RESOURCE_STATE_COMMON;
-    bool                               foreign = false;
-    D3D12_HEAP_TYPE                    heap_type = (D3D12_HEAP_TYPE)0;
-    std::vector<unsigned char>         shadow;
+    ID3D12Resource* dx12 = nullptr;
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    bool foreign = false;
+    D3D12_HEAP_TYPE heap_type = (D3D12_HEAP_TYPE)0;
+    std::vector<unsigned char> shadow;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT                               row_pitch = 0; // 0 = not a staging texture
-    UINT                               rows = 0;
-    std::vector<unsigned char>         uploaded;
-    uint64_t                           uploaded_seq = 0;
-    uint64_t                           queued_seq = 0;
-    UploadRecord                       flushed;
-    virtual ~WrapResource()
-    {
-        WrapResourceDied();
-        if (dx12 && !foreign) DisownBuffer(dx12);
-        if (dx12 && heap_type == D3D12_HEAP_TYPE_READBACK)
-            RetireReadback(dx12);
-        else if (dx12)
-            RetireDx12Resource(dx12);
-    }
+    UINT row_pitch = 0; // 0 = not a staging texture
+    UINT rows = 0;
+    std::vector<unsigned char> uploaded;
+    uint64_t uploaded_seq = 0;
+    uint64_t queued_seq = 0;
+    UploadRecord flushed;
+    virtual ~WrapResource();
 };
 
 void WrapStats(long* created, long* destroyed, long* live);
@@ -133,9 +120,9 @@ void WrapStats(long* created, long* destroyed, long* live);
 WrapResource* AsWrapResource(void* p);
 struct WrapView;
 WrapView* AsWrapView(void* p);
-void      RegisterWrap(void* iface, WrapResource* r);
-void      RegisterWrapView(void* iface, WrapView* v);
-void      UnregisterWrap(void* iface);
+void RegisterWrap(void* iface, WrapResource* r);
+void RegisterWrapView(void* iface, WrapView* v);
+void UnregisterWrap(void* iface);
 
 class WrapBuffer final : public WrapBase<ID3D11Buffer>, public WrapResource {
 public:
@@ -242,16 +229,15 @@ public:
 };
 
 struct WrapView {
-    ID3D11Resource*             res = nullptr;  // the wrapper it views; we hold a ref
-    WrapResource*               wres = nullptr; // same object, our side of it
-    char                        kind = 0;       // t=SRV u=UAV r=RTV d=DSV
-    UINT                        heap_slot = 0;  // index into our CPU-visible staging heap
+    ID3D11Resource* res = nullptr; // the wrapper it views; we hold a ref
+    WrapResource* wres = nullptr; // same object, our side of it
+    char kind = 0; // t=SRV u=UAV r=RTV d=DSV
+    UINT heap_slot = 0; // index into our CPU-visible staging heap
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
     virtual ~WrapView();
 };
 
-template <class I, class D, char KIND>
-class WrapViewT final : public WrapBase<I>, public WrapView {
+template <class I, class D, char KIND> class WrapViewT final : public WrapBase<I>, public WrapView {
 public:
     D desc{};
     WrapViewT()
@@ -284,27 +270,26 @@ using WrapRTV = WrapViewT<ID3D11RenderTargetView, D3D11_RENDER_TARGET_VIEW_DESC,
 using WrapDSV = WrapViewT<ID3D11DepthStencilView, D3D11_DEPTH_STENCIL_VIEW_DESC, 'd'>;
 
 struct ShaderReg {
-    char          kind; // b t u s
-    UINT          reg;
-    UINT          space;
+    char kind; // b t u s
+    UINT reg;
+    UINT space;
     unsigned char sit = 0; // D3D_SHADER_INPUT_TYPE  (0 = not recorded)
     unsigned char dim = 0; // D3D_SRV_DIMENSION      (0 = UNKNOWN)
 };
 
 struct ShaderCode {
-    char                   stage = 0; // v h d g p c
-    std::vector<uint8_t>   code;
+    char stage = 0; // v h d g p c
+    std::vector<uint8_t> code;
     std::vector<ShaderReg> regs;
-    uint32_t               cb_size[16] = {};
-    bool                   reflected = false;
-    uint64_t               content_hash = 0; // of `code`, taken at the first PSO lookup; the PSO cache key
+    uint32_t cb_size[16] = {};
+    bool reflected = false;
+    uint64_t content_hash = 0; // of `code`, taken at the first PSO lookup; the PSO cache key
     virtual ~ShaderCode() = default;
 };
 ShaderCode* AsShaderCode(void* p);
-void        RegisterShader(void* iface, ShaderCode* s);
+void RegisterShader(void* iface, ShaderCode* s);
 
-template <class I, char STAGE>
-class WrapShader final : public WrapBase<I>, public ShaderCode {
+template <class I, char STAGE> class WrapShader final : public WrapBase<I>, public ShaderCode {
 public:
     WrapShader()
     {
@@ -327,16 +312,16 @@ using WrapPS = WrapShader<ID3D11PixelShader, 'p'>;
 using WrapCS = WrapShader<ID3D11ComputeShader, 'c'>;
 
 struct StateDesc {
-    char                     kind = 0; // B=blend R=raster D=depth S=sampler
-    D3D11_BLEND_DESC         blend{};
-    D3D11_RASTERIZER_DESC    raster{};
+    char kind = 0; // B=blend R=raster D=depth S=sampler
+    D3D11_BLEND_DESC blend{};
+    D3D11_RASTERIZER_DESC raster{};
     D3D11_DEPTH_STENCIL_DESC depth{};
-    D3D11_SAMPLER_DESC       sampler{};
-    uint64_t                 content_hash = 0; // of the desc `kind` names, taken at the first PSO lookup
+    D3D11_SAMPLER_DESC sampler{};
+    uint64_t content_hash = 0; // of the desc `kind` names, taken at the first PSO lookup
     virtual ~StateDesc() = default;
 };
 StateDesc* AsStateDesc(void* p);
-void       RegisterState(void* iface, StateDesc* s);
+void RegisterState(void* iface, StateDesc* s);
 
 template <class I, class D, char KIND, D StateDesc::* FIELD>
 class WrapState final : public WrapBase<I>, public StateDesc {
@@ -365,12 +350,12 @@ using WrapSampler = WrapState<ID3D11SamplerState, D3D11_SAMPLER_DESC, 'S', &Stat
 
 struct InputLayoutDesc {
     std::vector<D3D12_INPUT_ELEMENT_DESC> elems;
-    std::vector<std::string>              names;            // owns the strings elems point at
-    uint64_t                              content_hash = 0; // of elems and names, taken at the first PSO lookup
+    std::vector<std::string> names; // owns the strings elems point at
+    uint64_t content_hash = 0; // of elems and names, taken at the first PSO lookup
     virtual ~InputLayoutDesc() = default;
 };
 InputLayoutDesc* AsInputLayout(void* p);
-void             RegisterInputLayout(void* iface, InputLayoutDesc* l);
+void RegisterInputLayout(void* iface, InputLayoutDesc* l);
 
 class WrapInputLayout final : public WrapBase<ID3D11InputLayout>, public InputLayoutDesc {
 public:

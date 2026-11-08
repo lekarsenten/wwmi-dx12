@@ -16,11 +16,11 @@
    that produces no action. Add one when its parser lands, not before. */
 enum class TargetClass : uint8_t {
     Invalid = 0,
-    ShaderResource = 1,      // t#      -- ResourceCopyTargetType::SHADER_RESOURCE
+    ShaderResource = 1, // t#      -- ResourceCopyTargetType::SHADER_RESOURCE
     UnorderedAccessView = 2, // u#      -- ResourceCopyTargetType::UNORDERED_ACCESS_VIEW
-    ConstantBuffer = 3,      // b# / cb#-- ResourceCopyTargetType::CONSTANT_BUFFER
-    VertexBuffer = 4,        // vb#     -- ResourceCopyTargetType::VERTEX_BUFFER
-    IndexBuffer = 5,         // ib      -- ResourceCopyTargetType::INDEX_BUFFER
+    ConstantBuffer = 3, // b# / cb#-- ResourceCopyTargetType::CONSTANT_BUFFER
+    VertexBuffer = 4, // vb#     -- ResourceCopyTargetType::VERTEX_BUFFER
+    IndexBuffer = 5, // ib      -- ResourceCopyTargetType::INDEX_BUFFER
 };
 
 /* HOW WIDE THE ROOT-SIGNATURE REGISTER FILE IS FOR THIS CLASS, and 0 for a class that is not a
@@ -41,10 +41,10 @@ enum class TargetClass : uint8_t {
 constexpr unsigned RegisterFileWidth(TargetClass c)
 {
     switch (c) {
-    case TargetClass::ShaderResource: return 128;     // LayoutRegMap::t_cs
+    case TargetClass::ShaderResource: return 128; // LayoutRegMap::t_cs
     case TargetClass::UnorderedAccessView: return 16; // LayoutRegMap::u_cs
-    case TargetClass::ConstantBuffer: return 16;      // LayoutRegMap::b_cs, CsCbvRoots::reg
-    default: return 0;                                // vb / ib / Invalid: not a register
+    case TargetClass::ConstantBuffer: return 16; // LayoutRegMap::b_cs, CsCbvRoots::reg
+    default: return 0; // vb / ib / Invalid: not a register
     }
 }
 
@@ -60,8 +60,7 @@ constexpr unsigned RegisterFileWidth(TargetClass c)
 constexpr unsigned RegisterFileBase(TargetClass c)
 {
     unsigned base = 0;
-    for (unsigned i = 0; i < static_cast<unsigned>(c); ++i)
-        base += RegisterFileWidth(static_cast<TargetClass>(i));
+    for (unsigned i = 0; i < static_cast<unsigned>(c); ++i) base += RegisterFileWidth(static_cast<TargetClass>(i));
     return base;
 }
 

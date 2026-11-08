@@ -15,10 +15,10 @@ void InitReporting(); // always safe; sets up the report file + module range
 void Install();
 void Uninstall();
 
-void           SetContext(const wchar_t* what);
-void           ClearContext();
+void SetContext(const wchar_t* what);
+void ClearContext();
 const wchar_t* Context();
-void           FormatCallers(char* buf, size_t cap, unsigned skip);
+void FormatCallers(char* buf, size_t cap, unsigned skip);
 
 struct ScopedContext {
     explicit ScopedContext(const wchar_t* what) { SetContext(what); }

@@ -1,7 +1,7 @@
 #include "../addon_common.h"
 #include "hot_path.h"
 #include "gpu_timer.h"
-#include "../../src/d3d12_buffer.h"
+#include "../core/d3d12_buffer.h"
 #include <TraceLoggingProvider.h>
 #include <d3d12.h>
 #include <wrl.h>
@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include "../addon/addon.h"
 
 TRACELOGGING_DECLARE_PROVIDER(g_hp_etw);
 
@@ -30,47 +31,47 @@ constexpr UINT kListChunk = 64;
 
 struct Slab {
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
-    Microsoft::WRL::ComPtr<ID3D12Resource>  rb;
-    int                                     ty = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> rb;
+    int ty = 0;
 };
 
 struct Meta {
     uint32_t kind;
     uint32_t aux;
     uint32_t works;
-    int64_t  cpu;
+    int64_t cpu;
 };
 
 struct Chunk {
-    Slab*               slab = nullptr;
-    UINT                base = 0;
-    UINT                cap = 0;
-    std::vector<Meta>   meta;
-    uint64_t            list = 0;
-    uint32_t            tid = 0;
-    GpuRec*             owner = nullptr;
+    Slab* slab = nullptr;
+    UINT base = 0;
+    UINT cap = 0;
+    std::vector<Meta> meta;
+    uint64_t list = 0;
+    uint32_t tid = 0;
+    GpuRec* owner = nullptr;
     ID3D12CommandQueue* queue = nullptr;
-    bool                resolved = false;
-    bool                abandoned = false;
-    bool                read = false;
+    bool resolved = false;
+    bool abandoned = false;
+    bool read = false;
 };
 
 struct Region {
-    uint64_t                            fence = 0;
+    uint64_t fence = 0;
     std::vector<std::unique_ptr<Chunk>> chunks;
-    std::vector<Slab*>                  slabs;
-    Slab*                               cur[2] = {};
-    UINT                                used[2] = {};
+    std::vector<Slab*> slabs;
+    Slab* cur[2] = {};
+    UINT used[2] = {};
 };
 
-std::mutex                          g_gmtx;
-std::vector<std::unique_ptr<Slab>>  g_all_slabs;
-std::vector<Slab*>                  g_free[2];
-std::unique_ptr<Region>             g_open;
+std::mutex g_gmtx;
+std::vector<std::unique_ptr<Slab>> g_all_slabs;
+std::vector<Slab*> g_free[2];
+std::unique_ptr<Region> g_open;
 std::deque<std::unique_ptr<Region>> g_closed;
 Microsoft::WRL::ComPtr<ID3D12Fence> g_fence;
-ID3D12CommandQueue*                 g_present_queue = nullptr;
-int                                 g_copy_ok = -1;
+ID3D12CommandQueue* g_present_queue = nullptr;
+int g_copy_ok = -1;
 
 int TypeOf(D3D12_COMMAND_LIST_TYPE t)
 {
@@ -93,7 +94,7 @@ Slab* TakeSlabLocked(int ty)
         g_free[ty].pop_back();
         return s;
     }
-    ID3D12Device* dev = g_d3d12_device;
+    ID3D12Device* dev = g_addon.d3d12_device;
     if (!dev) return nullptr;
     auto s = std::make_unique<Slab>();
     s->ty = ty;
@@ -101,10 +102,10 @@ Slab* TakeSlabLocked(int ty)
     qd.Type = ty ? D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP : D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qd.Count = kSlabStamps;
     if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&s->heap)))) return nullptr;
-    if (FAILED(CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, kSlabStamps * sizeof(uint64_t),
-            D3D12_RESOURCE_STATE_COPY_DEST, &s->rb)))
+    if (FAILED(CreateD3D12Buffer(
+            dev, D3D12_HEAP_TYPE_READBACK, kSlabStamps * sizeof(uint64_t), D3D12_RESOURCE_STATE_COPY_DEST, &s->rb)))
         return nullptr;
-    void*       p = nullptr;
+    void* p = nullptr;
     D3D12_RANGE none{ 0, 0 };
     if (SUCCEEDED(s->rb->Map(0, &none, &p)) && p) {
         std::memset(p, 0, kSlabStamps * sizeof(uint64_t));
@@ -121,8 +122,8 @@ bool TypeUsableLocked(int ty)
     if (ty == 0) return true;
     if (g_copy_ok < 0) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
-        g_copy_ok = g_d3d12_device &&
-                SUCCEEDED(g_d3d12_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) &&
+        g_copy_ok = g_addon.d3d12_device &&
+                SUCCEEDED(g_addon.d3d12_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))) &&
                 o3.CopyQueueTimestampQueriesSupported
             ? 1
             : 0;
@@ -156,14 +157,14 @@ Chunk* NewChunk(int ty, UINT cap)
 } // namespace
 
 struct GpuRec {
-    uint64_t                         key = 0;
-    ID3D12GraphicsCommandList*       native = nullptr;
-    int                              ty = -1;
-    bool                             live = false;
-    bool                             begin_pending = false;
-    uint32_t                         works = 0;
-    Chunk*                           cur = nullptr;
-    std::vector<Chunk*>              chunks;
+    uint64_t key = 0;
+    ID3D12GraphicsCommandList* native = nullptr;
+    int ty = -1;
+    bool live = false;
+    bool begin_pending = false;
+    uint32_t works = 0;
+    Chunk* cur = nullptr;
+    std::vector<Chunk*> chunks;
     std::atomic<ID3D12CommandQueue*> queue{ nullptr };
 };
 
@@ -221,16 +222,16 @@ bool Open(GpuRec* g, uint64_t key, ID3D12GraphicsCommandList* native)
 
 bool IsWork(int hook)
 {
-    return hook == HK_draw_indexed || hook == HK_dispatch || hook == HK_copy_buffer_region || hook == HK_copy_resource ||
-        hook == HK_copy_texture_region || hook == HK_copy_buffer_to_texture || hook == HK_update_texture_region ||
-        hook == HK_dispatch_rays || hook == HK_build_acceleration_structure;
+    return hook == HK_draw_indexed || hook == HK_dispatch || hook == HK_copy_buffer_region ||
+        hook == HK_copy_resource || hook == HK_copy_texture_region || hook == HK_copy_buffer_to_texture ||
+        hook == HK_update_texture_region || hook == HK_dispatch_rays || hook == HK_build_acceleration_structure;
 }
 
 struct Calib {
     ID3D12CommandQueue* q;
-    uint64_t            gpu;
-    uint64_t            cpu;
-    double              qpc_per_tick;
+    uint64_t gpu;
+    uint64_t cpu;
+    double qpc_per_tick;
 };
 
 } // namespace
@@ -305,9 +306,10 @@ void GpuExecuted(Rec* rec, reshade::api::command_queue* queue)
 void* GpuBracketBegin(ID3D12GraphicsCommandList* cl, int bucket)
 {
     if (!g_gpu_on.load(std::memory_order_relaxed) || !cl) return nullptr;
-    if (bucket != GT_Present && bucket != GT_ClaimedDraw && !g_gpu_detail.load(std::memory_order_relaxed)) return nullptr;
+    if (bucket != GT_Present && bucket != GT_ClaimedDraw && !g_gpu_detail.load(std::memory_order_relaxed))
+        return nullptr;
     const int ty = TypeOf(cl->GetType());
-    Chunk*    c = NewChunk(ty, 2);
+    Chunk* c = NewChunk(ty, 2);
     if (!c) return nullptr;
     GpuRec* g = t_rec ? GpuOf(t_rec) : nullptr;
     if (g && g->native == cl) {
@@ -373,17 +375,17 @@ void GpuTick()
 {
     std::lock_guard l(g_gmtx);
     if (!g_fence || g_closed.empty()) return;
-    const uint64_t      done = g_fence->GetCompletedValue();
+    const uint64_t done = g_fence->GetCompletedValue();
     static const double qpf = [] {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         return (double)f.QuadPart;
     }();
     std::vector<Calib> calib;
-    auto               convert = [&](ID3D12CommandQueue* q, uint64_t t) -> int64_t {
+    auto convert = [&](ID3D12CommandQueue* q, uint64_t t) -> int64_t {
         for (const Calib& c : calib)
             if (c.q == q) return (int64_t)c.cpu + (int64_t)((double)((int64_t)(t - c.gpu)) * c.qpc_per_tick);
-        Calib  c{ q, 0, 0, 0.0 };
+        Calib c{ q, 0, 0, 0.0 };
         UINT64 hz = 0;
         if (FAILED(q->GetTimestampFrequency(&hz)) || !hz || FAILED(q->GetClockCalibration(&c.gpu, &c.cpu))) return 0;
         c.qpc_per_tick = qpf / (double)hz;
@@ -406,8 +408,8 @@ void GpuTick()
             if (!q && c.owner) q = c.owner->queue.load(std::memory_order_relaxed);
             if (!q) q = g_present_queue;
             const size_t n = c.meta.size();
-            D3D12_RANGE  rr{ (SIZE_T)c.base * sizeof(uint64_t), (SIZE_T)(c.base + n) * sizeof(uint64_t) };
-            void*        p = nullptr;
+            D3D12_RANGE rr{ (SIZE_T)c.base * sizeof(uint64_t), (SIZE_T)(c.base + n) * sizeof(uint64_t) };
+            void* p = nullptr;
             if (!n || !q || FAILED(c.slab->rb->Map(0, &rr, &p)) || !p) {
                 c.read = true;
                 continue;
@@ -423,16 +425,11 @@ void GpuTick()
             for (size_t i = 0; i < n; ++i) {
                 if (!v[i]) continue;
                 const Meta& m = c.meta[i];
-                TraceLoggingWrite(g_hp_etw, "GpuStamp",
-                    TraceLoggingUInt64(c.list, "list"),
-                    TraceLoggingPointer(q, "queue"),
-                    TraceLoggingUInt32(c.tid, "tid"),
-                    TraceLoggingUInt32(m.kind, "kind"),
-                    TraceLoggingUInt32(m.aux, "aux"),
-                    TraceLoggingUInt32(m.works, "works"),
-                    TraceLoggingInt64(m.cpu, "cpu_qpc"),
-                    TraceLoggingInt64(convert(q, v[i]), "gpu_qpc"),
-                    TraceLoggingInt64(now, "now_qpc"),
+                TraceLoggingWrite(g_hp_etw, "GpuStamp", TraceLoggingUInt64(c.list, "list"),
+                    TraceLoggingPointer(q, "queue"), TraceLoggingUInt32(c.tid, "tid"),
+                    TraceLoggingUInt32(m.kind, "kind"), TraceLoggingUInt32(m.aux, "aux"),
+                    TraceLoggingUInt32(m.works, "works"), TraceLoggingInt64(m.cpu, "cpu_qpc"),
+                    TraceLoggingInt64(convert(q, v[i]), "gpu_qpc"), TraceLoggingInt64(now, "now_qpc"),
                     TraceLoggingInt64((int64_t)qpf, "qpf"));
             }
             std::memset(v, 0, n * sizeof(uint64_t));
@@ -441,7 +438,7 @@ void GpuTick()
         }
         if (open || (pending && done < r.fence + 8)) break;
         for (Slab* s : r.slabs) {
-            void*       p = nullptr;
+            void* p = nullptr;
             D3D12_RANGE none{ 0, 0 };
             if (SUCCEEDED(s->rb->Map(0, &none, &p)) && p) {
                 std::memset(p, 0, kSlabStamps * sizeof(uint64_t));

@@ -15,10 +15,10 @@
 #include "dx12_pipeline.h"
 #include "port_toggles.h" // g_buffers_in_vram
 #include "prof_core.h" // ProfGpuWork -- views created, for the performance report's work rows
-#include "../../src/log.h"
-#include "../../src/d3d12_buffer.h"
-#include "../../src/dxgi_bc.h"
-#include "../../src/buffer_view_fit.h"
+#include "../core/log.h"
+#include "../core/d3d12_buffer.h"
+#include "../core/dxgi_bc.h"
+#include "../core/buffer_view_fit.h"
 
 namespace MigotoPort {
 
@@ -31,29 +31,27 @@ namespace {
 static bool NoTextures()
 {
     static const bool v = [] {
-        char   buf[8] = {};
+        char buf[8] = {};
         size_t n = 0;
         return getenv_s(&n, buf, sizeof(buf), "PORT_NO_TEX") == 0 && n && buf[0] == '1';
     }();
     return v;
 }
 
-ID3D12Resource* CreateBufferDx12(UINT64 bytes, bool allow_uav, D3D12_RESOURCE_STATES& state,
-    bool upload)
+ID3D12Resource* CreateBufferDx12(UINT64 bytes, bool allow_uav, D3D12_RESOURCE_STATES& state, bool upload)
 {
     const Dx12Bridge& b = GetDx12Bridge();
     if (!b.device || !bytes) return nullptr;
 
-    const D3D12_HEAP_TYPE      heap = upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
-    const UINT64               width = (bytes + 255) & ~(UINT64)255; // 256-align, DX12's buffer placement rule
-    const D3D12_RESOURCE_FLAGS flags = (allow_uav && !upload) ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                                                              : D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_HEAP_TYPE heap = upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
+    const UINT64 width = (bytes + 255) & ~(UINT64)255; // 256-align, DX12's buffer placement rule
+    const D3D12_RESOURCE_FLAGS flags =
+        (allow_uav && !upload) ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
 
     state = upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COMMON;
 
     ID3D12Resource* res = nullptr;
-    if (FAILED(CreateD3D12Buffer(b.device, heap, width, state, &res, flags)))
-        return nullptr;
+    if (FAILED(CreateD3D12Buffer(b.device, heap, width, state, &res, flags))) return nullptr;
     DevName(res, L"wwmi mod buffer");
     if (!upload) OwnBuffer(res);
     return res;
@@ -61,15 +59,13 @@ ID3D12Resource* CreateBufferDx12(UINT64 bytes, bool allow_uav, D3D12_RESOURCE_ST
 
 static inline void PortNormalizeBufferDesc(D3D11_BUFFER_DESC& d)
 {
-    if (!(d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED))
-        d.StructureByteStride = 0;
+    if (!(d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) d.StructureByteStride = 0;
 }
 
 } // namespace
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDesc,
-    const D3D11_SUBRESOURCE_DATA*                                           pInitialData,
-    _COM_Outptr_opt_ ID3D11Buffer**                                         ppBuffer)
+    const D3D11_SUBRESOURCE_DATA* pInitialData, _COM_Outptr_opt_ ID3D11Buffer** ppBuffer)
 {
     if (ppBuffer) *ppBuffer = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -90,10 +86,10 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDes
         WrapBuffer* sw = new WrapBuffer();
         sw->dx12 = sres;
         sw->desc = *pDesc;
-        PortNormalizeBufferDesc(sw->desc);          // match D3D11 GetDesc (see PortNormalizeBufferDesc note)
+        PortNormalizeBufferDesc(sw->desc); // match D3D11 GetDesc (see PortNormalizeBufferDesc note)
         sw->state = D3D12_RESOURCE_STATE_COPY_DEST; // READBACK is pinned here for its lifetime
-        sw->heap_type = D3D12_HEAP_TYPE_READBACK;   // set now, so CopyResource/Map can just read
-                                                    // it instead of probing GetHeapProperties
+        sw->heap_type = D3D12_HEAP_TYPE_READBACK; // set now, so CopyResource/Map can just read
+        // it instead of probing GetHeapProperties
         if (ppBuffer)
             *ppBuffer = sw;
         else
@@ -102,14 +98,14 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDes
     }
 
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-    const bool            host = !g_buffers_in_vram && pInitialData != nullptr && !uav;
-    ID3D12Resource*       res = CreateBufferDx12(pDesc->ByteWidth, true, state, host);
+    const bool host = !g_buffers_in_vram && pInitialData != nullptr && !uav;
+    ID3D12Resource* res = CreateBufferDx12(pDesc->ByteWidth, true, state, host);
     if (!res) {
         NotImplOnce("Device::CreateBuffer (no DX12 device bound, or creation failed)");
         return E_FAIL;
     }
     if (host && pInitialData->pSysMem) {
-        void*       dst = nullptr;
+        void* dst = nullptr;
         D3D12_RANGE none{ 0, 0 };
         if (SUCCEEDED(res->Map(0, &none, &dst)) && dst) {
             memcpy(dst, pInitialData->pSysMem, pDesc->ByteWidth);
@@ -124,8 +120,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDes
     w->state = state;
     w->desc = *pDesc;
     PortNormalizeBufferDesc(w->desc); // match D3D11 GetDesc (see PortNormalizeBufferDesc note)
-    if (!host && pInitialData && pInitialData->pSysMem)
-        QueueUpload(w, pInitialData->pSysMem, pDesc->ByteWidth);
+    if (!host && pInitialData && pInitialData->pSysMem) QueueUpload(w, pInitialData->pSysMem, pDesc->ByteWidth);
     if (ppBuffer)
         *ppBuffer = w;
     else
@@ -134,8 +129,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBuffer(const D3D11_BUFFER_DESC* pDes
 }
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC* pDesc,
-    const D3D11_SUBRESOURCE_DATA*                                                 pInitialData,
-    _COM_Outptr_opt_ ID3D11Texture1D**                                            pp)
+    const D3D11_SUBRESOURCE_DATA* pInitialData, _COM_Outptr_opt_ ID3D11Texture1D** pp)
 {
     if (pp) *pp = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -160,9 +154,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC
     if (pDesc->BindFlags & D3D11_BIND_RENDER_TARGET) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     ID3D12Resource* res = nullptr;
-    if (FAILED(b.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
-            D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&res)))) {
+    if (FAILED(b.device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res)))) {
         NotImplOnce("Device::CreateTexture1D (CreateCommittedResource failed)");
         return E_FAIL;
     }
@@ -172,9 +165,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC
     w->dx12 = res;
     w->desc = *pDesc;
     if (pInitialData)
-        QueueTextureUpload(w, pInitialData,
-            (pDesc->MipLevels ? pDesc->MipLevels : 1) *
-                (pDesc->ArraySize ? pDesc->ArraySize : 1));
+        QueueTextureUpload(
+            w, pInitialData, (pDesc->MipLevels ? pDesc->MipLevels : 1) * (pDesc->ArraySize ? pDesc->ArraySize : 1));
     if (pp)
         *pp = w;
     else
@@ -183,8 +175,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture1D(const D3D11_TEXTURE1D_DESC
 }
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC* pDesc,
-    const D3D11_SUBRESOURCE_DATA*                                                 pInitialData,
-    _COM_Outptr_opt_ ID3D11Texture2D**                                            ppTexture2D)
+    const D3D11_SUBRESOURCE_DATA* pInitialData, _COM_Outptr_opt_ ID3D11Texture2D** ppTexture2D)
 {
     if (ppTexture2D) *ppTexture2D = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -226,9 +217,9 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-        UINT                               rows = 0;
-        UINT64                             row_bytes = 0;
-        UINT64                             total = 0;
+        UINT rows = 0;
+        UINT64 row_bytes = 0;
+        UINT64 total = 0;
         b.device->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
         if (!total) {
             NotImplOnce("Device::CreateTexture2D STAGING (zero footprint)");
@@ -265,14 +256,13 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
     d.DepthOrArraySize = (UINT16)(pDesc->ArraySize ? pDesc->ArraySize : 1);
     d.MipLevels = (UINT16)pDesc->MipLevels;
     d.Format = pDesc->Format;
-    d.SampleDesc = { pDesc->SampleDesc.Count ? pDesc->SampleDesc.Count : 1,
-        pDesc->SampleDesc.Quality };
+    d.SampleDesc = { pDesc->SampleDesc.Count ? pDesc->SampleDesc.Count : 1, pDesc->SampleDesc.Quality };
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     if (pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (pDesc->BindFlags & D3D11_BIND_RENDER_TARGET) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 
-    const bool    timed = TexTiming::Armed() && pInitialData;
+    const bool timed = TexTiming::Armed() && pInitialData;
     LARGE_INTEGER tq{};
     LARGE_INTEGER t0{};
     LARGE_INTEGER t1{};
@@ -282,9 +272,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
         QueryPerformanceCounter(&t0);
     }
     ID3D12Resource* res = nullptr;
-    if (FAILED(b.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
-            D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&res)))) {
+    if (FAILED(b.device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res)))) {
         NotImplOnce("Device::CreateTexture2D (CreateCommittedResource failed)");
         return E_FAIL;
     }
@@ -296,9 +285,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
         if (n < 64) {
             ++n;
             logger::write("PORT-TEX %ux%u mips=%u array=%u fmt=%d bind=%x -> dx12 res=%p mips=%u array=%u",
-                pDesc->Width, pDesc->Height, pDesc->MipLevels, pDesc->ArraySize,
-                (int)pDesc->Format, pDesc->BindFlags, (void*)res,
-                (unsigned)res->GetDesc().MipLevels, (unsigned)res->GetDesc().DepthOrArraySize);
+                pDesc->Width, pDesc->Height, pDesc->MipLevels, pDesc->ArraySize, (int)pDesc->Format, pDesc->BindFlags,
+                (void*)res, (unsigned)res->GetDesc().MipLevels, (unsigned)res->GetDesc().DepthOrArraySize);
         }
     }
 
@@ -306,9 +294,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
     w->dx12 = res;
     w->desc = *pDesc;
     if (pInitialData)
-        QueueTextureUpload(w, pInitialData,
-            (pDesc->MipLevels ? pDesc->MipLevels : 1) *
-                (pDesc->ArraySize ? pDesc->ArraySize : 1));
+        QueueTextureUpload(
+            w, pInitialData, (pDesc->MipLevels ? pDesc->MipLevels : 1) * (pDesc->ArraySize ? pDesc->ArraySize : 1));
     if (timed) {
         QueryPerformanceCounter(&t2);
         const double ms = 1000.0 / (double)tq.QuadPart;
@@ -323,8 +310,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC
 }
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture3D(const D3D11_TEXTURE3D_DESC* pDesc,
-    const D3D11_SUBRESOURCE_DATA*                                                 pInitialData,
-    _COM_Outptr_opt_ ID3D11Texture3D**                                            pp)
+    const D3D11_SUBRESOURCE_DATA* pInitialData, _COM_Outptr_opt_ ID3D11Texture3D** pp)
 {
     if (pp) *pp = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -349,9 +335,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture3D(const D3D11_TEXTURE3D_DESC
     if (pDesc->BindFlags & D3D11_BIND_RENDER_TARGET) d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     ID3D12Resource* res = nullptr;
-    if (FAILED(b.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
-            D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&res)))) {
+    if (FAILED(b.device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res)))) {
         NotImplOnce("Device::CreateTexture3D (CreateCommittedResource failed)");
         return E_FAIL;
     }
@@ -360,8 +345,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateTexture3D(const D3D11_TEXTURE3D_DESC
     WrapTexture3D* w = new WrapTexture3D();
     w->dx12 = res;
     w->desc = *pDesc;
-    if (pInitialData)
-        QueueTextureUpload(w, pInitialData, pDesc->MipLevels ? pDesc->MipLevels : 1);
+    if (pInitialData) QueueTextureUpload(w, pInitialData, pDesc->MipLevels ? pDesc->MipLevels : 1);
     if (pp)
         *pp = w;
     else
@@ -377,15 +361,14 @@ namespace {
 static bool NoViews()
 {
     static const bool v = [] {
-        char   buf[8] = {};
+        char buf[8] = {};
         size_t n = 0;
         return getenv_s(&n, buf, sizeof(buf), "PORT_NO_VIEWS") == 0 && n && buf[0] == '1';
     }();
     return v;
 }
 
-template <class W>
-W* NewView(ID3D11Resource* res, char kind)
+template <class W> W* NewView(ID3D11Resource* res, char kind)
 {
     if (NoViews()) return nullptr;
     WrapResource* wr = AsWrapResource(res);
@@ -393,7 +376,7 @@ W* NewView(ID3D11Resource* res, char kind)
         NotImplOnce("Device::Create*View on a resource that is not one of our wrappers");
         return nullptr;
     }
-    UINT                        slot = 0;
+    UINT slot = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = AllocStagingDescriptor(kind, &slot);
     if (!cpu.ptr) return nullptr;
     ProfGpuWork(PGW_ViewCreate, 0); // every SRV/UAV/RTV/DSV the shim makes comes through here
@@ -508,8 +491,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateUnorderedAccessView(ID3D11Resource* 
                 d.Buffer.StructureByteStride =
                     (pDesc->Format == DXGI_FORMAT_UNKNOWN) ? wb->desc.StructureByteStride : 0;
             }
-            if (pDesc->Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW)
-                d.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            if (pDesc->Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) d.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
             if (pDesc->Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))
                 NotImplOnce("Device::CreateUnorderedAccessView with APPEND/COUNTER "
                             "(DX12 needs a separate counter resource)");
@@ -573,9 +555,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateRenderTargetView(ID3D11Resource* pRe
         D3D12_RENDER_TARGET_VIEW_DESC d{};
         d.Format = pDesc->Format;
         d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        d.Texture2D.MipSlice = (pDesc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D)
-            ? pDesc->Texture2D.MipSlice
-            : 0;
+        d.Texture2D.MipSlice = (pDesc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D) ? pDesc->Texture2D.MipSlice : 0;
         b.device->CreateRenderTargetView(v->wres->dx12, &d, v->cpu);
     } else {
         b.device->CreateRenderTargetView(v->wres->dx12, nullptr, v->cpu);
@@ -600,9 +580,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateDepthStencilView(ID3D11Resource* pRe
         D3D12_DEPTH_STENCIL_VIEW_DESC d{};
         d.Format = pDesc->Format;
         d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        d.Texture2D.MipSlice = (pDesc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D)
-            ? pDesc->Texture2D.MipSlice
-            : 0;
+        d.Texture2D.MipSlice = (pDesc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D) ? pDesc->Texture2D.MipSlice : 0;
         if (pDesc->Flags & D3D11_DSV_READ_ONLY_DEPTH) d.Flags |= D3D12_DSV_FLAG_READ_ONLY_DEPTH;
         if (pDesc->Flags & D3D11_DSV_READ_ONLY_STENCIL) d.Flags |= D3D12_DSV_FLAG_READ_ONLY_STENCIL;
         b.device->CreateDepthStencilView(v->wres->dx12, &d, v->cpu);
@@ -624,8 +602,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateDepthStencilView(ID3D11Resource* pRe
 // the same bytes go into the PSO, and D3DReflect on the same bytes derives the root signature.
 namespace {
 
-template <class W, class I>
-HRESULT MakeShader(const void* code, SIZE_T len, _COM_Outptr_opt_ I** out, const char* what)
+template <class W, class I> HRESULT MakeShader(const void* code, SIZE_T len, _COM_Outptr_opt_ I** out, const char* what)
 {
     if (out) *out = nullptr;
     if (!code || !len) return E_INVALIDARG;
@@ -641,44 +618,44 @@ HRESULT MakeShader(const void* code, SIZE_T len, _COM_Outptr_opt_ I** out, const
 
 } // namespace
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateVertexShader(const void* code, SIZE_T len,
-    ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11VertexShader**                    out)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateVertexShader(
+    const void* code, SIZE_T len, ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11VertexShader** out)
 {
     return MakeShader<WrapVS>(code, len, out, "vertex shader");
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateHullShader(const void* code, SIZE_T len,
-    ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11HullShader**                    out)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateHullShader(
+    const void* code, SIZE_T len, ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11HullShader** out)
 {
     return MakeShader<WrapHS>(code, len, out, "hull shader");
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateDomainShader(const void* code, SIZE_T len,
-    ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11DomainShader**                    out)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateDomainShader(
+    const void* code, SIZE_T len, ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11DomainShader** out)
 {
     return MakeShader<WrapDS>(code, len, out, "domain shader");
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateGeometryShader(const void* code, SIZE_T len,
-    ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11GeometryShader**                    out)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateGeometryShader(
+    const void* code, SIZE_T len, ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11GeometryShader** out)
 {
     return MakeShader<WrapGS>(code, len, out, "geometry shader");
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreatePixelShader(const void* code, SIZE_T len,
-    ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11PixelShader**                    out)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreatePixelShader(
+    const void* code, SIZE_T len, ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11PixelShader** out)
 {
     return MakeShader<WrapPS>(code, len, out, "pixel shader");
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateComputeShader(const void* code, SIZE_T len,
-    ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11ComputeShader**                    out)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateComputeShader(
+    const void* code, SIZE_T len, ID3D11ClassLinkage*, _COM_Outptr_opt_ ID3D11ComputeShader** out)
 {
     return MakeShader<WrapCS>(code, len, out, "compute shader");
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateBlendState(const D3D11_BLEND_DESC* pDesc,
-    _COM_Outptr_opt_ ID3D11BlendState**                                        pp)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateBlendState(
+    const D3D11_BLEND_DESC* pDesc, _COM_Outptr_opt_ ID3D11BlendState** pp)
 {
     if (pp) *pp = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -691,8 +668,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateBlendState(const D3D11_BLEND_DESC* p
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateRasterizerState(const D3D11_RASTERIZER_DESC* pDesc,
-    _COM_Outptr_opt_ ID3D11RasterizerState**                                             pp)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateRasterizerState(
+    const D3D11_RASTERIZER_DESC* pDesc, _COM_Outptr_opt_ ID3D11RasterizerState** pp)
 {
     if (pp) *pp = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -705,8 +682,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateRasterizerState(const D3D11_RASTERIZ
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateDepthStencilState(const D3D11_DEPTH_STENCIL_DESC* pDesc,
-    _COM_Outptr_opt_ ID3D11DepthStencilState**                                                pp)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateDepthStencilState(
+    const D3D11_DEPTH_STENCIL_DESC* pDesc, _COM_Outptr_opt_ ID3D11DepthStencilState** pp)
 {
     if (pp) *pp = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -719,8 +696,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateDepthStencilState(const D3D11_DEPTH_
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateSamplerState(const D3D11_SAMPLER_DESC* pDesc,
-    _COM_Outptr_opt_ ID3D11SamplerState**                                          pp)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateSamplerState(
+    const D3D11_SAMPLER_DESC* pDesc, _COM_Outptr_opt_ ID3D11SamplerState** pp)
 {
     if (pp) *pp = nullptr;
     if (!pDesc) return E_INVALIDARG;
@@ -733,8 +710,8 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateSamplerState(const D3D11_SAMPLER_DES
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateInputLayout(const D3D11_INPUT_ELEMENT_DESC* pElems,
-    UINT NumElements, const void*, SIZE_T, _COM_Outptr_opt_ ID3D11InputLayout** pp)
+HRESULT STDMETHODCALLTYPE Dx12Device::CreateInputLayout(const D3D11_INPUT_ELEMENT_DESC* pElems, UINT NumElements,
+    const void*, SIZE_T, _COM_Outptr_opt_ ID3D11InputLayout** pp)
 {
     if (pp) *pp = nullptr;
     if (!pElems && NumElements) return E_INVALIDARG;
@@ -772,8 +749,7 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CheckFormatSupport(DXGI_FORMAT Format, UIN
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
     fs.Format = Format;
-    if (FAILED(b.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))))
-        return E_FAIL;
+    if (FAILED(b.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) return E_FAIL;
     UINT out = 0;
     if (fs.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) out |= D3D11_FORMAT_SUPPORT_TEXTURE2D;
     if (fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) out |= D3D11_FORMAT_SUPPORT_RENDER_TARGET;

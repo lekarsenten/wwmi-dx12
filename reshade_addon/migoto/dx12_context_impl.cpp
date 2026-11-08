@@ -11,19 +11,22 @@
 //  shortcut -- a PSO cannot be built until every input to it is known.
 // ===========================================================================
 #include "dx12_context.h"
+#include "dx12_context_impl.h"
 #include "dx12_pipeline.h"
+#include "dx12_present_snap.h"
 #include "dx12_wrap.h"
-#include "port_keygate.h"
-#include "globals.h"                      // G->track_texture_updates -- their gate on hash propagation
-#include "ResourceHash.h"                 // PropagateResourceHash / UpdateResourceHashFromCPU (HackerContext.cpp: CopyResource / UpdateSubresource)
-#include "dx12_dump_readback.h"           // the synchronous staging readback their dump engine assumes
-#include "dump_watchdog.h"                // DumpStage: the Map(READ) / CopyResource leaves report their position
-#include "dx12_input_layout.h"            // CurrentInputLayout, for IAGetInputLayout
-#include "prof_core.h"                    // ProfGpuWork -- the performance report's work rows
+#include "command_observer.h"
+#include "shim_unmet.h"
+#include "globals.h" // G->track_texture_updates -- their gate on hash propagation
+#include "ResourceHash.h" // PropagateResourceHash / UpdateResourceHashFromCPU (HackerContext.cpp: CopyResource / UpdateSubresource)
+#include "dx12_dump_readback.h" // the synchronous staging readback their dump engine assumes
+#include "dump_watchdog.h" // DumpStage: the Map(READ) / CopyResource leaves report their position
+#include "dx12_input_layout.h" // CurrentInputLayout, for IAGetInputLayout
+#include "prof_core.h" // ProfGpuWork -- the performance report's work rows
 #include "../instrumentation/gpu_timer.h" // GT_ShimCopy -- the performance monitor's graphics card rows
-#include "../instrumentation/diag.h"      // DiagOnce -- COPY-WHAT, one line per destination
-#include "../../src/log.h"
-#include "../../src/d3d12_barrier.h"
+#include "../instrumentation/diag_gate.h" // DiagOnce -- COPY-WHAT, one line per destination
+#include "../core/log.h"
+#include "../core/d3d12_barrier.h"
 #include "../instrumentation/removal_pin.h" // REMOVAL-PIN tally: the copies this file records on the game's list
 
 #include <atomic> // COPY-REFUSED/COPY-OK counters in CopyResource
@@ -47,21 +50,37 @@ namespace MigotoPort {
 // (BuiltInCommandListUnbindAllRenderTargets) would AddRef it.
 namespace {
 
-// Their command lists run under the engine lock (PortApi::EngineLock), so a plain counter is enough here.
+// Their command lists run under the engine lock (PortApi::EngineLock), so plain counters are enough here.
 static uint32_t g_srv_write_gen = 0;
+static uint32_t g_cb_write_gen = 0;
 
 void SetSrvs(char stage, UINT start, UINT num, ID3D11ShaderResourceView* const* views)
 {
     PipeState& st = State();
-    const int  si = StageIndex(stage);
+    const int si = StageIndex(stage);
     for (UINT i = 0; i < num; ++i) {
         ID3D11ShaderResourceView* v = views ? views[i] : nullptr;
-        const UINT                slot = start + i;
+        const UINT slot = start + i;
         if (si >= 0 && slot < kMaxSRV) {
             BindSlot(st.srv[si][slot], v);
             st.srv_gen[si][slot] = ++g_srv_write_gen;
         }
     }
+}
+
+// A texture slot of the draw's game stages that their list reads, not written since the draw scope opened, holds the
+// game's texture there (DX11: their lists run in the game's state); the addon publishes it at the first read.
+void InheritSrvsForRead(char stage, UINT start, UINT num)
+{
+    static thread_local bool t_publishing = false; // PushGameTexture reads the slot back
+    const Dx12Bridge* br = BridgeScope();
+    if (!br || !br->game.publish_srv || t_publishing || (stage != 'v' && stage != 'p')) return;
+    PipeState& st = State();
+    const int si = StageIndex(stage);
+    t_publishing = true;
+    for (UINT slot = start; slot < kMaxSRV && slot - start < num; ++slot)
+        if ((int32_t)(st.srv_gen[si][slot] - br->game.srv_gen) <= 0) br->game.publish_srv(br->game.user, stage, slot);
+    t_publishing = false;
 }
 
 static bool VaAndSize(ID3D11Buffer* b, UINT offset, D3D12_GPU_VIRTUAL_ADDRESS* va, UINT* size)
@@ -89,18 +108,21 @@ static bool VaAndSize(ID3D11Buffer* b, UINT offset, D3D12_GPU_VIRTUAL_ADDRESS* v
 void SetCbs(char stage, UINT start, UINT num, ID3D11Buffer* const* bufs)
 {
     PipeState& st = State();
-    const int  si = StageIndex(stage);
+    const int si = StageIndex(stage);
     if (si < 0) return;
     for (UINT i = 0; i < num; ++i) {
         const UINT slot = start + i;
-        if (slot < kMaxCB) BindSlot(st.cb[si][slot], bufs ? bufs[i] : nullptr);
+        if (slot < kMaxCB) {
+            BindSlot(st.cb[si][slot], bufs ? bufs[i] : nullptr);
+            st.cb_gen[si][slot] = ++g_cb_write_gen;
+        }
     }
 }
 
 void SetSamplers(char stage, UINT start, UINT num, ID3D11SamplerState* const* ss)
 {
     PipeState& st = State();
-    const int  si = StageIndex(stage);
+    const int si = StageIndex(stage);
     if (si < 0) return;
     for (UINT i = 0; i < num; ++i) {
         const UINT slot = start + i;
@@ -115,8 +137,13 @@ uint32_t SrvWriteGen()
     return g_srv_write_gen;
 }
 
-bool ShimBufferForCompute(ID3D12GraphicsCommandList* cl, char kind, unsigned slot, ShimBufView* out, const char** why,
-    void* object)
+uint32_t CbWriteGen()
+{
+    return g_cb_write_gen;
+}
+
+bool ShimBufferForCompute(
+    ID3D12GraphicsCommandList* cl, char kind, unsigned slot, ShimBufView* out, const char** why, void* object)
 {
     const char* dummy = nullptr;
     if (!why) why = &dummy;
@@ -124,10 +151,10 @@ bool ShimBufferForCompute(ID3D12GraphicsCommandList* cl, char kind, unsigned slo
         *why = "no list";
         return false;
     }
-    const PipeState&      st = State();
-    ID3D11Buffer*         b = nullptr;
-    UINT                  off = 0;
-    UINT                  stride = 0;
+    const PipeState& st = State();
+    ID3D11Buffer* b = nullptr;
+    UINT off = 0;
+    UINT stride = 0;
     D3D12_RESOURCE_STATES to = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (kind == 'v' && slot < kMaxVB) {
         b = st.vb[slot];
@@ -153,23 +180,23 @@ bool ShimBufferForCompute(ID3D12GraphicsCommandList* cl, char kind, unsigned slo
         *why = "nothing bound";
         return false;
     }
-    WrapResource*             wr = AsWrapResource(b);
+    WrapResource* wr = AsWrapResource(b);
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-    UINT                      sz = 0;
+    UINT sz = 0;
     if (!wr || !wr->dx12 || !VaAndSize(b, off, &va, &sz)) {
         *why = "no VA";
         return false;
     }
     const D3D12_GPU_VIRTUAL_ADDRESS base = wr->dx12->GetGPUVirtualAddress();
-    const UINT64                    width = wr->dx12->GetDesc().Width;
+    const UINT64 width = wr->dx12->GetDesc().Width;
     if (va < base || va >= base + width) {
         *why = "relocated (replacement not tracked)";
         return false;
     }
     if (va + sz > base + width) sz = (UINT)(base + width - va);
     D3D12_HEAP_PROPERTIES hp{};
-    D3D12_HEAP_FLAGS      hf{};
-    const bool            upload = SUCCEEDED(wr->dx12->GetHeapProperties(&hp, &hf)) && hp.Type == D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_HEAP_FLAGS hf{};
+    const bool upload = SUCCEEDED(wr->dx12->GetHeapProperties(&hp, &hf)) && hp.Type == D3D12_HEAP_TYPE_UPLOAD;
     if (!upload) TransitionResource(cl, b, to);
     out->res = wr->dx12;
     out->va = va;
@@ -241,9 +268,9 @@ void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers(UINT s, UINT n, ID3D11B
         const int root = br.vs_cb_root(br.vs_cb_root_user, slot);
         if (root < 0 || root >= 64) continue;
         D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-        UINT                      sz = 0;
+        UINT sz = 0;
         if (VaAndSize(st.cb[0][slot], 0, &va, &sz)) {
-            WrapResource*                   w = AsWrapResource(st.cb[0][slot]);
+            WrapResource* w = AsWrapResource(st.cb[0][slot]);
             const D3D12_GPU_VIRTUAL_ADDRESS snap = (w && w->dx12 && OwnedBuffer(w->dx12))
                 ? StaticCbSnapshot(br.cl, w->dx12, va - w->dx12->GetGPUVirtualAddress(), sz)
                 : 0;
@@ -335,8 +362,8 @@ void STDMETHODCALLTYPE Dx12Context::CSSetShader(ID3D11ComputeShader* s, ID3D11Cl
     SetShader('c', s, n, "CSSetShader with class instances");
 }
 
-void STDMETHODCALLTYPE Dx12Context::CSSetUnorderedAccessViews(UINT StartSlot, UINT NumUAVs,
-    ID3D11UnorderedAccessView* const* ppUAVs, const UINT* pUAVInitialCounts)
+void STDMETHODCALLTYPE Dx12Context::CSSetUnorderedAccessViews(
+    UINT StartSlot, UINT NumUAVs, ID3D11UnorderedAccessView* const* ppUAVs, const UINT* pUAVInitialCounts)
 {
     PipeState& st = State();
     for (UINT i = 0; i < NumUAVs; ++i) {
@@ -355,13 +382,13 @@ void STDMETHODCALLTYPE Dx12Context::CSSetUnorderedAccessViews(UINT StartSlot, UI
     }
 }
 
-void STDMETHODCALLTYPE Dx12Context::CSGetUnorderedAccessViews(UINT StartSlot, UINT NumUAVs,
-    ID3D11UnorderedAccessView** ppUAVs)
+void STDMETHODCALLTYPE Dx12Context::CSGetUnorderedAccessViews(
+    UINT StartSlot, UINT NumUAVs, ID3D11UnorderedAccessView** ppUAVs)
 {
     PipeState& st = State();
     if (!ppUAVs) return;
     for (UINT i = 0; i < NumUAVs; ++i) {
-        const UINT                 slot = StartSlot + i;
+        const UINT slot = StartSlot + i;
         ID3D11UnorderedAccessView* v = (slot < kMaxUAV) ? st.uav[slot] : nullptr;
         ppUAVs[i] = v;
         if (v) v->AddRef(); // Get* returns a reference; their code Releases it
@@ -374,8 +401,8 @@ void STDMETHODCALLTYPE Dx12Context::IASetInputLayout(ID3D11InputLayout* l)
     BindSlot(State().layout, l);
 }
 
-void STDMETHODCALLTYPE Dx12Context::IASetVertexBuffers(UINT StartSlot, UINT NumBuffers,
-    ID3D11Buffer* const* ppVB, const UINT* pStrides, const UINT* pOffsets)
+void STDMETHODCALLTYPE Dx12Context::IASetVertexBuffers(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppVB, const UINT* pStrides, const UINT* pOffsets)
 {
     PipeState& st = State();
     for (UINT i = 0; i < NumBuffers; ++i) {
@@ -389,11 +416,11 @@ void STDMETHODCALLTYPE Dx12Context::IASetVertexBuffers(UINT StartSlot, UINT NumB
         if (st.vb[slot] && slot + 1 > st.num_vb) st.num_vb = slot + 1;
 
         // ...and through to the real pipeline, exactly as theirs does.
-        const Dx12Bridge&         b = GetDx12Bridge();
+        const Dx12Bridge& b = GetDx12Bridge();
         D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-        UINT                      sz = 0;
-        const bool                have_va = st.vb[slot] && VaAndSize(st.vb[slot], st.vb_offset[slot], &va, &sz);
-        bool                      explicit_null = false; // the K8 line below must say what actually reached the list
+        UINT sz = 0;
+        const bool have_va = st.vb[slot] && VaAndSize(st.vb[slot], st.vb_offset[slot], &va, &sz);
+        bool explicit_null = false; // the K8 line below must say what actually reached the list
         if (b.cl && have_va) {
             D3D12_VERTEX_BUFFER_VIEW v{ va, sz, st.vb_stride[slot] };
             ReadyForGameDraw(b.cl, st.vb[slot], D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -412,23 +439,22 @@ void STDMETHODCALLTYPE Dx12Context::IASetVertexBuffers(UINT StartSlot, UINT NumB
         if (st.vb[slot] && !(b.cl && have_va) && logger::enabled(1)) { // ShimUnmet is log-only
             wchar_t d[64];
             _snwprintf_s(d, _TRUNCATE, L"vb%u", slot);
-            ShimUnmet(!b.cl ? L"no DX12 command list published" : L"no VA for the wrapped buffer", d);
+            g_shim_unmet.Note(!b.cl ? L"no DX12 command list published" : L"no VA for the wrapped buffer", d);
         }
-        if (ObserverActive()) {
+        if (g_command_observer.Active()) {
             wchar_t line[256];
             if (b.cl && have_va)
-                _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   vb%u -> game list: va %016llX size %u stride %u",
-                    slot, (unsigned long long)va, sz, st.vb_stride[slot]);
+                _snwprintf_s(line, _TRUNCATE, L"  LEAF   vb%u -> game list: va %016llX size %u stride %u", slot,
+                    (unsigned long long)va, sz, st.vb_stride[slot]);
             else if (explicit_null)
                 _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   vb%u = null -> game list: EXPLICIT UNBIND (zeroed vertex-buffer view)",
-                    slot);
+                    L"  LEAF   vb%u = null -> game list: EXPLICIT UNBIND (zeroed vertex-buffer view)", slot);
             else
-                _snwprintf_s(line, _TRUNCATE,
-                    L"  LEAF   vb%u NOT WRITTEN THROUGH (%s) -- game's own VB stays bound",
-                    slot, !b.cl ? L"no DX12 command list published" : (st.vb[slot] ? L"no VA for the wrapped buffer" : L"no VB bound"));
-            ObserveCommand(line);
+                _snwprintf_s(line, _TRUNCATE, L"  LEAF   vb%u NOT WRITTEN THROUGH (%s) -- game's own VB stays bound",
+                    slot,
+                    !b.cl ? L"no DX12 command list published"
+                          : (st.vb[slot] ? L"no VA for the wrapped buffer" : L"no VB bound"));
+            g_command_observer.Observe(line);
         }
     }
 }
@@ -440,10 +466,10 @@ void STDMETHODCALLTYPE Dx12Context::IASetIndexBuffer(ID3D11Buffer* pIB, DXGI_FOR
     st.ib_format = Format;
     st.ib_offset = Offset;
 
-    const Dx12Bridge&         b = GetDx12Bridge();
+    const Dx12Bridge& b = GetDx12Bridge();
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
-    UINT                      sz = 0;
-    const bool                have_va = st.ib && VaAndSize(st.ib, st.ib_offset, &va, &sz);
+    UINT sz = 0;
+    const bool have_va = st.ib && VaAndSize(st.ib, st.ib_offset, &va, &sz);
     if (b.cl && have_va) {
         D3D12_INDEX_BUFFER_VIEW v{};
         v.BufferLocation = va;
@@ -453,17 +479,16 @@ void STDMETHODCALLTYPE Dx12Context::IASetIndexBuffer(ID3D11Buffer* pIB, DXGI_FOR
         b.cl->IASetIndexBuffer(&v);
     }
     if (st.ib && !(b.cl && have_va))
-        ShimUnmet(!b.cl ? L"no DX12 command list published" : L"no VA for the wrapped buffer", L"ib");
-    if (ObserverActive()) {
+        g_shim_unmet.Note(!b.cl ? L"no DX12 command list published" : L"no VA for the wrapped buffer", L"ib");
+    if (g_command_observer.Active()) {
         wchar_t line[256];
         if (b.cl && have_va)
             _snwprintf_s(line, _TRUNCATE, L"  LEAF   ib -> game list: va %016llX size %u fmt %u",
                 (unsigned long long)va, sz, (unsigned)Format);
         else
-            _snwprintf_s(line, _TRUNCATE,
-                L"  LEAF   ib NOT WRITTEN THROUGH (%s) -- game's own IB stays bound",
+            _snwprintf_s(line, _TRUNCATE, L"  LEAF   ib NOT WRITTEN THROUGH (%s) -- game's own IB stays bound",
                 !b.cl ? L"no DX12 command list published" : (st.ib ? L"no VA for the wrapped buffer" : L"no IB bound"));
-        ObserveCommand(line);
+        g_command_observer.Observe(line);
     }
 }
 
@@ -473,8 +498,8 @@ void STDMETHODCALLTYPE Dx12Context::IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOL
 }
 
 // ---- output merger ---------------------------------------------------------------------------
-void STDMETHODCALLTYPE Dx12Context::OMSetRenderTargets(UINT NumViews,
-    ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
+void STDMETHODCALLTYPE Dx12Context::OMSetRenderTargets(
+    UINT NumViews, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
 {
     PipeState& st = State();
     st.num_rtv = 0;
@@ -486,13 +511,11 @@ void STDMETHODCALLTYPE Dx12Context::OMSetRenderTargets(UINT NumViews,
 }
 
 void STDMETHODCALLTYPE Dx12Context::OMSetRenderTargetsAndUnorderedAccessViews(UINT NumRTVs,
-    ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV,
-    UINT UAVStartSlot, UINT NumUAVs, ID3D11UnorderedAccessView* const* ppUAVs,
-    const UINT* pUAVInitialCounts)
+    ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV, UINT UAVStartSlot, UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUAVs, const UINT* pUAVInitialCounts)
 {
     // D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL means "leave the RTs alone, only change UAVs".
-    if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
-        OMSetRenderTargets(NumRTVs, ppRTVs, pDSV);
+    if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) OMSetRenderTargets(NumRTVs, ppRTVs, pDSV);
     if (NumUAVs != D3D11_KEEP_UNORDERED_ACCESS_VIEWS) {
         PipeState& st = State();
         for (UINT i = 0; i < NumUAVs; ++i) {
@@ -503,8 +526,8 @@ void STDMETHODCALLTYPE Dx12Context::OMSetRenderTargetsAndUnorderedAccessViews(UI
     }
 }
 
-void STDMETHODCALLTYPE Dx12Context::OMSetBlendState(ID3D11BlendState* pBlendState,
-    const FLOAT BlendFactor[4], UINT SampleMask)
+void STDMETHODCALLTYPE Dx12Context::OMSetBlendState(
+    ID3D11BlendState* pBlendState, const FLOAT BlendFactor[4], UINT SampleMask)
 {
     PipeState& st = State();
     BindSlot(st.blend, pBlendState);
@@ -569,58 +592,65 @@ void STDMETHODCALLTYPE Dx12Context::RSGetScissorRects(UINT* pNumRects, D3D11_REC
     }
 }
 
-static bool DispatchToAddon(bool indexed, UINT count, UINT start, INT base, UINT instances,
-    UINT start_instance)
+static bool DispatchToAddon(bool indexed, UINT count, UINT start, INT base, UINT instances, UINT start_instance)
 {
-    void*     user = nullptr;
+    void* user = nullptr;
     ModDrawFn fn = ModDrawCallback(&user);
-    if (!fn) return false;
+    if (!fn || AsShaderCode(State().shader[0])) return false;
     PayGameState();
     fn(count, start, base, instances, start_instance, indexed, user);
     return true;
 }
 
-void STDMETHODCALLTYPE Dx12Context::DrawIndexed(UINT IndexCount, UINT StartIndexLocation,
-    INT BaseVertexLocation)
+static void IssueDrawSnapped(
+    ID3D11DeviceContext* ctx, bool indexed, UINT count, UINT start, INT base, UINT instances, UINT start_instance)
+{
+    g_present_snapshots.BeforeDraw(ctx, State());
+    IssueDraw(indexed, count, start, base, instances, start_instance);
+    g_present_snapshots.AfterDraw(State());
+}
+
+void STDMETHODCALLTYPE Dx12Context::DrawIndexed(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
 {
     if (DispatchToAddon(true, IndexCount, StartIndexLocation, BaseVertexLocation, 1, 0)) return;
-    IssueDraw(true, IndexCount, StartIndexLocation, BaseVertexLocation, 1, 0);
+    IssueDrawSnapped(this, true, IndexCount, StartIndexLocation, BaseVertexLocation, 1, 0);
 }
 
 void STDMETHODCALLTYPE Dx12Context::Draw(UINT VertexCount, UINT StartVertexLocation)
 {
     if (DispatchToAddon(false, VertexCount, StartVertexLocation, 0, 1, 0)) return;
-    IssueDraw(false, VertexCount, StartVertexLocation, 0, 1, 0);
+    IssueDrawSnapped(this, false, VertexCount, StartVertexLocation, 0, 1, 0);
 }
 
 void STDMETHODCALLTYPE Dx12Context::DrawIndexedInstanced(UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
-    if (DispatchToAddon(true, IndexCountPerInstance, StartIndexLocation, BaseVertexLocation,
-            InstanceCount, StartInstanceLocation)) return;
-    IssueDraw(true, IndexCountPerInstance, StartIndexLocation, BaseVertexLocation,
-        InstanceCount, StartInstanceLocation);
+    if (DispatchToAddon(
+            true, IndexCountPerInstance, StartIndexLocation, BaseVertexLocation, InstanceCount, StartInstanceLocation))
+        return;
+    IssueDrawSnapped(this, true, IndexCountPerInstance, StartIndexLocation, BaseVertexLocation, InstanceCount,
+        StartInstanceLocation);
 }
 
-void STDMETHODCALLTYPE Dx12Context::DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount,
-    UINT StartVertexLocation, UINT StartInstanceLocation)
+void STDMETHODCALLTYPE Dx12Context::DrawInstanced(
+    UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation)
 {
-    if (DispatchToAddon(false, VertexCountPerInstance, StartVertexLocation, 0,
-            InstanceCount, StartInstanceLocation)) return;
-    IssueDraw(false, VertexCountPerInstance, StartVertexLocation, 0,
-        InstanceCount, StartInstanceLocation);
+    if (DispatchToAddon(false, VertexCountPerInstance, StartVertexLocation, 0, InstanceCount, StartInstanceLocation))
+        return;
+    IssueDrawSnapped(this, false, VertexCountPerInstance, StartVertexLocation, 0, InstanceCount, StartInstanceLocation);
 }
 
-void STDMETHODCALLTYPE Dx12Context::Dispatch(UINT ThreadGroupCountX, UINT ThreadGroupCountY,
-    UINT ThreadGroupCountZ)
+void STDMETHODCALLTYPE Dx12Context::Dispatch(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ)
 {
     if (g_present_redraw) return;
+    for (ID3D11UnorderedAccessView* u : State().uav)
+        if (WrapView* v = u ? AsWrapView(u) : nullptr) g_present_snapshots.NoteWrite(v->res);
     NoteEmittedDispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
     IssueDispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Context::Map(ID3D11Resource* pResource, UINT Subresource,
-    D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
+HRESULT STDMETHODCALLTYPE Dx12Context::Map(ID3D11Resource* pResource, UINT Subresource, D3D11_MAP MapType,
+    UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 {
     (void)Subresource;
     (void)MapFlags;
@@ -630,8 +660,8 @@ HRESULT STDMETHODCALLTYPE Dx12Context::Map(ID3D11Resource* pResource, UINT Subre
         WrapResource* wr = AsWrapResource(pResource);
         if (wr && wr->dx12) {
             const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
-            UINT64                    bytes = 0;
-            UINT64                    row = 0;
+            UINT64 bytes = 0;
+            UINT64 row = 0;
             if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
                 bytes = rd.Width;
                 row = rd.Width;
@@ -672,8 +702,8 @@ HRESULT STDMETHODCALLTYPE Dx12Context::Map(ID3D11Resource* pResource, UINT Subre
                 return E_FAIL;
             }
             const D3D12_RESOURCE_DESC rd = wr->dx12->GetDesc();
-            void*                     p = nullptr;
-            D3D12_RANGE               all{ 0, (SIZE_T)rd.Width };
+            void* p = nullptr;
+            D3D12_RANGE all{ 0, (SIZE_T)rd.Width };
             DumpStage("Map(READ): map", (unsigned long long)wr->dx12);
             if (SUCCEEDED(wr->dx12->Map(0, &all, &p)) && p) {
                 pMappedResource->pData = p;
@@ -722,6 +752,7 @@ void STDMETHODCALLTYPE Dx12Context::Unmap(ID3D11Resource* pResource, UINT)
 void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Resource* pSrc)
 {
     if (g_present_redraw) return;
+    g_present_snapshots.NoteWrite(pDst);
     WrapResource* d = AsWrapResource(pDst);
     WrapResource* s = AsWrapResource(pSrc);
     if (!d || !s || !d->dx12 || !s->dx12) {
@@ -730,8 +761,7 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
     }
 
     if (d->heap_type == D3D12_HEAP_TYPE_READBACK) DumpStage("CopyResource: record", (unsigned long long)s->dx12);
-    if (d->heap_type == D3D12_HEAP_TYPE_READBACK && d->row_pitch &&
-        s->dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+    if (d->heap_type == D3D12_HEAP_TYPE_READBACK && d->row_pitch && s->dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
         if (ID3D12GraphicsCommandList* dl = DumpReadbackList()) {
             D3D12_TEXTURE_COPY_LOCATION dstL{};
             dstL.pResource = d->dx12;
@@ -746,20 +776,21 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
             unsigned pre_bytes = 0;
             unsigned pre_pitch = 0;
             if (const void* pre = PreDrainLookup(s->dx12, &pre_bytes, &pre_pitch)) {
-                void*       dstp = nullptr;
+                void* dstp = nullptr;
                 D3D12_RANGE none{ 0, 0 };
                 if (SUCCEEDED(d->dx12->Map(0, &none, &dstp)) && dstp) {
                     const UINT64 cap = d->dx12->GetDesc().Width;
-                    SIZE_T       end = 0;
+                    SIZE_T end = 0;
                     if (!pre_pitch || pre_pitch == d->row_pitch) {
                         end = (SIZE_T)(pre_bytes < cap ? pre_bytes : cap);
                         memcpy(dstp, pre, end);
                     } else {
                         static std::atomic<unsigned> s_pitch_logs{ 0 };
                         if (s_pitch_logs.fetch_add(1, std::memory_order_relaxed) < 4)
-                            logger::write("DUMPRB: pre-drained %p (fmt %d) has row pitch %u, its staging (fmt %d) %u x %u rows: copied row by row",
-                                (void*)s->dx12, (int)s->dx12->GetDesc().Format, pre_pitch, (int)d->footprint.Footprint.Format,
-                                d->row_pitch, d->rows);
+                            logger::write(
+                                "DUMPRB: pre-drained %p (fmt %d) has row pitch %u, its staging (fmt %d) %u x %u rows: copied row by row",
+                                (void*)s->dx12, (int)s->dx12->GetDesc().Format, pre_pitch,
+                                (int)d->footprint.Footprint.Format, d->row_pitch, d->rows);
                         const UINT64 row = d->row_pitch < pre_pitch ? d->row_pitch : pre_pitch;
                         for (UINT r = 0; r < d->rows; ++r) {
                             const UINT64 so = (UINT64)r * pre_pitch;
@@ -795,7 +826,7 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
         if (ID3D12GraphicsCommandList* dl = DumpReadbackList()) {
             const UINT64 dw = d->dx12->GetDesc().Width;
             const UINT64 sw = s->dx12->GetDesc().Width;
-            UINT64       src_off = 0;
+            UINT64 src_off = 0;
             if (s->gpu_va) {
                 const D3D12_GPU_VIRTUAL_ADDRESS sb = s->dx12->GetGPUVirtualAddress();
                 if (s->gpu_va > sb) src_off = s->gpu_va - sb;
@@ -818,7 +849,7 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
     static std::atomic<unsigned long long> s_copy_nocl{ 0 };
 
     const Dx12Bridge& b = GetDx12Bridge();
-    const bool        log_on = logger::enabled(1);
+    const bool log_on = logger::enabled(1);
     if (!b.cl) {
         const unsigned long long n = log_on ? s_copy_nocl.fetch_add(1, std::memory_order_relaxed) + 1 : 0ull;
         if (log_on && (n <= 4 || (n % 512) == 0))
@@ -826,9 +857,8 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
                           "succeeded %llu. A refused copy leaves the destination holding whatever it "
                           "held before; if that destination is bound as vb0, the draw reads a buffer "
                           "nothing wrote.",
-                (unsigned long long)d->dx12->GetDesc().Width,
-                (unsigned long long)s->dx12->GetDesc().Width,
-                n, s_copy_ok.load(std::memory_order_relaxed));
+                (unsigned long long)d->dx12->GetDesc().Width, (unsigned long long)s->dx12->GetDesc().Width, n,
+                s_copy_ok.load(std::memory_order_relaxed));
         NotImplOnce("CopyResource (no DX12 command list bound)");
         return;
     }
@@ -836,14 +866,13 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
         const unsigned long long n = s_copy_ok.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 4 || (n % 2048) == 0)
             logger::write("COPY-OK: dst=%llu B src=%llu B  -- succeeded %llu, refused %llu",
-                (unsigned long long)d->dx12->GetDesc().Width,
-                (unsigned long long)s->dx12->GetDesc().Width,
-                n, s_copy_nocl.load(std::memory_order_relaxed));
+                (unsigned long long)d->dx12->GetDesc().Width, (unsigned long long)s->dx12->GetDesc().Width, n,
+                s_copy_nocl.load(std::memory_order_relaxed));
     }
     FlushPendingUploads(b.cl);
     bool cs = false;
     if (d->dim == D3D11_RESOURCE_DIMENSION_BUFFER && s->dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
-        GpuBracket   _gt(b.cl, GT_ShimCopyCs);
+        GpuBracket _gt(b.cl, GT_ShimCopyCs);
         const UINT64 dw = d->dx12->GetDesc().Width;
         const UINT64 sw = s->dx12->GetDesc().Width;
         cs = CopyBufferCs(b.cl, d, 0, s, 0, dw < sw ? dw : sw);
@@ -862,11 +891,12 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
     if (DiagOnce("COPY-WHAT", (int)(reinterpret_cast<uintptr_t>(d->dx12) >> 4))) {
         const D3D12_RESOURCE_DESC dd = d->dx12->GetDesc();
         const D3D12_RESOURCE_DESC sd = s->dx12->GetDesc();
-        const wchar_t*            line = CurrentIniLine();
-        logger::write("COPY-WHAT dst=%p dim=%d %llux%u fmt=%d mips=%u flags=%x <- src=%p dim=%d %llux%u fmt=%d  (own_list=%d) line='%ls'",
+        const wchar_t* line = g_command_observer.CurrentIniLine();
+        logger::write(
+            "COPY-WHAT dst=%p dim=%d %llux%u fmt=%d mips=%u flags=%x <- src=%p dim=%d %llux%u fmt=%d  (own_list=%d) line='%ls'",
             (void*)d->dx12, (int)dd.Dimension, (unsigned long long)dd.Width, dd.Height, (int)dd.Format,
-            (unsigned)dd.MipLevels, (unsigned)dd.Flags, (void*)s->dx12, (int)sd.Dimension,
-            (unsigned long long)sd.Width, sd.Height, (int)sd.Format, (int)b.own_list, line ? line : L"(none)");
+            (unsigned)dd.MipLevels, (unsigned)dd.Flags, (void*)s->dx12, (int)sd.Dimension, (unsigned long long)sd.Width,
+            sd.Height, (int)sd.Format, (int)b.own_list, line ? line : L"(none)");
     }
     if (g_prof_enabled) { // the GetDesc is a COM call; only pay it while measuring
         if (s->dim == D3D11_RESOURCE_DIMENSION_BUFFER)
@@ -874,12 +904,10 @@ void STDMETHODCALLTYPE Dx12Context::CopyResource(ID3D11Resource* pDst, ID3D11Res
         else
             ProfGpuWork(PGW_ShimCopyTex, 0);
     }
-    if (G->track_texture_updates == 1)
-        PropagateResourceHash(pDst, pSrc);
+    if (G->track_texture_updates == 1) PropagateResourceHash(pDst, pSrc);
 }
 
-static bool PortExpandRegionCopy(ID3D11Resource* pDstResource,
-    ID3D11Resource* pSrcResource, const D3D11_BOX* pSrcBox,
+static bool PortExpandRegionCopy(ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource, const D3D11_BOX* pSrcBox,
     UINT* replaceDstX, D3D11_BOX* replaceBox)
 {
     static int s_any_expand = -1;
@@ -892,23 +920,18 @@ static bool PortExpandRegionCopy(ID3D11Resource* pDstResource,
                     break;
                 }
     }
-    if (!s_any_expand)
-        return false;
+    if (!s_any_expand) return false;
 
-    if (!pSrcResource || !pDstResource || !pSrcBox)
-        return false;
+    if (!pSrcResource || !pDstResource || !pSrcBox) return false;
     WrapResource* s = AsWrapResource(pSrcResource);
     WrapResource* d = AsWrapResource(pDstResource);
     if (!s || !d) return false;
-    if (s->dim != d->dim || s->dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        return false;
+    if (s->dim != d->dim || s->dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return false;
 
-    const uint32_t               dstHash = GetResourceHash(pDstResource);
+    const uint32_t dstHash = GetResourceHash(pDstResource);
     TextureOverrideMap::iterator i = lookup_textureoverride(dstHash);
-    if (i == G->mTextureOverrideMap.end())
-        return false;
-    if (!i->second.begin()->expand_region_copy)
-        return false;
+    if (i == G->mTextureOverrideMap.end()) return false;
+    if (!i->second.begin()->expand_region_copy) return false;
 
     memcpy(replaceBox, pSrcBox, sizeof(D3D11_BOX));
     *replaceDstX = 0;
@@ -917,11 +940,11 @@ static bool PortExpandRegionCopy(ID3D11Resource* pDstResource,
     return true;
 }
 
-void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, UINT DstSubresource,
-    UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource* pSrc, UINT SrcSubresource,
-    const D3D11_BOX* pSrcBox)
+void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, UINT DstSubresource, UINT DstX,
+    UINT DstY, UINT DstZ, ID3D11Resource* pSrc, UINT SrcSubresource, const D3D11_BOX* pSrcBox)
 {
     if (g_present_redraw) return;
+    g_present_snapshots.NoteWrite(pDst);
     const Dx12Bridge& b = GetDx12Bridge();
     if (!b.cl) {
         NotImplOnce("CopySubresourceRegion (no DX12 command list bound)");
@@ -939,7 +962,7 @@ void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, 
 
     // HackerContext::CopySubresourceRegion substitutes BOTH the box and DstX before the copy.
     D3D11_BOX replaceSrcBox;
-    UINT      replaceDstX = DstX;
+    UINT replaceDstX = DstX;
     if (PortExpandRegionCopy(pDst, pSrc, pSrcBox, &replaceDstX, &replaceSrcBox)) {
         pSrcBox = &replaceSrcBox;
         DstX = replaceDstX;
@@ -947,9 +970,8 @@ void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, 
 
     if (d->dim == D3D11_RESOURCE_DIMENSION_BUFFER && s->dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
         const UINT64 src_off = pSrcBox ? pSrcBox->left : 0;
-        const UINT64 bytes = pSrcBox ? (UINT64)(pSrcBox->right - pSrcBox->left)
-                                     : s->dx12->GetDesc().Width;
-        bool         cs = false;
+        const UINT64 bytes = pSrcBox ? (UINT64)(pSrcBox->right - pSrcBox->left) : s->dx12->GetDesc().Width;
+        bool cs = false;
         {
             GpuBracket _gt(b.cl, GT_ShimCopyCs);
             cs = CopyBufferCs(b.cl, d, DstX, s, src_off, bytes);
@@ -973,13 +995,12 @@ void STDMETHODCALLTYPE Dx12Context::CopySubresourceRegion(ID3D11Resource* pDst, 
     sl.SubresourceIndex = SrcSubresource;
     D3D12_BOX box{};
     if (pSrcBox) {
-        box = { pSrcBox->left, pSrcBox->top, pSrcBox->front,
-            pSrcBox->right, pSrcBox->bottom, pSrcBox->back };
+        box = { pSrcBox->left, pSrcBox->top, pSrcBox->front, pSrcBox->right, pSrcBox->bottom, pSrcBox->back };
     }
     b.cl->CopyTextureRegion(&dl, DstX, DstY, DstZ, &sl, pSrcBox ? &box : nullptr);
     ProfGpuWork(PGW_ShimCopyTex, 0);
-    if (G->track_texture_updates == 1 && DstSubresource == 0 &&
-        DstX == 0 && DstY == 0 && DstZ == 0 && pSrcBox == nullptr)
+    if (G->track_texture_updates == 1 && DstSubresource == 0 && DstX == 0 && DstY == 0 && DstZ == 0 &&
+        pSrcBox == nullptr)
         PropagateResourceHash(pDst, pSrc);
 }
 
@@ -987,14 +1008,14 @@ void STDMETHODCALLTYPE Dx12Context::UpdateSubresource(ID3D11Resource* pDst, UINT
     const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch)
 {
     if (g_present_redraw) return;
+    g_present_snapshots.NoteWrite(pDst);
     WrapResource* d = AsWrapResource(pDst);
     if (!d || !d->dx12 || !pSrcData) {
         NotImplOnce("UpdateSubresource with a resource that is not one of our wrappers");
         return;
     }
     if (d->dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
-        const UINT64 bytes = pDstBox ? (UINT64)(pDstBox->right - pDstBox->left)
-                                     : d->dx12->GetDesc().Width;
+        const UINT64 bytes = pDstBox ? (UINT64)(pDstBox->right - pDstBox->left) : d->dx12->GetDesc().Width;
         if (pDstBox && pDstBox->left != 0) {
             NotImplOnce("UpdateSubresource into a buffer at a non-zero offset");
             return;
@@ -1006,8 +1027,7 @@ void STDMETHODCALLTYPE Dx12Context::UpdateSubresource(ID3D11Resource* pDst, UINT
         NotImplOnce("UpdateSubresource into a texture subresource or sub-box");
         return;
     }
-    if (G->track_texture_updates == 1)
-        UpdateResourceHashFromCPU(pDst, pSrcData, SrcRowPitch, SrcDepthPitch);
+    if (G->track_texture_updates == 1) UpdateResourceHashFromCPU(pDst, pSrcData, SrcRowPitch, SrcDepthPitch);
     D3D11_SUBRESOURCE_DATA sd{};
     sd.pSysMem = pSrcData;
     sd.SysMemPitch = SrcRowPitch;
@@ -1015,10 +1035,11 @@ void STDMETHODCALLTYPE Dx12Context::UpdateSubresource(ID3D11Resource* pDst, UINT
     QueueTextureUpload(pDst, &sd, 1);
 }
 
-void STDMETHODCALLTYPE Dx12Context::ResolveSubresource(ID3D11Resource* pDst, UINT DstSubresource,
-    ID3D11Resource* pSrc, UINT SrcSubresource, DXGI_FORMAT Format)
+void STDMETHODCALLTYPE Dx12Context::ResolveSubresource(
+    ID3D11Resource* pDst, UINT DstSubresource, ID3D11Resource* pSrc, UINT SrcSubresource, DXGI_FORMAT Format)
 {
     if (g_present_redraw) return;
+    g_present_snapshots.NoteWrite(pDst);
     const Dx12Bridge& b = GetDx12Bridge();
     if (!b.cl) {
         NotImplOnce("ResolveSubresource (no DX12 command list bound)");
@@ -1036,11 +1057,10 @@ void STDMETHODCALLTYPE Dx12Context::ResolveSubresource(ID3D11Resource* pDst, UIN
     b.cl->ResolveSubresource(d->dx12, DstSubresource, s->dx12, SrcSubresource, Format);
 }
 
-void STDMETHODCALLTYPE Dx12Context::ClearRenderTargetView(ID3D11RenderTargetView* pRTV,
-    const FLOAT                                                                   ColorRGBA[4])
+void STDMETHODCALLTYPE Dx12Context::ClearRenderTargetView(ID3D11RenderTargetView* pRTV, const FLOAT ColorRGBA[4])
 {
     const Dx12Bridge& b = GetDx12Bridge();
-    WrapView*         v = AsWrapView(pRTV);
+    WrapView* v = AsWrapView(pRTV);
     if (!b.cl || !v || !v->wres) {
         NotImplOnce("ClearRenderTargetView (no command list or not ours)");
         return;
@@ -1051,11 +1071,11 @@ void STDMETHODCALLTYPE Dx12Context::ClearRenderTargetView(ID3D11RenderTargetView
     b.cl->ClearRenderTargetView(v->cpu, ColorRGBA ? ColorRGBA : black, 0, nullptr);
 }
 
-void STDMETHODCALLTYPE Dx12Context::ClearDepthStencilView(ID3D11DepthStencilView* pDSV, UINT ClearFlags,
-    FLOAT Depth, UINT8 Stencil)
+void STDMETHODCALLTYPE Dx12Context::ClearDepthStencilView(
+    ID3D11DepthStencilView* pDSV, UINT ClearFlags, FLOAT Depth, UINT8 Stencil)
 {
     const Dx12Bridge& b = GetDx12Bridge();
-    WrapView*         v = AsWrapView(pDSV);
+    WrapView* v = AsWrapView(pDSV);
     if (!b.cl || !v || !v->wres) {
         NotImplOnce("ClearDepthStencilView (no command list or not ours)");
         return;
@@ -1070,20 +1090,19 @@ void STDMETHODCALLTYPE Dx12Context::ClearDepthStencilView(ID3D11DepthStencilView
 
 namespace {
 
-bool PrepareUavClear(ID3D11UnorderedAccessView* uav, WrapView** out_view,
-    D3D12_GPU_DESCRIPTOR_HANDLE* gpu, D3D12_CPU_DESCRIPTOR_HANDLE* cpu,
-    UINT* scratch_slot)
+bool PrepareUavClear(ID3D11UnorderedAccessView* uav, WrapView** out_view, D3D12_GPU_DESCRIPTOR_HANDLE* gpu,
+    D3D12_CPU_DESCRIPTOR_HANDLE* cpu, UINT* scratch_slot)
 {
     const Dx12Bridge& b = GetDx12Bridge();
-    WrapView*         v = AsWrapView(uav);
+    WrapView* v = AsWrapView(uav);
     if (!b.cl || !b.device || !v || !v->wres || !v->wres->dx12) return false;
     FlushPendingUploads(b.cl);
 
     D3D12_CPU_DESCRIPTOR_HANDLE src = v->cpu;
     *scratch_slot = UINT_MAX;
     if (v->wres->dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
-        const D3D12_RESOURCE_DESC   rd = v->wres->dx12->GetDesc();
-        UINT                        slot = 0;
+        const D3D12_RESOURCE_DESC rd = v->wres->dx12->GetDesc();
+        UINT slot = 0;
         D3D12_CPU_DESCRIPTOR_HANDLE tmp = AllocStagingDescriptor('u', &slot);
         if (!tmp.ptr) return false;
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
@@ -1106,47 +1125,46 @@ bool PrepareUavClear(ID3D11UnorderedAccessView* uav, WrapView** out_view,
 
 } // namespace
 
-void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewFloat(ID3D11UnorderedAccessView* pUAV,
-    const FLOAT                                                                              Values[4])
+void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewFloat(
+    ID3D11UnorderedAccessView* pUAV, const FLOAT Values[4])
 {
     if (g_present_redraw) return;
-    WrapView*                   v = nullptr;
+    WrapView* v = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
-    UINT                        scratch = UINT_MAX;
+    UINT scratch = UINT_MAX;
     if (!PrepareUavClear(pUAV, &v, &gpu, &cpu, &scratch)) {
         NotImplOnce("ClearUnorderedAccessViewFloat (no command list, or the view is not ours)");
         return;
     }
+    g_present_snapshots.NoteWrite(v->res);
     const FLOAT zero[4] = { 0, 0, 0, 0 };
     if (scratch != UINT_MAX) {
         const FLOAT* src = Values ? Values : zero;
-        UINT         bits[4];
+        UINT bits[4];
         for (int i = 0; i < 4; ++i) memcpy(&bits[i], &src[i], sizeof(UINT));
         GetDx12Bridge().cl->ClearUnorderedAccessViewUint(gpu, cpu, v->wres->dx12, bits, 0, nullptr);
         ReleaseStagingDescriptor('u', scratch);
     } else {
-        GetDx12Bridge().cl->ClearUnorderedAccessViewFloat(gpu, cpu, v->wres->dx12,
-            Values ? Values : zero, 0, nullptr);
+        GetDx12Bridge().cl->ClearUnorderedAccessViewFloat(gpu, cpu, v->wres->dx12, Values ? Values : zero, 0, nullptr);
     }
     OweGameState(GetDx12Bridge()); // ShaderVisibleCopy set our heaps
 }
 
-void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewUint(ID3D11UnorderedAccessView* pUAV,
-    const UINT                                                                              Values[4])
+void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewUint(ID3D11UnorderedAccessView* pUAV, const UINT Values[4])
 {
     if (g_present_redraw) return;
-    WrapView*                   v = nullptr;
+    WrapView* v = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
-    UINT                        scratch = UINT_MAX;
+    UINT scratch = UINT_MAX;
     if (!PrepareUavClear(pUAV, &v, &gpu, &cpu, &scratch)) {
         NotImplOnce("ClearUnorderedAccessViewUint (no command list, or the view is not ours)");
         return;
     }
+    g_present_snapshots.NoteWrite(v->res);
     const UINT zero[4] = { 0, 0, 0, 0 };
-    GetDx12Bridge().cl->ClearUnorderedAccessViewUint(gpu, cpu, v->wres->dx12,
-        Values ? Values : zero, 0, nullptr);
+    GetDx12Bridge().cl->ClearUnorderedAccessViewUint(gpu, cpu, v->wres->dx12, Values ? Values : zero, 0, nullptr);
     if (scratch != UINT_MAX) ReleaseStagingDescriptor('u', scratch);
     OweGameState(GetDx12Bridge());
 }
@@ -1168,13 +1186,12 @@ void STDMETHODCALLTYPE Dx12Context::ClearUnorderedAccessViewUint(ID3D11Unordered
 namespace {
 
 // Get* hands back a reference in COM, and their code Releases what it gets.
-template <class T>
-void GetSlots(T** out, UINT num, T* const* src, UINT src_max, UINT start)
+template <class T> void GetSlots(T** out, UINT num, T* const* src, UINT src_max, UINT start)
 {
     if (!out) return;
     for (UINT i = 0; i < num; ++i) {
         const UINT slot = start + i;
-        T*         v = (slot < src_max) ? src[slot] : nullptr;
+        T* v = (slot < src_max) ? src[slot] : nullptr;
         out[i] = v;
         if (v) v->AddRef();
     }
@@ -1183,7 +1200,7 @@ void GetSlots(T** out, UINT num, T* const* src, UINT src_max, UINT start)
 void GetShader(char stage, void** out)
 {
     if (!out) return;
-    const int          si = StageIndex(stage);
+    const int si = StageIndex(stage);
     ID3D11DeviceChild* s = (si >= 0) ? State().shader[si] : nullptr;
     *out = s;
     if (s) s->AddRef();
@@ -1250,6 +1267,7 @@ void STDMETHODCALLTYPE Dx12Context::CSGetConstantBuffers(UINT start, UINT n, ID3
 }
 void STDMETHODCALLTYPE Dx12Context::PSGetShaderResources(UINT start, UINT n, ID3D11ShaderResourceView** out)
 {
+    if (out) InheritSrvsForRead('p', start, n);
     GetSlots(out, n, State().srv[4], kMaxSRV, start);
 }
 void STDMETHODCALLTYPE Dx12Context::CSGetShaderResources(UINT start, UINT n, ID3D11ShaderResourceView** out)
@@ -1261,8 +1279,8 @@ void STDMETHODCALLTYPE Dx12Context::PSGetSamplers(UINT start, UINT n, ID3D11Samp
     GetSlots(out, n, State().samp[4], kMaxSamp, start);
 }
 
-void STDMETHODCALLTYPE Dx12Context::IAGetVertexBuffers(UINT start, UINT NumBuffers, ID3D11Buffer** ppVBs,
-    UINT* pStrides, UINT* pOffsets)
+void STDMETHODCALLTYPE Dx12Context::IAGetVertexBuffers(
+    UINT start, UINT NumBuffers, ID3D11Buffer** ppVBs, UINT* pStrides, UINT* pOffsets)
 {
     PipeState& st = State();
     GetSlots(ppVBs, NumBuffers, st.vb, kMaxVB, start);
@@ -1289,8 +1307,8 @@ void STDMETHODCALLTYPE Dx12Context::IAGetPrimitiveTopology(D3D11_PRIMITIVE_TOPOL
     if (topo) *topo = State().topology;
 }
 
-void STDMETHODCALLTYPE Dx12Context::OMGetRenderTargets(UINT NumViews, ID3D11RenderTargetView** ppRTVs,
-    ID3D11DepthStencilView** ppDSV)
+void STDMETHODCALLTYPE Dx12Context::OMGetRenderTargets(
+    UINT NumViews, ID3D11RenderTargetView** ppRTVs, ID3D11DepthStencilView** ppDSV)
 {
     PipeState& st = State();
     GetSlots(ppRTVs, NumViews, st.rtv, kMaxRTV, 0);
@@ -1300,9 +1318,9 @@ void STDMETHODCALLTYPE Dx12Context::OMGetRenderTargets(UINT NumViews, ID3D11Rend
     }
 }
 
-void STDMETHODCALLTYPE Dx12Context::OMGetRenderTargetsAndUnorderedAccessViews(
-    UINT NumRTVs, ID3D11RenderTargetView** ppRTVs, ID3D11DepthStencilView** ppDSV,
-    UINT UAVStart, UINT NumUAVs, ID3D11UnorderedAccessView** ppUAVs)
+void STDMETHODCALLTYPE Dx12Context::OMGetRenderTargetsAndUnorderedAccessViews(UINT NumRTVs,
+    ID3D11RenderTargetView** ppRTVs, ID3D11DepthStencilView** ppDSV, UINT UAVStart, UINT NumUAVs,
+    ID3D11UnorderedAccessView** ppUAVs)
 {
     OMGetRenderTargets(NumRTVs, ppRTVs, ppDSV);
     GetSlots(ppUAVs, NumUAVs, State().uav, kMaxUAV, UAVStart);
@@ -1342,24 +1360,14 @@ void STDMETHODCALLTYPE Dx12Context::RSGetState(ID3D11RasterizerState** rs)
 void STDMETHODCALLTYPE Dx12Context::RSGetViewports(UINT* pNum, D3D11_VIEWPORT* vp)
 {
     if (!pNum) return;
-    PipeState&        st = State();
-    const Dx12Bridge& b = GetDx12Bridge();
-    const bool        have = st.has_viewport || (b.rt_width && b.rt_height);
+    const PipeState& st = State();
     if (!vp) {
-        *pNum = have ? 1u : 0u;
+        *pNum = st.has_viewport ? 1u : 0u;
         return;
     }
     if (*pNum == 0) return;
-    if (st.has_viewport) {
-        vp[0] = st.viewport;
-        *pNum = 1;
-    } else if (b.rt_width && b.rt_height) {
-        vp[0] = D3D11_VIEWPORT{ 0.0f, 0.0f, (float)b.rt_width,
-            (float)b.rt_height, 0.0f, 1.0f };
-        *pNum = 1;
-    } else {
-        *pNum = 0;
-    }
+    if (st.has_viewport) vp[0] = st.viewport;
+    *pNum = st.has_viewport ? 1u : 0u;
 }
 
 void STDMETHODCALLTYPE Dx12Context::SOGetTargets(UINT NumBuffers, ID3D11Buffer** ppSOTargets)
@@ -1385,9 +1393,9 @@ void GetCbsOut(char stage, UINT start, UINT num, ID3D11Buffer** out)
 {
     if (!out) return;
     PipeState& st = State();
-    const int  si = StageIndex(stage);
+    const int si = StageIndex(stage);
     for (UINT i = 0; i < num; ++i) {
-        const UINT    slot = start + i;
+        const UINT slot = start + i;
         ID3D11Buffer* b = (si >= 0 && slot < kMaxCB) ? st.cb[si][slot] : nullptr;
         out[i] = b;
         if (b) b->AddRef(); // Get* AddRefs; their engine Releases what it is handed
@@ -1397,10 +1405,11 @@ void GetCbsOut(char stage, UINT start, UINT num, ID3D11Buffer** out)
 void GetSrvsOut(char stage, UINT start, UINT num, ID3D11ShaderResourceView** out)
 {
     if (!out) return;
+    InheritSrvsForRead(stage, start, num);
     PipeState& st = State();
-    const int  si = StageIndex(stage);
+    const int si = StageIndex(stage);
     for (UINT i = 0; i < num; ++i) {
-        const UINT                slot = start + i;
+        const UINT slot = start + i;
         ID3D11ShaderResourceView* v = (si >= 0 && slot < kMaxSRV) ? st.srv[si][slot] : nullptr;
         out[i] = v;
         if (v) v->AddRef();
@@ -1411,9 +1420,9 @@ void GetSamplersOut(char stage, UINT start, UINT num, ID3D11SamplerState** out)
 {
     if (!out) return;
     PipeState& st = State();
-    const int  si = StageIndex(stage);
+    const int si = StageIndex(stage);
     for (UINT i = 0; i < num; ++i) {
-        const UINT          slot = start + i;
+        const UINT slot = start + i;
         ID3D11SamplerState* s = (si >= 0 && slot < kMaxSamp) ? st.samp[si][slot] : nullptr;
         out[i] = s;
         if (s) s->AddRef();
@@ -1491,32 +1500,38 @@ static void PortGetCbs1(UINT NumBuffers, UINT* pFirstConstant, UINT* pNumConstan
         if (pNumConstants) pNumConstants[i] = 0; // 0 = whole buffer, theirs' own convention
     }
 }
-void STDMETHODCALLTYPE Dx12Context::VSGetConstantBuffers1(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+void STDMETHODCALLTYPE Dx12Context::VSGetConstantBuffers1(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     VSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
     PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
 }
-void STDMETHODCALLTYPE Dx12Context::HSGetConstantBuffers1(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+void STDMETHODCALLTYPE Dx12Context::HSGetConstantBuffers1(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     HSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
     PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
 }
-void STDMETHODCALLTYPE Dx12Context::DSGetConstantBuffers1(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+void STDMETHODCALLTYPE Dx12Context::DSGetConstantBuffers1(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     DSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
     PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
 }
-void STDMETHODCALLTYPE Dx12Context::GSGetConstantBuffers1(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+void STDMETHODCALLTYPE Dx12Context::GSGetConstantBuffers1(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     GSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
     PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
 }
-void STDMETHODCALLTYPE Dx12Context::PSGetConstantBuffers1(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+void STDMETHODCALLTYPE Dx12Context::PSGetConstantBuffers1(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     PSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
     PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
 }
-void STDMETHODCALLTYPE Dx12Context::CSGetConstantBuffers1(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+void STDMETHODCALLTYPE Dx12Context::CSGetConstantBuffers1(
+    UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     CSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
     PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);

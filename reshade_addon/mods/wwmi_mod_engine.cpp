@@ -26,7 +26,7 @@
 // ===========================================================================
 #include "wwmi_mod.h"
 #include "../migoto/port_api.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 
 #include <algorithm>
 #include <cstdio> // swscanf_s -- drawindexed parsing
@@ -116,10 +116,14 @@ bool QueriesPsSlot(const wchar_t* line)
     if (!eq) return NamesPsSlot(line, true);
     const wchar_t* k = line;
     for (;;) {
-        if (!_wcsnicmp(k, L"pre ", 4)) k += 4;
-        else if (!_wcsnicmp(k, L"post ", 5)) k += 5;
-        else if (!_wcsnicmp(k, L"local ", 6)) k += 6;
-        else break;
+        if (!_wcsnicmp(k, L"pre ", 4))
+            k += 4;
+        else if (!_wcsnicmp(k, L"post ", 5))
+            k += 5;
+        else if (!_wcsnicmp(k, L"local ", 6))
+            k += 6;
+        else
+            break;
         while (*k == L' ') ++k;
     }
     std::wstring target(k, eq);
@@ -129,11 +133,11 @@ bool QueriesPsSlot(const wchar_t* line)
 }
 
 struct KeyCtx {
-    Component*            comp;
+    Component* comp;
     std::vector<SubDraw>* draws;
-    std::wstring          ns;           // author-case namespace, for constructing CustomShader names
-    std::wstring          pending_cond; // `if <expr>` currently open; recorded for the log only
-    int                   depth;        // run-expansion depth guard
+    std::wstring ns; // author-case namespace, for constructing CustomShader names
+    std::wstring pending_cond; // `if <expr>` currently open; recorded for the log only
+    int depth; // run-expansion depth guard
 };
 
 void OnKey(const wchar_t* key, const wchar_t* val, void* user);
@@ -146,13 +150,13 @@ void ExpandRun(KeyCtx* k, const std::wstring& target)
     if (tail.empty() || tail[0] == L'\\') return; // namespaced framework shader, not a part
 
     const std::wstring fq = L"CustomShader\\" + k->ns + L"\\" + tail;
-    KeyCtx             sub{ k->comp, k->draws, k->ns, k->pending_cond, k->depth + 1 };
+    KeyCtx sub{ k->comp, k->draws, k->ns, k->pending_cond, k->depth + 1 };
     PortApi::ForEachSectionKey(fq.c_str(), &OnKey, &sub);
 }
 
 void OnKey(const wchar_t* key, const wchar_t* val, void* user)
 {
-    KeyCtx*            k = (KeyCtx*)user;
+    KeyCtx* k = (KeyCtx*)user;
     const std::wstring lk = Lower(key ? key : L"");
     const std::wstring v = val ? val : L"";
 
@@ -208,22 +212,22 @@ void OnKey(const wchar_t* key, const wchar_t* val, void* user)
 }
 
 struct RemapInfo {
-    int      comp_idx;
-    int      id;
+    int comp_idx;
+    int id;
     uint32_t vg;
 };
 
 struct RemapCtx {
     std::vector<RemapInfo>* out;
-    int                     rm_id = -1;
-    uint32_t                rm_vg = 0;
+    int rm_id = -1;
+    uint32_t rm_vg = 0;
 };
 
 void OnRemapKey(const wchar_t* key, const wchar_t* val, void* user)
 {
-    RemapCtx*                 r = (RemapCtx*)user;
-    const std::wstring        lk = Lower(key ? key : L"");
-    const std::wstring        v = val ? val : L"";
+    RemapCtx* r = (RemapCtx*)user;
+    const std::wstring lk = Lower(key ? key : L"");
+    const std::wstring v = val ? val : L"";
     static const std::wstring kPrimary = L"resourceremappedskeletoncomponent";
 
     if (lk == L"$\\wwmiv1\\blend_remap_id") {
@@ -244,29 +248,76 @@ void OnRemapKey(const wchar_t* key, const wchar_t* val, void* user)
 }
 
 struct ResCtx {
-    const std::wstring*    ns_lower;
+    const std::wstring* ns_lower;
     std::vector<Resource>* out;
 };
 
+bool MakeResource(const std::wstring& fq, const wchar_t* filename, Resource& r)
+{
+    const size_t last = fq.find_last_of(L'\\');
+    if (last == std::wstring::npos) return false;
+    r.name = L"Resource" + fq.substr(last + 1);
+    r.fq = fq; // their key -- how the buffer is asked for later
+    r.filename = filename ? filename : L"";
+    return true;
+}
+
 void OnResource(const wchar_t* fq_name, const wchar_t* filename, int /*type*/, bool /*substantiated*/,
-    ID3D12Resource* /*dx12*/, void*                    user)
+    ID3D12Resource* /*dx12*/, void* user)
 {
     ResCtx* c = (ResCtx*)user;
     if (!fq_name) return;
     const std::wstring fq = fq_name;
     if (Lower(NsOfFq(fq)) != *c->ns_lower) return;
-
-    const size_t last = fq.find_last_of(L'\\');
-    if (last == std::wstring::npos) return;
-
     Resource r;
-    r.name = L"Resource" + fq.substr(last + 1);
-    r.fq = fq; // their key -- how the buffer is asked for later
-    r.filename = filename ? filename : L"";
-    c->out->push_back(std::move(r));
+    if (MakeResource(fq, filename, r)) c->out->push_back(std::move(r));
+}
+
+void OnResourceGrouped(const wchar_t* fq_name, const wchar_t* filename, int /*type*/, bool /*substantiated*/,
+    ID3D12Resource* /*dx12*/, void* user)
+{
+    if (!fq_name) return;
+    const std::wstring fq = fq_name;
+    Resource r;
+    if (MakeResource(fq, filename, r))
+        (*(std::unordered_map<std::wstring, NsEntries>*)user)[Lower(NsOfFq(fq))].resources.push_back(std::move(r));
+}
+
+NsEntries EntriesOfNs(const std::wstring& ns_lower)
+{
+    NsEntries e;
+    struct RangedCtx {
+        const std::wstring* ns_lower;
+        std::vector<std::wstring>* fqs;
+    } rc{ &ns_lower, &e.ranged_overrides };
+    PortApi::ForEachTextureOverride(
+        [](uint32_t hash, const wchar_t* fq, bool ranged, const wchar_t*, bool, void* user) {
+            auto* c = (RangedCtx*)user;
+            if (hash && ranged && fq && Lower(NsOfFq(fq)) == *c->ns_lower) c->fqs->push_back(fq);
+        },
+        &rc);
+    std::sort(e.ranged_overrides.begin(), e.ranged_overrides.end());
+    ResCtx res{ &ns_lower, &e.resources };
+    PortApi::ForEachCustomResource(&OnResource, &res);
+    return e;
 }
 
 } // namespace
+
+std::unordered_map<std::wstring, NsEntries> GroupByNamespace()
+{
+    std::unordered_map<std::wstring, NsEntries> groups;
+    PortApi::ForEachTextureOverride(
+        [](uint32_t hash, const wchar_t* fq, bool ranged, const wchar_t*, bool, void* user) {
+            if (hash && ranged && fq)
+                (*(std::unordered_map<std::wstring, NsEntries>*)user)[Lower(NsOfFq(fq))].ranged_overrides.push_back(
+                    fq);
+        },
+        &groups);
+    for (auto& kv : groups) std::sort(kv.second.ranged_overrides.begin(), kv.second.ranged_overrides.end());
+    PortApi::ForEachCustomResource(&OnResourceGrouped, &groups);
+    return groups;
+}
 
 // Read one component section into `out`. `fq_section` is their registered name.
 static bool ReadComponent(const std::wstring& fq_section, int index, Component& out)
@@ -280,7 +331,7 @@ static bool ReadComponent(const std::wstring& fq_section, int index, Component& 
 }
 
 // The whole mod layout for a namespace, straight from the engine. Returns the number of components read.
-int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
+static int ReadModFrom(const std::wstring& ns, const std::unordered_map<std::wstring, NsEntries>* groups, Mod& out)
 {
     out = Mod{};
 
@@ -294,10 +345,17 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
         }
     }
     if (ns_fq.empty()) ns_fq = ns;
+    const std::wstring ns_lower = Lower(ns_fq);
+    NsEntries own;
+    const NsEntries* entries = &own;
+    if (!groups)
+        own = EntriesOfNs(ns_lower);
+    else if (const auto it = groups->find(ns_lower); it != groups->end())
+        entries = &it->second;
 
     // Components are numbered from 0 and dense in every shipped WWMI mod: the first gap ends the scan.
     for (int i = 0;; ++i) {
-        wchar_t            fq[512] = {};
+        wchar_t fq[512] = {};
         const std::wstring sec = L"Component" + std::to_wstring(i);
         if (!PortApi::ResolveSection(ns.c_str(), nullptr, sec.c_str(), fq, std::size(fq)) || !fq[0]) break;
         Component c;
@@ -306,20 +364,9 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
     }
 
     {
-        struct RangedCtx {
-            std::wstring              ns_lower;
-            std::vector<std::wstring> fqs;
-        } rc{ Lower(ns_fq), {} };
-        PortApi::ForEachTextureOverride(
-            [](uint32_t hash, const wchar_t* fq, bool ranged, const wchar_t*, void* user) {
-                auto* c = (RangedCtx*)user;
-                if (hash && ranged && fq && Lower(NsOfFq(fq)) == c->ns_lower) c->fqs.push_back(fq);
-            },
-            &rc);
-        std::sort(rc.fqs.begin(), rc.fqs.end());
         int next = 0;
         for (const Component& c : out.comps) next = (std::max)(next, c.index + 1);
-        for (const std::wstring& fq : rc.fqs) {
+        for (const std::wstring& fq : entries->ranged_overrides) {
             const std::wstring tail = TailOfFq(fq);
             if (std::any_of(out.comps.begin(), out.comps.end(),
                     [&](const Component& c) { return _wcsicmp(c.tail.c_str(), tail.c_str()) == 0; }))
@@ -342,7 +389,7 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
 
     {
         std::vector<RemapInfo> remaps;
-        wchar_t                fq[512] = {};
+        wchar_t fq[512] = {};
         if (PortApi::ResolveSection(ns.c_str(), nullptr, L"RemapMergedSkeleton", fq, std::size(fq)) && fq[0]) {
             RemapCtx rc;
             rc.out = &remaps;
@@ -359,11 +406,9 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
 
     // Resources, from their [Resource*] store, filtered to this namespace.
     {
-        const std::wstring ns_lower = Lower(ns_fq);
-        ResCtx             rc{ &ns_lower, &out.resources };
-        PortApi::ForEachCustomResource(&OnResource, &rc);
+        out.resources = entries->resources;
         std::set<std::wstring> seen;
-        std::vector<Resource>  uniq;
+        std::vector<Resource> uniq;
         uniq.reserve(out.resources.size());
         for (auto& r : out.resources)
             if (seen.insert(Lower(r.name)).second) uniq.push_back(std::move(r));
@@ -394,12 +439,21 @@ int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
     out.object_guid = (int)PortApi::GetVarNs(ns.c_str(), L"object_guid", 0.f);
     out.mesh_vertex_count = (uint32_t)PortApi::GetVarNs(ns.c_str(), L"mesh_vertex_count", 0.f);
 
-    logger::write("WwmiMod: ns='%ls' -> %zu comp(s), %zu resource(s), guid=%d verts=%u dir='%ls'%s%s",
-        ns.c_str(), out.comps.size(), out.resources.size(), out.object_guid,
-        out.mesh_vertex_count, out.dir.c_str(),
+    logger::write("WwmiMod: ns='%ls' -> %zu comp(s), %zu resource(s), guid=%d verts=%u dir='%ls'%s%s", ns.c_str(),
+        out.comps.size(), out.resources.size(), out.object_guid, out.mesh_vertex_count, out.dir.c_str(),
         out.forward_map_file.empty() ? "" : " (has fwdmap)",
         out.queries_ps_slots ? " (asks what the game bound in ps-tN: every read slot published)" : "");
     return (int)out.comps.size();
+}
+
+int ReadMod(const std::wstring& ns, const std::unordered_map<std::wstring, NsEntries>& groups, Mod& out)
+{
+    return ReadModFrom(ns, &groups, out);
+}
+
+int ReadComponentsFromEngine(const std::wstring& ns, Mod& out)
+{
+    return ReadModFrom(ns, nullptr, out);
 }
 
 } // namespace WwmiMod

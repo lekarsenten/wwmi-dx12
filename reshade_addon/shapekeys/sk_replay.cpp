@@ -1,41 +1,35 @@
-// RunShapeKeyPasses: one mod instance's queued lists, replayed on its first draw of the frame. See sk_internal.h.
+// The replay: one mod instance's queued lists, run on its first draw of the frame. See sk_internal.h.
 #include "sk_internal.h"
+#include "../mods/mod_set.h"
 #include "../instrumentation/sk_ring.h"
 #include "../instrumentation/morph_dump.h"
 #include "../instrumentation/profiler.h"
+
+ShapekeyReplay g_sk_replay(g_sk_store, g_sk_queue, g_sk_identity);
 
 static int SkInstDiagKey(int mod_id, ID3D12Resource* inst)
 {
     return (int)(((uint64_t)(unsigned)mod_id << 24) ^ (reinterpret_cast<uintptr_t>(inst) >> 4));
 }
 
-static bool SkFirstDrawThisFrame(int mod_id, ID3D12Resource* inst, const void* cl, MorphDump::DrainRecord& dr)
+bool ShapekeyReplay::FirstDrawThisFrame(int mod_id, ID3D12Resource* inst, const void* cl, MorphDump::DrainRecord& dr)
 {
-    struct OrdState {
-        uint32_t    frame;
-        uint32_t    draws;
-        uint32_t    nlists;
-        const void* lists[8];
-        const void* pass_cl;
-    };
-    static std::mutex                                          ord_m;
-    static std::map<std::pair<int, ID3D12Resource*>, OrdState> ord_st;
     // The ended frame's numbers, copied out under the lock and reported after it.
-    bool        report = false;
-    uint32_t    rep_frame = 0;
-    uint32_t    rep_draws = 0;
-    uint32_t    rep_nlists = 0;
+    bool report = false;
+    uint32_t rep_frame = 0;
+    uint32_t rep_draws = 0;
+    uint32_t rep_nlists = 0;
     const void* rep_pass_cl = nullptr;
     const void* rep_lists[8] = {};
     {
-        std::lock_guard<std::mutex> l(ord_m);
-        if (ord_st.size() > 64)
-            for (auto it = ord_st.begin(); it != ord_st.end();)
+        std::lock_guard<std::mutex> l(ord_mutex_);
+        if (ord_st_.size() > 64)
+            for (auto it = ord_st_.begin(); it != ord_st_.end();)
                 if ((uint32_t)(g_frame_id - it->second.frame) > 300u)
-                    it = ord_st.erase(it);
+                    it = ord_st_.erase(it);
                 else
                     ++it;
-        OrdState& s = ord_st[{ mod_id, inst }];
+        OrdState& s = ord_st_[{ mod_id, inst }];
         if (s.frame == g_frame_id) {
             // A later draw of this mod in the same frame: the passes already ran on the first list.
             ++s.draws;
@@ -66,12 +60,12 @@ static bool SkFirstDrawThisFrame(int mod_id, ID3D12Resource* inst, const void* c
         }
     }
     if (report) {
-        const int   pass_at = SubmitIndexOf(rep_frame, rep_pass_cl);
-        const void* disp_cl = SkDispListForFrame(rep_frame);                    // per-frame slot, not the global
-        const int   disp_at = disp_cl ? SubmitIndexOf(rep_frame, disp_cl) : -2; // -2 = no dispatch seen
-        int         earliest = 0x7fffffff;
-        int         unsub = 0;
-        int         before = 0;
+        const int pass_at = SubmitIndexOf(rep_frame, rep_pass_cl);
+        const void* disp_cl = queue_.DispListForFrame(rep_frame); // per-frame slot, not the global
+        const int disp_at = disp_cl ? SubmitIndexOf(rep_frame, disp_cl) : -2; // -2 = no dispatch seen
+        int earliest = 0x7fffffff;
+        int unsub = 0;
+        int before = 0;
         for (uint32_t i = 0; i < rep_nlists; ++i) {
             const int at = SubmitIndexOf(rep_frame, rep_lists[i]);
             if (at < 0) {
@@ -82,7 +76,8 @@ static bool SkFirstDrawThisFrame(int mod_id, ID3D12Resource* inst, const void* c
             if (pass_at >= 0 && at < pass_at) ++before;
         }
         if (earliest == 0x7fffffff) earliest = -1;
-        const uint64_t key = (uint64_t)rep_nlists * 1000000000ull + (uint64_t)(pass_at + 1) * 1000000ull + (uint64_t)(disp_at + 3) * 1000ull + (uint64_t)(before + 1);
+        const uint64_t key = (uint64_t)rep_nlists * 1000000000ull + (uint64_t)(pass_at + 1) * 1000000ull +
+            (uint64_t)(disp_at + 3) * 1000ull + (uint64_t)(before + 1);
         if (DiagChanged("SHAPEKEY-ORDER", SkInstDiagKey(mod_id, inst), key))
             logger::write("SHAPEKEY-ORDER mod=%d inst=%p f=%u: %u draw(s) across %u list(s); pass@%d "
                           "earliest@%d disp@%d before=%d unsubmitted=%d (submissions seen: %llu). "
@@ -95,136 +90,78 @@ static bool SkFirstDrawThisFrame(int mod_id, ID3D12Resource* inst, const void* c
     return true;
 }
 
-// This mod instance's queued lists, taken out of the queue (the rest stay for their owners).
-static std::vector<SkPendingList> SkTakeOwnLists(const std::wstring& ns, int mod_id, ID3D12Resource* inst,
-    MorphDump::DrainRecord& dr,
-    size_t& left_for_others, size_t& sk_dropped_unowned,
-    size_t& other_inst_lists, ID3D12Resource*& other_inst)
-{
-    std::vector<SkPendingList> lists;
-    auto                       owned_by_ns = [&](const std::wstring& key) {
-        if (key.empty() || ns.empty()) return false;
-        std::wstring k = key;
-        std::wstring n = ns;
-        for (wchar_t& c : k) c = (wchar_t)towlower(c);
-        for (wchar_t& c : n) c = (wchar_t)towlower(c);
-        return k.find(n) != std::wstring::npos;
-    };
-    {
-        std::lock_guard<std::mutex> l(g_sk_pending_mtx);
-        dr.pending_in = (unsigned)g_sk_pending.size(); // the queue's depth BEFORE we filter it
-        std::vector<SkPendingList> keep;
-        for (auto& e : g_sk_pending) {
-            bool mine;
-            if (e.owner_mod >= 0) {
-                mine = (e.owner_mod == mod_id);
-            } else if (g_sk_strict_owner) {
-                mine = false;
-                ++sk_dropped_unowned;
-                continue; // dropped, NOT kept: nothing else will ever claim it either
-            } else {
-                mine = (e.u0hash && PortApi::ModDeclaresHash(ns.c_str(), e.u0hash)) || owned_by_ns(e.ns);
-            }
-            if (mine && e.inst && e.inst != inst) {
-                mine = false;
-                ++other_inst_lists;
-                other_inst = e.inst;
-            }
-            if (mine)
-                lists.push_back(e);
-            else
-                keep.push_back(std::move(e));
-        }
-        left_for_others = keep.size();
-        g_sk_pending.swap(keep); // whatever we did not claim stays queued for its owner
-    }
-    return lists;
-}
-
 // u0 from the mod's own declared hash when the dispatch left no live binding.
-static void SkOwnBufFallback(const std::wstring& ns, int mod_id, unsigned u0hash, ID3D12Resource*& u0_res, unsigned& u0_bytes)
+void ShapekeyReplay::OwnBufFallback(
+    const std::wstring& ns, int mod_id, unsigned u0hash, ID3D12Resource*& u0_res, unsigned& u0_bytes)
 {
     {
         PROF(PROF_SK_OwnBuf);
-        const unsigned want = SkModCbFor(mod_id, u0hash);
+        const unsigned want = identity_.ModCbFor(mod_id, u0hash);
         if (want) {
             ID3D12Resource* own = nullptr;
-            unsigned        own_bytes = 0;
-            uint64_t        own_va = 0;
-            {
-                std::lock_guard lock(g_mem_mutex);
-                for (const auto& kv : g_va_to_res) {
-                    if (!kv.second.size || !kv.second.res) continue;
-                    if (PortApi::GameComputeUavBufferHash(kv.second.size) != want) continue;
-                    own = kv.second.res;
-                    own_bytes = kv.second.size;
-                    own_va = kv.first;
-                    break;
-                }
-            }
+            unsigned own_bytes = 0;
+            uint64_t own_va = 0;
+            g_resources.ForEachBuffer([&](uint64_t va, const ResInfo& ri) {
+                if (!ri.size || !ri.res) return false;
+                if (PortApi::GameComputeUavBufferHash(ri.size) != want) return false;
+                own = ri.res;
+                own_bytes = ri.size;
+                own_va = va;
+                return true;
+            });
             bool bound_live = false; // a dispatch binding the game has since destroyed is as good as none
-            if (u0_res) {
-                std::lock_guard lock(g_mem_mutex);
-                bound_live = g_res_to_va.find(reinterpret_cast<uint64_t>(u0_res)) != g_res_to_va.end();
-            }
+            if (u0_res) bound_live = g_resources.Live(u0_res);
             if ((!u0_res || !bound_live) && own && own_va) {
                 u0_res = own;
                 u0_bytes = own_bytes;
-            } else if (own && own_va && own != u0_res && logger::enabled(1) && DiagChanged("SHAPEKEY-OWNBUF-DISAGREES", mod_id, reinterpret_cast<unsigned long long>(own) ^ reinterpret_cast<unsigned long long>(u0_res)))
+            } else if (own && own_va && own != u0_res && logger::enabled(1) &&
+                DiagChanged("SHAPEKEY-OWNBUF-DISAGREES", mod_id,
+                    reinterpret_cast<unsigned long long>(own) ^ reinterpret_cast<unsigned long long>(u0_res)))
                 logger::write("SHAPEKEY-OWNBUF: the declared-hash search met %p (%u B) first, the dispatch bound %p "
                               "(%u B) -- the dispatch wins (two live instances of this size, or a relocation)",
                     (void*)own, own_bytes, (void*)u0_res, u0_bytes);
             if (logger::enabled(1) && DiagChanged("SHAPEKEY-OWNBUF", mod_id, own_bytes))
-                logger::write("SHAPEKEY-OWNBUF mod=%d ns='%ls' declares %08x -> %s (%u bytes)",
-                    mod_id, ns.c_str(), want,
-                    own ? "found its own buffer" : "NOT FOUND among live buffers", own_bytes);
+                logger::write("SHAPEKEY-OWNBUF mod=%d ns='%ls' declares %08x -> %s (%u bytes)", mod_id, ns.c_str(),
+                    want, own ? "found its own buffer" : "NOT FOUND among live buffers", own_bytes);
         }
     }
 }
 
 // cs-u0, u1 and cb0 republished for this mod instance before its passes run.
-static void SkRepublishBindings(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
-    ID3D12Resource* u0_res, unsigned u0_bytes)
+void ShapekeyReplay::RepublishBindings(
+    const std::wstring& ns, ID3D12Resource* inst, int mod_id, ID3D12Resource* u0_res, unsigned u0_bytes)
 {
     if (u0_res && u0_bytes) {
         uint64_t va = 0;
-        {
-            std::lock_guard lock(g_mem_mutex);
-            auto            vi = g_res_to_va.find(reinterpret_cast<uint64_t>(u0_res));
-            if (vi != g_res_to_va.end()) va = vi->second;
-        }
+        g_resources.VaOf(reinterpret_cast<uint64_t>(u0_res), &va);
         if (va) PortApi::PushGameComputeUav(0, u0_res, u0_bytes, va);
         {
             ID3D12Resource* u1r = nullptr;
-            unsigned        u1b = 0;
-            uint64_t        u1va = 0;
+            unsigned u1b = 0;
+            uint64_t u1va = 0;
             SkBufferBinding u1_bind{};
-            if (SkGetBinding(ns, inst, TargetClass::UnorderedAccessView, 1, &u1_bind)) {
+            if (store_.GetBinding(ns, inst, TargetClass::UnorderedAccessView, 1, &u1_bind)) {
                 u1r = u1_bind.res;
                 u1b = u1_bind.bytes;
             } else {
                 u1r = nullptr;
                 u1b = 0;
             }
-            if (u1r && u1b) {
-                std::lock_guard lock(g_mem_mutex);
-                auto            vi = g_res_to_va.find(reinterpret_cast<uint64_t>(u1r));
-                if (vi != g_res_to_va.end()) u1va = vi->second; // liveness + the live VA, one lookup
-            }
+            if (u1r && u1b)
+                g_resources.VaOf(reinterpret_cast<uint64_t>(u1r), &u1va); // liveness + the live VA, one lookup
             if (u1r && u1va) PortApi::PushGameComputeUav(1, u1r, u1b, u1va);
             SkRing::Note(SkRing::U1Bind, (uint64_t)mod_id, (uint64_t)u1r, u1b, (u1r && u1va) ? 1u : 0u);
             if (logger::enabled(1) && DiagChanged("SHAPEKEY-U1", mod_id, u1b))
                 logger::write("SHAPEKEY-U1 mod=%d ns='%ls' -> %s (%u bytes) [from the dispatch's own "
                               "table, by declared ShapeKeyScale hash]",
-                    mod_id, ns.c_str(),
-                    (u1r && u1va) ? "bound" : "NOT CAPTURED at the dispatch", u1b);
+                    mod_id, ns.c_str(), (u1r && u1va) ? "bound" : "NOT CAPTURED at the dispatch", u1b);
         }
         ID3D12Resource* ns_cb0_res = nullptr;
-        uint64_t        ns_cb0_va = 0;
-        unsigned        ns_cb0_size = 0;
+        uint64_t ns_cb0_va = 0;
+        unsigned ns_cb0_size = 0;
         {
             SkBufferBinding cb{};
-            if (SkGetBinding(ns, inst, TargetClass::ConstantBuffer, 0, &cb)) {
+            if (store_.GetBinding(ns, inst, TargetClass::ConstantBuffer, 0, &cb)) {
                 ns_cb0_res = cb.res;
                 ns_cb0_va = cb.va;
                 ns_cb0_size = cb.bytes;
@@ -232,11 +169,7 @@ static void SkRepublishBindings(const std::wstring& ns, ID3D12Resource* inst, in
         }
         if (ns_cb0_res && ns_cb0_va) {
             uint64_t vac = 0;
-            {
-                std::lock_guard lock(g_mem_mutex);
-                auto            vi = g_res_to_va.find(reinterpret_cast<uint64_t>(ns_cb0_res));
-                if (vi != g_res_to_va.end()) vac = vi->second;
-            }
+            g_resources.VaOf(reinterpret_cast<uint64_t>(ns_cb0_res), &vac);
             constexpr unsigned kShapeKeyCB0Bytes = ((66u * 16u) + 255u) & ~255u; // cb0[66] -> 1280
             if (vac) PortApi::PushGameConstantBuffer('c', 0, ns_cb0_res, ns_cb0_va, kShapeKeyCB0Bytes);
         } else if (logger::enabled(1)) {
@@ -249,54 +182,52 @@ static void SkRepublishBindings(const std::wstring& ns, ID3D12Resource* inst, in
 }
 
 // The game's whole compute state for this mod instance replayed under the passes (UAVs past u1, CBVs).
-static void SkReplayComputeState(const std::wstring& ns, ID3D12Resource* inst, int mod_id)
+void ShapekeyReplay::ReplayComputeState(const std::wstring& ns, ID3D12Resource* inst, int mod_id)
 {
     {
         SkComputeState s;
-        if (!SkGetStateForNs(ns, inst, &s)) s = SkComputeState{};
+        if (!store_.GetState(ns, inst, &s)) s = SkComputeState{};
         if (s.valid) {
             unsigned n_uav = 0;
             unsigned n_cbv = 0;
             for (unsigned u = 0; u < RegisterFileWidth(TargetClass::UnorderedAccessView); ++u) {
                 if (u <= 1) continue;
-                if (!SkReg(s, TargetClass::UnorderedAccessView, u).res || !SkReg(s, TargetClass::UnorderedAccessView, u).bytes) continue;
+                if (!SkReg(s, TargetClass::UnorderedAccessView, u).res ||
+                    !SkReg(s, TargetClass::UnorderedAccessView, u).bytes)
+                    continue;
                 uint64_t va = 0;
-                {
-                    std::lock_guard lock(g_mem_mutex);
-                    auto            vi = g_res_to_va.find(reinterpret_cast<uint64_t>(SkReg(s, TargetClass::UnorderedAccessView, u).res));
-                    if (vi != g_res_to_va.end()) va = vi->second;
-                }
+                g_resources.VaOf(reinterpret_cast<uint64_t>(SkReg(s, TargetClass::UnorderedAccessView, u).res), &va);
                 if (!va) continue;
                 if ((SkReg(s, TargetClass::UnorderedAccessView, u).bytes & 3u) || (va & 3ull)) continue;
-                PortApi::PushGameComputeUav(u, SkReg(s, TargetClass::UnorderedAccessView, u).res, SkReg(s, TargetClass::UnorderedAccessView, u).bytes, va);
+                PortApi::PushGameComputeUav(u, SkReg(s, TargetClass::UnorderedAccessView, u).res,
+                    SkReg(s, TargetClass::UnorderedAccessView, u).bytes, va);
                 ++n_uav;
             }
             for (unsigned b = 0; b < RegisterFileWidth(TargetClass::ConstantBuffer); ++b) {
-                if (b == 0 && g_sk_cb0_snapshot) {
+                if (b == 0 && g_sk_toggles.cb0_snapshot) {
                     if (g_debug && LogBudget("CB0SNAP-SKIP", ns, 4))
                         logger::write("CB0SNAP: state replay SKIPPED b0 for ns='%ls' -- each pass "
                                       "publishes its own snapshot just before it runs (CB0PASS).",
                             ns.c_str());
                     continue;
                 }
-                if (!SkReg(s, TargetClass::ConstantBuffer, b).res || !SkReg(s, TargetClass::ConstantBuffer, b).va) continue;
+                if (!SkReg(s, TargetClass::ConstantBuffer, b).res || !SkReg(s, TargetClass::ConstantBuffer, b).va)
+                    continue;
                 uint64_t live = 0;
-                {
-                    std::lock_guard lock(g_mem_mutex);
-                    auto            vi = g_res_to_va.find(reinterpret_cast<uint64_t>(SkReg(s, TargetClass::ConstantBuffer, b).res));
-                    if (vi != g_res_to_va.end()) live = vi->second;
-                }
+                g_resources.VaOf(reinterpret_cast<uint64_t>(SkReg(s, TargetClass::ConstantBuffer, b).res), &live);
                 if (!live) continue; // destroyed since capture: bind nothing, never deref
                 unsigned sz = SkReg(s, TargetClass::ConstantBuffer, b).bytes;
                 if (b == 0) sz = ((66u * 16u) + 255u) & ~255u;
                 if (sz == 0u || sz == 0xFFFFFFFFu) {
                     // Safe to dereference ONLY because `live` above proved it is still alive.
                     const D3D12_RESOURCE_DESC rd = SkReg(s, TargetClass::ConstantBuffer, b).res->GetDesc();
-                    const uint64_t            base = live; // the VA the map just gave us
-                    const uint64_t            off = (SkReg(s, TargetClass::ConstantBuffer, b).va >= base) ? (SkReg(s, TargetClass::ConstantBuffer, b).va - base) : 0;
+                    const uint64_t base = live; // the VA the map just gave us
+                    const uint64_t off = (SkReg(s, TargetClass::ConstantBuffer, b).va >= base)
+                        ? (SkReg(s, TargetClass::ConstantBuffer, b).va - base)
+                        : 0;
                     sz = (rd.Width > off) ? (unsigned)(rd.Width - off) : 0;
                     if (sz > 65536u) sz = 65536u; // D3D12 CBV maximum
-                    sz &= ~255u;                  // CBVs must be 256-byte aligned
+                    sz &= ~255u; // CBVs must be 256-byte aligned
                 }
                 if (!sz) continue;
                 if (SkReg(s, TargetClass::ConstantBuffer, b).va & 255ull) {
@@ -310,7 +241,8 @@ static void SkReplayComputeState(const std::wstring& ns, ID3D12Resource* inst, i
                     }
                     continue;
                 }
-                PortApi::PushGameConstantBuffer('c', b, SkReg(s, TargetClass::ConstantBuffer, b).res, SkReg(s, TargetClass::ConstantBuffer, b).va, sz);
+                PortApi::PushGameConstantBuffer('c', b, SkReg(s, TargetClass::ConstantBuffer, b).res,
+                    SkReg(s, TargetClass::ConstantBuffer, b).va, sz);
                 ++n_cbv;
             }
             if (logger::enabled(1) && DiagChanged("SKREPLAY", mod_id, (unsigned long long)n_uav * 100u + n_cbv))
@@ -323,11 +255,11 @@ static void SkReplayComputeState(const std::wstring& ns, ID3D12Resource* inst, i
 }
 
 // The mod's lists run, each on its own cb0 snapshot and batch selector; one SKPASS row per pass.
-static void SkRunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id, reshade::api::command_list* cmd_list,
-    const std::vector<SkPendingList>& lists, MorphDump::DrainRecord& dr,
+void ShapekeyReplay::RunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
+    reshade::api::command_list* cmd_list, const std::vector<SkPendingList>& lists, MorphDump::DrainRecord& dr,
     ID3D12Resource* u0_res, unsigned u0_bytes)
 {
-    if (u0_res && u0_bytes) SkNoteChainWroteU0(u0_res, g_frame_id);
+    if (u0_res && u0_bytes) identity_.NoteChainWroteU0(u0_res, g_frame_id);
     PortApi::DrawInfo di;
     di.dispatch = true;
     {
@@ -339,13 +271,13 @@ static void SkRunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
             uint64_t sk_snap_res = 0;
             uint64_t sk_snap_va = 0;
             unsigned sk_snap_bytes = 0;
-            int      sk_snap_hit = -1;
-            if (g_sk_cb0_snapshot) {
+            int sk_snap_hit = -1;
+            if (g_sk_toggles.cb0_snapshot) {
                 PROF(PROF_SK_Cb0);
-                sk_snap_hit = 0; // attempted; 1 only once SkGetSnap actually answers
-                /* SkGetSnap refuses an entry with no res or no va, so what it returns is usable as-is. */
+                sk_snap_hit = 0; // attempted; 1 only once GetSnap actually answers
+                /* GetSnap refuses an entry with no res or no va, so what it returns is usable as-is. */
                 SkBufferBinding sb{};
-                if (SkGetSnap(ns, inst, 0, lists[i].cs, lists[i].tgy, &sb)) {
+                if (store_.GetSnap(ns, inst, 0, lists[i].cs, lists[i].tgy, &sb)) {
                     PortApi::PushGameConstantBuffer('c', 0, sb.res, sb.va, sb.bytes);
                     sk_snap_hit = 1;
                     sk_snap_res = reinterpret_cast<uint64_t>(sb.res);
@@ -353,8 +285,8 @@ static void SkRunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
                     sk_snap_bytes = sb.bytes;
                     if (g_debug) {
                         if (LogBudget("CB0PASS", ns, 12))
-                            logger::write("CB0PASS: pass %zu <- cb0 snapshot of cs=%016llx (%u B, va=%llx)",
-                                i, lists[i].cs, sb.bytes, (unsigned long long)sb.va);
+                            logger::write("CB0PASS: pass %zu <- cb0 snapshot of cs=%016llx (%u B, va=%llx)", i,
+                                lists[i].cs, sb.bytes, (unsigned long long)sb.va);
                     }
                 } else if (g_debug) {
                     if (LogBudget("CB0PASS-MISS", ns, 12))
@@ -363,8 +295,9 @@ static void SkRunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
                             i, lists[i].cs);
                 }
             }
-            if (g_sk_freeze && i + 1 == lists.size()) {
-                if (SkZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "SKFREEZE") == 1 && g_debug && LogBudget("SKFREEZE-ON", ns, 4))
+            if (g_sk_toggles.freeze && i + 1 == lists.size()) {
+                if (store_.ZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "SKFREEZE") == 1 &&
+                    g_debug && LogBudget("SKFREEZE-ON", ns, 4))
                     logger::write("SKFREEZE: ns='%ls' -- u0 zeroed before the final pass (%zu of %zu); the "
                                   "Applier will write base positions with no morph.",
                         ns.c_str(), i + 1, lists.size());
@@ -375,23 +308,23 @@ static void SkRunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
                 PROF(PROF_SK_Run);
                 PortApi::RunResolvedCommandList(lists[i].list, &di);
             }
-            uint32_t       em_x = 0;
-            uint32_t       em_y = 0;
-            uint32_t       em_z = 0;
+            uint32_t em_x = 0;
+            uint32_t em_y = 0;
+            uint32_t em_z = 0;
             const unsigned em_n = MigotoPort::TakeEmittedDispatch(&em_x, &em_y, &em_z);
-            PROF(PROF_SK_Row);              // everything below, to the end of this iteration: the row and its log
-            const int              csi = 5; // 'c' -- v h d g p c (MigotoPort::StageIndex)
+            PROF(PROF_SK_Row); // everything below, to the end of this iteration: the row and its log
+            const int csi = 5; // 'c' -- v h d g p c (MigotoPort::StageIndex)
             MigotoPort::PipeState& ps = MigotoPort::State();
-            auto                   srv = [&](int r) { return ps.srv[csi][r] ? 1 : 0; };
-            auto                   uav = [&](int r) { return ps.uav[r] ? 1 : 0; };
-            const float            ck = PortApi::GetVarNs(L"WWMIv1", L"shapekey_checksum", -1.f);
-            const float            skv = PortApi::GetVarNs(L"WWMIv1", L"shapekey_vertex_count", -1.f);
-            const float            cvc = PortApi::GetVarNs(L"WWMIv1", L"custom_vertex_count", -1.f);
+            auto srv = [&](int r) { return ps.srv[csi][r] ? 1 : 0; };
+            auto uav = [&](int r) { return ps.uav[r] ? 1 : 0; };
+            const float ck = PortApi::GetVarNs(L"WWMIv1", L"shapekey_checksum", -1.f);
+            const float skv = PortApi::GetVarNs(L"WWMIv1", L"shapekey_vertex_count", -1.f);
+            const float cvc = PortApi::GetVarNs(L"WWMIv1", L"custom_vertex_count", -1.f);
             if (MorphDump::Armed()) {
                 MorphDump::PassRecord pr{};
                 pr.frame = g_frame_id;
                 pr.mod_id = mod_id;
-                pr.owner_mod = lists[i].owner_mod;
+                pr.owner_mod = Mods().IdOfNsHash(lists[i].owner_ns_hash);
                 pr.pass_index = (unsigned)(i + 1);
                 pr.pass_count = (unsigned)lists.size();
                 pr.queued_cs = lists[i].cs;
@@ -444,27 +377,27 @@ static void SkRunLists(const std::wstring& ns, ID3D12Resource* inst, int mod_id,
                 _snprintf_s(line, sizeof(line), _TRUNCATE,
                     "t0=%d t1=%d t6=%d t33=%d u5=%d u6=%d | checksum=%g shapekey_vtx=%g "
                     "custom_vtx=%g | emitted=%u x %u,%u,%u tgy=%u",
-                    srv(0), srv(1), srv(6), srv(33), uav(5), uav(6), ck, skv, cvc,
-                    em_n, em_x, em_y, em_z, lists[i].tgy);
+                    srv(0), srv(1), srv(6), srv(33), uav(5), uav(6), ck, skv, cvc, em_n, em_x, em_y, em_z,
+                    lists[i].tgy);
                 // on change of the whole line, per (mod, pass)
-                if (DiagChanged("SKPASS", mod_id * 16 + (int)i, DiagFnv(line)))
-                    logger::write("SKPASS mod=%d ns='%ls' pass=%zu/%zu | %s",
-                        mod_id, ns.c_str(), i + 1, lists.size(), line);
+                if (DiagChanged("SKPASS", mod_id * 16 + (int)i, Fnv1a64Str(line)))
+                    logger::write(
+                        "SKPASS mod=%d ns='%ls' pass=%zu/%zu | %s", mod_id, ns.c_str(), i + 1, lists.size(), line);
             }
         }
     }
 }
 
 // The drain row and the SHAPEKEY-PASSES line for what ran.
-static void SkReportDrain(const std::wstring& ns, int mod_id, const std::vector<SkPendingList>& lists,
-    MorphDump::DrainRecord& dr, size_t left_for_others, size_t sk_dropped_unowned,
-    ID3D12Resource* u0_res, unsigned u0_bytes)
+void ShapekeyReplay::ReportDrain(const std::wstring& ns, int mod_id, const std::vector<SkPendingList>& lists,
+    MorphDump::DrainRecord& dr, size_t left_for_others, size_t dropped_unowned, ID3D12Resource* u0_res,
+    unsigned u0_bytes)
 {
     { // THE DRAIN ROW. Sampled here, at the draw, where the mod's own vb0/vb6 binds have landed.
         dr.matched = (unsigned)lists.size();
         dr.left = (unsigned)left_for_others;
-        dr.dropped = (unsigned)sk_dropped_unowned;
-        dr.disp_seen = SkDispListForFrame(g_frame_id) ? 1 : 0;
+        dr.dropped = (unsigned)dropped_unowned;
+        dr.disp_seen = queue_.DispListForFrame(g_frame_id) ? 1 : 0;
         dr.u0_res = reinterpret_cast<uint64_t>(u0_res);
         dr.u0_bytes = u0_bytes;
         dr.u0_identity = u0_res ? g_buffer_reloc.IdentityBytes(u0_res, u0_bytes) : 0;
@@ -483,20 +416,21 @@ static void SkReportDrain(const std::wstring& ns, int mod_id, const std::vector<
         MorphDump::RecordDrain(dr);
     }
     if (logger::enabled(1) && DiagChanged("SHAPEKEY-PASSES", mod_id, (unsigned long long)lists.size())) {
-        const size_t named = (size_t)std::count_if(lists.begin(), lists.end(),
-            [](const SkPendingList& e) { return e.owner_mod >= 0; });
-        logger::write("SHAPEKEY-PASSES mod=%d ns='%ls' ran %zu of ITS OWN list(s) (%zu named this mod at their dispatch, %zu fell back to hash/name), %zu left queued for "
-                      "other mods or instances, %zu dropped-unowned, cs-u0 %s (%u bytes), cmdlist=%p",
-            mod_id, ns.c_str(), lists.size(), named, lists.size() - named,
-            left_for_others, sk_dropped_unowned,
-            u0_res ? "republished" : "NOT AVAILABLE", u0_bytes,
-            (void*)MigotoPort::GetDx12Bridge().cl);
+        const size_t named =
+            (size_t)std::count_if(lists.begin(), lists.end(), [](const SkPendingList& e) { return e.owner_ns_hash != 0; });
+        logger::write(
+            "SHAPEKEY-PASSES mod=%d ns='%ls' ran %zu of ITS OWN list(s) (%zu named this mod at their dispatch, %zu fell back to hash/name), %zu left queued for "
+            "other mods or instances, %zu dropped-unowned, cs-u0 %s (%u bytes), cmdlist=%p",
+            mod_id, ns.c_str(), lists.size(), named, lists.size() - named, left_for_others, dropped_unowned,
+            u0_res ? "republished" : "NOT AVAILABLE", u0_bytes, (void*)MigotoPort::GetDx12Bridge().cl);
     }
 }
 
-void RunShapeKeyPasses(const std::wstring& ns, int mod_id, ID3D12Resource* inst, reshade::api::command_list* cmd_list)
+void ShapekeyReplay::RunPasses(
+    const std::wstring& ns, int mod_id, ID3D12Resource* inst, reshade::api::command_list* cmd_list)
 {
-    const void* cl = cmd_list ? reinterpret_cast<const void*>(cmd_list->get_native()) : nullptr; // every record/order key below is the native list
+    const void* cl = cmd_list ? reinterpret_cast<const void*>(cmd_list->get_native())
+                              : nullptr; // every record/order key below is the native list
     // Every exit records: "never called" and "called and did nothing" are indistinguishable by absence.
     MorphDump::DrainRecord dr{};
     dr.frame = g_frame_id;
@@ -508,19 +442,19 @@ void RunShapeKeyPasses(const std::wstring& ns, int mod_id, ID3D12Resource* inst,
         return;
     }
     PROF(PROF_DI_ShapeKeys);
-    if (!SkFirstDrawThisFrame(mod_id, inst, cl, dr)) return;
-    size_t                     left_for_others = 0;
-    size_t                     sk_dropped_unowned = 0; // lists whose queuing dispatch named no mod
-    ID3D12Resource*            u0_res = nullptr;
-    unsigned                   u0_bytes = 0;
-    size_t                     other_inst_lists = 0;
-    ID3D12Resource*            other_inst = nullptr;
-    std::vector<SkPendingList> lists = SkTakeOwnLists(ns, mod_id, inst, dr, left_for_others, sk_dropped_unowned,
-        other_inst_lists, other_inst);
+    if (!FirstDrawThisFrame(mod_id, inst, cl, dr)) return;
+    size_t left_for_others = 0;
+    size_t dropped_unowned = 0; // lists whose queuing dispatch named no mod
+    ID3D12Resource* u0_res = nullptr;
+    unsigned u0_bytes = 0;
+    size_t other_inst_lists = 0;
+    ID3D12Resource* other_inst = nullptr;
+    std::vector<SkPendingList> lists =
+        queue_.TakeOwnLists(ns, mod_id, inst, dr, left_for_others, dropped_unowned, other_inst_lists, other_inst);
     // THIS INSTANCE'S u0, or nothing. Inheriting the previous dispatcher's position buffer is the same leak.
     {
         SkBufferBinding b0b{};
-        if (SkGetBinding(ns, inst, TargetClass::UnorderedAccessView, 0, &b0b)) {
+        if (store_.GetBinding(ns, inst, TargetClass::UnorderedAccessView, 0, &b0b)) {
             u0_res = b0b.res;
             u0_bytes = b0b.bytes;
         } else {
@@ -539,22 +473,29 @@ void RunShapeKeyPasses(const std::wstring& ns, int mod_id, ID3D12Resource* inst,
     if (lists.empty()) {
         dr.matched = 0;
         dr.left = (unsigned)left_for_others;
-        dr.dropped = (unsigned)sk_dropped_unowned;
-        dr.disp_seen = SkDispListForFrame(g_frame_id) ? 1 : 0;
+        dr.dropped = (unsigned)dropped_unowned;
+        dr.disp_seen = queue_.DispListForFrame(g_frame_id) ? 1 : 0;
         MorphDump::RecordDrain(dr);
         return;
     }
 
-    if (g_sk_u0_clear) dr.u0_clear = SkZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "U0CLEAR");
-    if (g_sk_u1_clear) dr.u1_clear = SkZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 1, cmd_list, "U1CLEAR");
+    if (g_sk_toggles.u0_clear)
+        dr.u0_clear = store_.ZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 0, cmd_list, "U0CLEAR");
+    if (g_sk_toggles.u1_clear)
+        dr.u1_clear = store_.ZeroBinding(ns, inst, TargetClass::UnorderedAccessView, 1, cmd_list, "U1CLEAR");
 
-    SkOwnBufFallback(ns, mod_id, lists.front().u0hash, u0_res, u0_bytes);
+    OwnBufFallback(ns, mod_id, lists.front().u0hash, u0_res, u0_bytes);
 
-    SkRepublishBindings(ns, inst, mod_id, u0_res, u0_bytes);
+    RepublishBindings(ns, inst, mod_id, u0_res, u0_bytes);
 
-    SkReplayComputeState(ns, inst, mod_id);
+    ReplayComputeState(ns, inst, mod_id);
 
-    SkRunLists(ns, inst, mod_id, cmd_list, lists, dr, u0_res, u0_bytes);
+    RunLists(ns, inst, mod_id, cmd_list, lists, dr, u0_res, u0_bytes);
 
-    SkReportDrain(ns, mod_id, lists, dr, left_for_others, sk_dropped_unowned, u0_res, u0_bytes);
+    ReportDrain(ns, mod_id, lists, dr, left_for_others, dropped_unowned, u0_res, u0_bytes);
+}
+
+void RunShapeKeyPasses(const std::wstring& ns, int mod_id, ID3D12Resource* inst, reshade::api::command_list* cmd_list)
+{
+    g_sk_replay.RunPasses(ns, mod_id, inst, cmd_list);
 }

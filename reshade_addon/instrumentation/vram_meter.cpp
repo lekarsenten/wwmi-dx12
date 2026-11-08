@@ -1,5 +1,5 @@
 #include "vram_meter.h"
-#include "../addon_state.h" // g_d3d12_device
+#include "../addon/addon.h" // g_addon.d3d12_device
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -8,17 +8,17 @@ VramMeter g_vram;
 
 void VramMeter::Open()
 {
-    if (!g_d3d12_device || for_ == g_d3d12_device) return;
+    if (!g_addon.d3d12_device || for_ == g_addon.d3d12_device) return;
     if (adapter_) {
         if (event_) adapter_->UnregisterVideoMemoryBudgetChangeNotification(cookie_);
         adapter_->Release();
         adapter_ = nullptr;
     }
-    for_ = g_d3d12_device;
+    for_ = g_addon.d3d12_device;
     IDXGIFactory4* fac = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac) {
         IDXGIAdapter1* a1 = nullptr;
-        if (SUCCEEDED(fac->EnumAdapterByLuid(g_d3d12_device->GetAdapterLuid(), IID_PPV_ARGS(&a1))) && a1) {
+        if (SUCCEEDED(fac->EnumAdapterByLuid(g_addon.d3d12_device->GetAdapterLuid(), IID_PPV_ARGS(&a1))) && a1) {
             a1->QueryInterface(IID_PPV_ARGS(&adapter_));
             a1->Release();
         }

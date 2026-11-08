@@ -4,16 +4,15 @@
 #include "HackerInputLayout.h"
 #include "dx12_input_layout.h"
 #include "dx12_pipeline.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 
 void HackerContext::Bind3DMigotoResources()
 {
-    if (!mHackerDevice || !mHackerDevice->mIniResourceView || G->IniParamsReg < 0)
-        return;
+    if (!mHackerDevice || !mHackerDevice->mIniResourceView || G->IniParamsReg < 0) return;
     ID3D11DeviceContext1* ctx = GetPassThroughOrigContext1();
     if (!ctx) return;
     ID3D11ShaderResourceView* srv = mHackerDevice->mIniResourceView;
-    const UINT                slot = (UINT)G->IniParamsReg;
+    const UINT slot = (UINT)G->IniParamsReg;
     ctx->VSSetShaderResources(slot, 1, &srv);
     ctx->HSSetShaderResources(slot, 1, &srv);
     ctx->DSSetShaderResources(slot, 1, &srv);
@@ -25,8 +24,7 @@ void HackerContext::Bind3DMigotoResources()
 
 void HackerContext::InitIniParams()
 {
-    if (!G->iniParams.empty())
-        memset(G->iniParams.data(), 0, sizeof(DirectX::XMFLOAT4) * G->iniParams.size());
+    if (!G->iniParams.empty()) memset(G->iniParams.data(), 0, sizeof(DirectX::XMFLOAT4) * G->iniParams.size());
     Bind3DMigotoResources();
 }
 

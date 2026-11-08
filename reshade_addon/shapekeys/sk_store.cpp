@@ -2,27 +2,37 @@
 #include "sk_internal.h"
 #include "../instrumentation/profiler.h" // ProfGpuWork -- this file's GPU copies, for the performance report's work rows
 #include "../instrumentation/removal_pin.h"
-#include "../migoto/dx12_bridge.h"
-#include "../../src/gpu_progress.h"
-#include "../../src/d3d12_name.h"
+#include "../migoto/dx12_pipeline.h"
+#include "../core/gpu_progress.h"
+#include "../core/d3d12_name.h"
+#include <cwctype>
 
-using SkStoreKey = std::pair<std::wstring, ID3D12Resource*>;
-static std::mutex                      g_store_mtx;
-static std::map<SkStoreKey, SkNsState> g_store;
+ShapekeyToggles g_sk_toggles;
+ShapekeyStats g_sk_stats;
+ShapekeyStore g_sk_store;
+
+// THE OWNERSHIP KEY, LOWERCASED IN EXACTLY ONE PLACE: a mod's namespace is the key for every resource the chain
+// remembers between the dispatch that produced it and the point that consumes it.
+std::wstring ShapekeyStore::NsKey(const std::wstring& ns)
+{
+    std::wstring k = ns;
+    for (wchar_t& c : k) c = (wchar_t)towlower(c);
+    return k;
+}
 
 // Look up an existing instance. Absent is a real answer, not a reason to create one.
-_Requires_lock_held_(g_store_mtx) static SkNsState* SkFindLocked(const std::wstring& ns, ID3D12Resource* inst)
+SkNsState* ShapekeyStore::FindLocked(const std::wstring& ns, ID3D12Resource* inst)
 {
     if (ns.empty() || !inst) return nullptr;
-    auto it = g_store.find(SkStoreKey(NsKey(ns), inst));
-    return it == g_store.end() ? nullptr : &it->second; // node-based map: the pointer survives an insert
+    auto it = store_.find(Key(NsKey(ns), inst));
+    return it == store_.end() ? nullptr : &it->second; // node-based map: the pointer survives an insert
 }
 
 // Get or create. Only writers call this, and a writer naming a new instance is how an instance appears.
-_Requires_lock_held_(g_store_mtx) static SkNsState* SkEmplaceLocked(const std::wstring& ns, ID3D12Resource* inst)
+SkNsState* ShapekeyStore::EmplaceLocked(const std::wstring& ns, ID3D12Resource* inst)
 {
     if (ns.empty() || !inst) return nullptr;
-    return &g_store[SkStoreKey(NsKey(ns), inst)];
+    return &store_[Key(NsKey(ns), inst)];
 }
 
 /* Resolve (kind, reg) to the binding it names, or nullptr. RegisterIndex is the single bounds check. */
@@ -38,10 +48,11 @@ static bool SkBindingLive(TargetClass kind, const SkBufferBinding& b)
     return RegisterBoundByAddress(kind) ? b.va != 0 : b.bytes != 0;
 }
 
-bool SkGetBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg, SkBufferBinding* out)
+bool ShapekeyStore::GetBinding(
+    const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg, SkBufferBinding* out)
 {
-    std::lock_guard<std::mutex> lk(g_store_mtx);
-    const SkNsState*            e = SkFindLocked(ns, inst);
+    std::lock_guard<std::mutex> lk(mutex_);
+    const SkNsState* e = FindLocked(ns, inst);
     if (!e) return false;
     const SkBufferBinding* b = SkBindingSlot(*const_cast<SkNsState*>(e), kind, reg);
     if (!b || !SkBindingLive(kind, *b)) return false; /* nothing recorded is a real answer, not a default */
@@ -49,31 +60,23 @@ bool SkGetBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind
     return true;
 }
 
-struct SkZeroSource {
-    ID3D12Resource*    buf = nullptr; // >= the largest buffer zeroed through this register so far
-    unsigned           bytes = 0;
-    unsigned long long cleared = 0;
-    unsigned long long not_ours = 0;
-    unsigned long long not_ready = 0;
-};
-static std::unordered_map<unsigned, SkZeroSource>        g_zero; // flat register index -> source; g_store_mtx
-static std::vector<std::pair<ID3D12Resource*, uint64_t>> g_grave;
-_Requires_lock_held_(g_store_mtx) static void SkRetireLocked(ID3D12Resource* r)
+void ShapekeyStore::RetireLocked(ID3D12Resource* r)
 {
-    if (r) g_grave.emplace_back(r, GpuStamp());
+    if (r) grave_.emplace_back(r, GpuStamp());
 }
-_Requires_lock_held_(g_store_mtx) static void SkSweepGraveLocked()
+
+void ShapekeyStore::SweepGraveLocked()
 {
     /* destroy_resource, not Release: it also drops the buffer from ReShade's VA registry. */
-    reshade::api::device* dev = g_reshade_device;
-    for (size_t k = 0; k < g_grave.size();) {
-        if (GpuPassed(g_grave[k].second)) {
+    reshade::api::device* dev = g_addon.reshade_device;
+    for (size_t k = 0; k < grave_.size();) {
+        if (GpuPassed(grave_[k].second)) {
             if (dev)
-                dev->destroy_resource(resource{ reinterpret_cast<uint64_t>(g_grave[k].first) });
+                dev->destroy_resource(resource{ reinterpret_cast<uint64_t>(grave_[k].first) });
             else
-                g_grave[k].first->Release();
-            g_grave[k] = g_grave.back();
-            g_grave.pop_back();
+                grave_[k].first->Release();
+            grave_[k] = grave_.back();
+            grave_.pop_back();
         } else
             ++k;
     }
@@ -84,8 +87,8 @@ static ID3D12Resource* SkMakeZeroSource(reshade::api::device* dev, unsigned byte
     if (!dev || !bytes) return nullptr;
     /* UPLOAD heap via cpu_access, which is GENERIC_READ (sdk d3d12_impl_type_convert.cpp:213). */
     resource h{};
-    if (!dev->create_resource(resource_desc(bytes, memory_heap::upload, resource_usage::copy_source),
-            nullptr, resource_usage::cpu_access, &h) ||
+    if (!dev->create_resource(resource_desc(bytes, memory_heap::upload, resource_usage::copy_source), nullptr,
+            resource_usage::cpu_access, &h) ||
         !h.handle)
         return nullptr;
     void* mp = nullptr;
@@ -99,33 +102,30 @@ static ID3D12Resource* SkMakeZeroSource(reshade::api::device* dev, unsigned byte
     return reinterpret_cast<ID3D12Resource*>(h.handle);
 }
 
-uint8_t SkZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg,
+uint8_t ShapekeyStore::ZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg,
     reshade::api::command_list* cmd_list, const char* why)
 {
     const unsigned i = RegisterIndex(kind, reg);
     if (i == kNoRegister) return 0;
-    const void*     cl = cmd_list ? reinterpret_cast<const void*>(cmd_list->get_native()) : nullptr; // the record path keys on the native list
+    const void* cl = cmd_list ? reinterpret_cast<const void*>(cmd_list->get_native())
+                              : nullptr; // the record path keys on the native list
     SkBufferBinding b{};
-    if (!SkGetBinding(ns, inst, kind, reg, &b) || !b.res || !b.bytes) return 0; // nothing recorded: real answer
-    bool live = false;
-    {
-        std::lock_guard lock(g_mem_mutex);
-        live = g_res_to_va.find(reinterpret_cast<uint64_t>(b.res)) != g_res_to_va.end();
-    }
-    const unsigned  identity = g_buffer_reloc.IdentityBytes(b.res, b.bytes);
-    const unsigned  hash = PortApi::GameComputeUavBufferHash(identity);
-    const bool      ours = live && PortApi::ModDeclaresHash(ns.c_str(), hash);
+    if (!GetBinding(ns, inst, kind, reg, &b) || !b.res || !b.bytes) return 0; // nothing recorded: real answer
+    const bool live = g_resources.Live(b.res);
+    const unsigned identity = g_buffer_reloc.IdentityBytes(b.res, b.bytes);
+    const unsigned hash = PortApi::GameComputeUavBufferHash(identity);
+    const bool ours = live && PortApi::ModDeclaresHash(ns.c_str(), hash);
     ID3D12Resource* src = nullptr;
-    bool            need_build = false;
+    bool need_build = false;
     /* DECIDE under the lock, BUILD outside it, INSTALL under it again. */
     {
-        std::lock_guard<std::mutex> lk(g_store_mtx);
-        SkZeroSource&               z = g_zero[i];
+        std::lock_guard<std::mutex> lk(mutex_);
+        ZeroSource& z = zero_[i];
         if (!ours) {
             ++z.not_ours;
         } else if (cl) {
             if (z.buf && z.bytes < b.bytes) {
-                SkRetireLocked(z.buf); // retired, NOT released -- see the note at g_grave
+                RetireLocked(z.buf); // retired, NOT released -- see the note at grave_
                 z.buf = nullptr;
                 z.bytes = 0;
             }
@@ -135,20 +135,20 @@ uint8_t SkZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass 
             } else
                 need_build = true;
         }
-        SkSweepGraveLocked();
+        SweepGraveLocked();
     }
     if (ours && cl && need_build) {
-        ID3D12Resource*             nb = SkMakeZeroSource(g_reshade_device, b.bytes);
-        std::lock_guard<std::mutex> lk(g_store_mtx);
-        SkZeroSource&               z = g_zero[i];
+        ID3D12Resource* nb = SkMakeZeroSource(g_addon.reshade_device, b.bytes);
+        std::lock_guard<std::mutex> lk(mutex_);
+        ZeroSource& z = zero_[i];
         if (!nb) {
             ++z.not_ready;
         } else if (z.buf && z.bytes >= b.bytes) {
-            g_reshade_device->destroy_resource(resource{ reinterpret_cast<uint64_t>(nb) });
+            g_addon.reshade_device->destroy_resource(resource{ reinterpret_cast<uint64_t>(nb) });
             src = z.buf;
             ++z.cleared;
         } else {
-            SkRetireLocked(z.buf);
+            RetireLocked(z.buf);
             z.buf = nb;
             z.bytes = b.bytes;
             src = nb;
@@ -167,15 +167,16 @@ uint8_t SkZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass 
     {
         const resource dst{ reinterpret_cast<uint64_t>(b.res) };
         const resource zsrc{ reinterpret_cast<uint64_t>(src) };
-        const bool     owned = MigotoPort::OwnedBuffer(b.res);
+        const bool owned = MigotoPort::OwnedBuffer(b.res);
         if (owned)
             MigotoPort::OwnedTransition(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), b.res,
                 D3D12_RESOURCE_STATE_COPY_DEST);
-        else if (g_sk_clear_barrier)
+        else if (g_sk_toggles.clear_barrier)
             cmd_list->barrier(dst, resource_usage::unordered_access, resource_usage::copy_dest);
         cmd_list->copy_buffer_region(zsrc, 0, dst, 0, b.bytes);
         ProfGpuWork(PGW_SkCopy, b.bytes);
-        if (!owned && g_sk_clear_barrier) cmd_list->barrier(dst, resource_usage::copy_dest, resource_usage::unordered_access);
+        if (!owned && g_sk_toggles.clear_barrier)
+            cmd_list->barrier(dst, resource_usage::copy_dest, resource_usage::unordered_access);
         RemovalPin::Ours(reinterpret_cast<const void*>(cmd_list->get_native()), "sk-clear");
         RemovalPin::Refs(reinterpret_cast<const void*>(cmd_list->get_native()), b.res, "sk-clear destination");
     }
@@ -187,27 +188,27 @@ uint8_t SkZeroBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass 
     return 1;
 }
 
-void SkZeroStats(TargetClass kind, unsigned reg, unsigned long long* cleared,
-    unsigned long long* not_ours, unsigned long long* not_ready)
+void ShapekeyStore::ZeroStats(TargetClass kind, unsigned reg, unsigned long long* cleared, unsigned long long* not_ours,
+    unsigned long long* not_ready)
 {
     *cleared = *not_ours = *not_ready = 0;
     const unsigned i = RegisterIndex(kind, reg);
     if (i == kNoRegister) return;
-    std::lock_guard<std::mutex> lk(g_store_mtx);
-    auto                        it = g_zero.find(i);
-    if (it == g_zero.end()) return;
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = zero_.find(i);
+    if (it == zero_.end()) return;
     *cleared = it->second.cleared;
     *not_ours = it->second.not_ours;
     *not_ready = it->second.not_ready;
 }
 
-bool SkSetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsigned long long cs, unsigned tgy,
-    ID3D12Resource* res, uint64_t va, unsigned bytes)
+bool ShapekeyStore::SetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsigned long long cs,
+    unsigned tgy, ID3D12Resource* res, uint64_t va, unsigned bytes)
 {
     const unsigned i = RegisterIndex(TargetClass::ConstantBuffer, reg);
     if (i == kNoRegister) return false;
-    std::lock_guard<std::mutex> lk(g_store_mtx);
-    SkNsState*                  e = SkEmplaceLocked(ns, inst);
+    std::lock_guard<std::mutex> lk(mutex_);
+    SkNsState* e = EmplaceLocked(ns, inst);
     if (!e) return false;
     SkBufferBinding& b = e->snap[i][cs][tgy];
     b.res = res;
@@ -216,13 +217,13 @@ bool SkSetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsig
     return true;
 }
 
-bool SkGetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsigned long long cs, unsigned tgy,
-    SkBufferBinding* out)
+bool ShapekeyStore::GetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsigned long long cs,
+    unsigned tgy, SkBufferBinding* out)
 {
     const unsigned i = RegisterIndex(TargetClass::ConstantBuffer, reg);
     if (i == kNoRegister) return false;
-    std::lock_guard<std::mutex> lk(g_store_mtx);
-    SkNsState*                  e = SkFindLocked(ns, inst);
+    std::lock_guard<std::mutex> lk(mutex_);
+    SkNsState* e = FindLocked(ns, inst);
     if (!e) return false;
     auto si = e->snap.find(i);
     if (si == e->snap.end()) return false;
@@ -234,19 +235,13 @@ bool SkGetSnap(const std::wstring& ns, ID3D12Resource* inst, unsigned reg, unsig
     return true;
 }
 
-void SkSnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns, ID3D12Resource* inst,
-    ID3D12Resource* src, uint64_t va, unsigned size,
-    unsigned long long cs_hash, unsigned tgy)
+void ShapekeyStore::SnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns, ID3D12Resource* inst,
+    ID3D12Resource* src, uint64_t va, unsigned size, unsigned long long cs_hash, unsigned tgy)
 {
-    if (!g_sk_cb0_snapshot || !cmd_list || ns.empty() || !inst || !src || !va || !size) return;
+    if (!g_sk_toggles.cb0_snapshot || !cmd_list || ns.empty() || !inst || !src || !va || !size) return;
 
     uint64_t base = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_mem_mutex);
-        auto                        vi = g_res_to_va.find(reinterpret_cast<uint64_t>(src));
-        if (vi == g_res_to_va.end()) return; // destroyed since resolve -- never deref
-        base = vi->second;
-    }
+    if (!g_resources.VaOf(reinterpret_cast<uint64_t>(src), &base)) return; // destroyed since resolve -- never deref
     const uint64_t off = (va > base) ? (va - base) : 0;
 
     const unsigned bytes = (size + 255u) & ~255u;
@@ -256,7 +251,7 @@ void SkSnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns,
     ID3D12Resource* undersized = nullptr; // (`small` is a Windows macro)
     {
         SkBufferBinding prev{};
-        if (SkGetSnap(ns, inst, 0, cs_hash, tgy, &prev)) {
+        if (GetSnap(ns, inst, 0, cs_hash, tgy, &prev)) {
             if (prev.bytes >= bytes)
                 snap = prev.res;
             else
@@ -282,14 +277,14 @@ void SkSnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns,
         DevName(snap, L"wwmi cb snapshot");
         const uint64_t snap_gpu_va = snap->GetGPUVirtualAddress();
         if (undersized) {
-            std::lock_guard<std::mutex> lk(g_store_mtx);
-            SkRetireLocked(undersized);
+            std::lock_guard<std::mutex> lk(mutex_);
+            RetireLocked(undersized);
         }
-        SkSetSnap(ns, inst, 0, cs_hash, tgy, snap, snap_gpu_va, bytes);
+        SetSnap(ns, inst, 0, cs_hash, tgy, snap, snap_gpu_va, bytes);
         if (g_debug)
             logger::write("CB0SNAP: ns='%ls' inst=%p snapshot %u B  src=%p base=%llx va=%llx off=%llu cs=%016llx%s",
-                ns.c_str(), (void*)inst, bytes, (void*)src, (unsigned long long)base,
-                (unsigned long long)va, (unsigned long long)off, cs_hash,
+                ns.c_str(), (void*)inst, bytes, (void*)src, (unsigned long long)base, (unsigned long long)va,
+                (unsigned long long)off, cs_hash,
                 off == 0 ? "  [off=0 -- b0 pointed at the RING BASE, not a suballocation]" : "");
     }
 
@@ -301,52 +296,66 @@ void SkSnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns,
     RemovalPin::Refs(reinterpret_cast<const void*>(cmd_list->get_native()), src, "sk-snap source");
 }
 
-void SkSetStateForNs(const std::wstring& ns, ID3D12Resource* inst, const SkComputeState& st)
+void ShapekeyStore::SetState(const std::wstring& ns, ID3D12Resource* inst, const SkComputeState& st)
 {
-    std::lock_guard<std::mutex> lk(g_store_mtx);
-    SkNsState*                  e = SkEmplaceLocked(ns, inst);
+    std::lock_guard<std::mutex> lk(mutex_);
+    SkNsState* e = EmplaceLocked(ns, inst);
     if (!e) return;
     for (unsigned i = 0; i < kRegisterFileTotal; ++i) e->reg[i] = st.reg[i];
     e->valid = st.valid;
 }
 
-bool SkGetStateForNs(const std::wstring& ns, ID3D12Resource* inst, SkComputeState* out)
+bool ShapekeyStore::GetState(const std::wstring& ns, ID3D12Resource* inst, SkComputeState* out)
 {
-    std::lock_guard<std::mutex> lk(g_store_mtx);
-    SkNsState*                  e = SkFindLocked(ns, inst);
+    std::lock_guard<std::mutex> lk(mutex_);
+    SkNsState* e = FindLocked(ns, inst);
     if (!e || !e->valid) return false;
     for (unsigned i = 0; i < kRegisterFileTotal; ++i) out->reg[i] = e->reg[i];
     out->valid = true;
     return true;
 }
 
-void SkInvalidateSnapshotFor(ID3D12Resource* dead)
+void ShapekeyStore::Forget(ID3D12Resource* dead)
 {
     if (!dead) return;
-    {
-        std::lock_guard<std::mutex> lk(g_store_mtx);
-        for (auto kv = g_store.begin(); kv != g_store.end();) {
-            SkNsState& e = kv->second;
-            if (kv->first.second == dead) {
-                for (auto& per_reg : e.snap)
-                    for (auto& per_cs : per_reg.second)
-                        for (auto& per_tgy : per_cs.second)
-                            SkRetireLocked(per_tgy.second.res);
-                kv = g_store.erase(kv);
-                continue;
-            }
-            for (unsigned i = 0; i < kRegisterFileTotal; ++i)
-                if (e.reg[i].res == dead) e.reg[i] = SkBufferBinding{};
-            /* the snapshots are per queuing dispatch, so a dead one takes out its own key and no other */
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (auto kv = store_.begin(); kv != store_.end();) {
+        SkNsState& e = kv->second;
+        if (kv->first.second == dead) {
             for (auto& per_reg : e.snap)
                 for (auto& per_cs : per_reg.second)
-                    for (auto it = per_cs.second.begin(); it != per_cs.second.end();)
-                        if (it->second.res == dead)
-                            it = per_cs.second.erase(it);
-                        else
-                            ++it;
-            ++kv;
+                    for (auto& per_tgy : per_cs.second) RetireLocked(per_tgy.second.res);
+            kv = store_.erase(kv);
+            continue;
         }
+        for (unsigned i = 0; i < kRegisterFileTotal; ++i)
+            if (e.reg[i].res == dead) e.reg[i] = SkBufferBinding{};
+        /* the snapshots are per queuing dispatch, so a dead one takes out its own key and no other */
+        for (auto& per_reg : e.snap)
+            for (auto& per_cs : per_reg.second)
+                for (auto it = per_cs.second.begin(); it != per_cs.second.end();)
+                    if (it->second.res == dead)
+                        it = per_cs.second.erase(it);
+                    else
+                        ++it;
+        ++kv;
     }
-    SkForgetPendingFor(dead);
+}
+
+bool SkGetBinding(const std::wstring& ns, ID3D12Resource* inst, TargetClass kind, unsigned reg, SkBufferBinding* out)
+{
+    return g_sk_store.GetBinding(ns, inst, kind, reg, out);
+}
+
+void SkZeroStats(TargetClass kind, unsigned reg, unsigned long long* cleared, unsigned long long* not_ours,
+    unsigned long long* not_ready)
+{
+    g_sk_store.ZeroStats(kind, reg, cleared, not_ours, not_ready);
+}
+
+void SkOnDestroyed(ID3D12Resource* dead)
+{
+    if (!dead) return;
+    g_sk_store.Forget(dead);
+    g_sk_queue.ForgetFor(dead);
 }

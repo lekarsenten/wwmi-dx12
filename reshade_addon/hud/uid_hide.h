@@ -14,7 +14,7 @@ public:
     // Where the UID is drawn on a back buffer of `target` (width << 16 | height), and in which colours.
     static std::vector<RfxDxilCut> Cuts(uint32_t target);
 
-    void     NoteBackBuffer(reshade::api::swapchain* sc);
+    void NoteBackBuffer(reshade::api::swapchain* sc);
     uint32_t Target() const { return target_.load(std::memory_order_acquire); } // 0 = not known yet
 
 private:

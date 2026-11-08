@@ -1,0 +1,21 @@
+# Files clang-format must not touch: their ports (THEIRS banner or names fixed by their sources),
+# generated files, submodules, tools and local captures.
+reshade_addon/migoto/frame_analysis_engine.cpp
+reshade_addon/migoto/frame_analysis_engine.h
+reshade_addon/migoto/frame_analysis_format.cpp
+reshade_addon/migoto/frame_analysis_format.h
+reshade_addon/migoto/port_ini.cpp
+reshade_addon/migoto/port_override.cpp
+reshade_addon/migoto/port_globals.cpp
+reshade_addon/migoto/HackerContext.h
+reshade_addon/migoto/HackerDevice.h
+reshade_addon/migoto/DirectX11/*
+reshade_addon/migoto/dx12_context.cpp
+reshade_addon/migoto/dx12_context.h
+reshade_addon/migoto/dx12_device.cpp
+reshade_addon/migoto/dx12_device.h
+reshade_addon/sdk/*
+third_party/*
+tools/*
+captures/*
+build_addon/*

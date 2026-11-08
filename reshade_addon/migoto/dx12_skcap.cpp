@@ -1,12 +1,13 @@
 // SKCAP: the compute-chain capture. See the banner below.
+#include "dx12_skcap.h"
 #include "dx12_pipeline.h"
 #include "dx12_pipeline_internal.h"
 #include "dx12_wrap.h"
 #include "dx12_context.h"
-#include "../../src/log.h"
-#include "../../src/fnv.h"
-#include "../../src/d3d12_buffer.h"
-#include "../../src/d3d12_barrier.h"
+#include "../core/log.h"
+#include "../core/fnv.h"
+#include "../core/d3d12_buffer.h"
+#include "../core/d3d12_barrier.h"
 #include "port_api.h" // BridgeStackDepth, GameComputeUavBufferHash, ForEachTextureOverrideConfig, ...
 
 #include <algorithm>
@@ -43,64 +44,64 @@ namespace MigotoPort {
 namespace {
 
 struct SkCapSlot {
-    char                 owner = 'M';
-    char                 prov[72] = {};
-    std::string          name;              // "u0", "cs-t33", "cs-cb0" ...
-    bool                 post = false;      // false = snapshot taken BEFORE the Dispatch
-    ID3D12Resource*      staging = nullptr; // ours, READBACK heap
-    UINT64               bytes = 0;         // how much we copied
-    UINT64               src_size = 0;      // how big the source actually is
-    UINT64               src_off = 0;       // window offset into the game's allocation
-    const void*          src_res = nullptr; // identity, for correlating pre/post and across passes
-    unsigned long long   src_va = 0;
-    unsigned             seq = 0;      // which captured dispatch
-    const void*          cs = nullptr; // that dispatch's CS wrapper
-    UINT                 gx = 0;       // its thread-group dims
-    UINT                 gy = 0;
-    UINT                 gz = 0;
-    char                 view[208] = {};
-    unsigned             frame = 0; // capture-relative frame this snapshot was taken on
-    bool                 done = false;
-    std::string          digest;
+    char owner = 'M';
+    char prov[72] = {};
+    std::string name; // "u0", "cs-t33", "cs-cb0" ...
+    bool post = false; // false = snapshot taken BEFORE the Dispatch
+    ID3D12Resource* staging = nullptr; // ours, READBACK heap
+    UINT64 bytes = 0; // how much we copied
+    UINT64 src_size = 0; // how big the source actually is
+    UINT64 src_off = 0; // window offset into the game's allocation
+    const void* src_res = nullptr; // identity, for correlating pre/post and across passes
+    unsigned long long src_va = 0;
+    unsigned seq = 0; // which captured dispatch
+    const void* cs = nullptr; // that dispatch's CS wrapper
+    UINT gx = 0; // its thread-group dims
+    UINT gy = 0;
+    UINT gz = 0;
+    char view[208] = {};
+    unsigned frame = 0; // capture-relative frame this snapshot was taken on
+    bool done = false;
+    std::string digest;
     std::vector<uint8_t> keep;
 };
 
 struct SkCapPass {
-    uint32_t               uav_bound_mask = 0; // which compute uN actually reached a root parameter
-    unsigned long long     t_begin_us = 0;
-    unsigned long long     t_end_us = 0;
-    unsigned long long     caller_cs = 0;
-    unsigned               caller_tgy = 0;
-    int                    caller_mod = -1;
-    wchar_t                caller_ns[64] = { 0 };
-    unsigned               seq = 0;
-    unsigned               frame = 0; // capture-relative frame this dispatch issued on
-    const void*            cs = nullptr;
-    UINT                   gx = 0;
-    UINT                   gy = 0;
-    UINT                   gz = 0;
-    std::vector<uint8_t>   code; // CS bytecode, written out as .cso
+    uint32_t uav_bound_mask = 0; // which compute uN actually reached a root parameter
+    unsigned long long t_begin_us = 0;
+    unsigned long long t_end_us = 0;
+    unsigned long long caller_cs = 0;
+    unsigned caller_tgy = 0;
+    int caller_mod = -1;
+    wchar_t caller_ns[64] = { 0 };
+    unsigned seq = 0;
+    unsigned frame = 0; // capture-relative frame this dispatch issued on
+    const void* cs = nullptr;
+    UINT gx = 0;
+    UINT gy = 0;
+    UINT gz = 0;
+    std::vector<uint8_t> code; // CS bytecode, written out as .cso
     std::vector<ShaderReg> regs; // reflected declarations: kind b/t/u/s, reg, space
 };
 
 struct SkCapSkip {
     std::string name;
-    bool        post = false;
-    unsigned    seq = 0;
+    bool post = false;
+    unsigned seq = 0;
     std::string why;
 };
 
-std::mutex                g_skcap_mtx;
-std::vector<SkCapSlot>    g_skcap;
-std::vector<SkCapSkip>    g_skcap_skip;
-std::vector<SkCapPass>    g_skcap_pass;
-static std::mutex         g_skcap_caller_mtx;
+std::mutex g_skcap_mtx;
+std::vector<SkCapSlot> g_skcap;
+std::vector<SkCapSkip> g_skcap_skip;
+std::vector<SkCapPass> g_skcap_pass;
+static std::mutex g_skcap_caller_mtx;
 static unsigned long long g_skcap_caller_cs = 0;
-static unsigned           g_skcap_caller_tgy = 0;
-static int                g_skcap_caller_mod = -1;
-static wchar_t            g_skcap_caller_ns[64] = { 0 };
-static LARGE_INTEGER      g_skcap_t0 = {};
-static LARGE_INTEGER      g_skcap_freq = {};
+static unsigned g_skcap_caller_tgy = 0;
+static int g_skcap_caller_mod = -1;
+static wchar_t g_skcap_caller_ns[64] = { 0 };
+static LARGE_INTEGER g_skcap_t0 = {};
+static LARGE_INTEGER g_skcap_freq = {};
 static unsigned long long SkCapNowUs()
 {
     if (!g_skcap_freq.QuadPart) QueryPerformanceFrequency(&g_skcap_freq);
@@ -109,39 +110,40 @@ static unsigned long long SkCapNowUs()
     if (!g_skcap_t0.QuadPart) g_skcap_t0 = n;
     return (unsigned long long)((n.QuadPart - g_skcap_t0.QuadPart) * 1000000LL / g_skcap_freq.QuadPart);
 }
-std::atomic<int>      g_skcap_arm{ 0 };  // dispatches still to capture
-std::atomic<int>      g_skcap_wait{ 0 }; // frames to wait before the readback is valid
-std::atomic<int>      g_skcap_frames_left{ 0 };
+std::atomic<int> g_skcap_arm{ 0 }; // dispatches still to capture
+std::atomic<int> g_skcap_wait{ 0 }; // frames to wait before the readback is valid
+std::atomic<int> g_skcap_frames_left{ 0 };
 std::atomic<unsigned> g_skcap_frame{ 0 }; // capture-relative frame index stamped onto every record
-std::atomic<int>      g_skcap_frames_armed{ 0 };
-std::atomic<int>      g_skcap_mode{ 0 };
-unsigned              g_skcap_seq = 0;
-UINT64                g_skcap_budget = 0; // bytes still allowed to stage
+std::atomic<int> g_skcap_frames_armed{ 0 };
+std::atomic<int> g_skcap_mode{ 0 };
+unsigned g_skcap_seq = 0;
+UINT64 g_skcap_budget = 0; // bytes still allowed to stage
 
-constexpr UINT64 kSkCapPerResource = 32ull << 20;   // never copy more than this from one resource
+constexpr UINT64 kSkCapPerResource = 32ull << 20; // never copy more than this from one resource
 constexpr UINT64 kSkCapTotalBudget = 1536ull << 20; // and never stage more than this in one capture
 constexpr UINT64 kSkCapFullWrite = 1ull << 20;
 
 constexpr UINT64 kSkCapGameShareDiv = 4;
-UINT64           g_skcap_game_budget = 0; // FRAME mode: bytes the G rows may still stage this frame
+UINT64 g_skcap_game_budget = 0; // FRAME mode: bytes the G rows may still stage this frame
 struct SkCapDSeen {
-    unsigned    frame;
+    unsigned frame;
     const void* cl;
     const void* res;
-    UINT64      off;
+    UINT64 off;
 };
-std::vector<SkCapDSeen> g_skcap_d_seen;      // FRAME mode: D rows already staged this frame
-unsigned                g_skcap_d_dedup = 0; // D rows not staged because rule 3 already had them
+std::vector<SkCapDSeen> g_skcap_d_seen; // FRAME mode: D rows already staged this frame
+unsigned g_skcap_d_dedup = 0; // D rows not staged because rule 3 already had them
 
 ID3D12Resource* SkCapMakeReadback(ID3D12Device* dev, UINT64 bytes)
 {
     ID3D12Resource* out = nullptr;
-    if (FAILED(CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST, &out))) return nullptr;
+    if (FAILED(CreateD3D12Buffer(dev, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST, &out)))
+        return nullptr;
     return out;
 }
 
-void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name, void* iface,
-    bool is_view, bool post, const void* cs, unsigned seq, UINT gx, UINT gy, UINT gz)
+void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name, void* iface, bool is_view, bool post,
+    const void* cs, unsigned seq, UINT gx, UINT gy, UINT gz)
 {
     auto skip = [&](const char* why) {
         std::lock_guard<std::mutex> l(g_skcap_mtx);
@@ -152,32 +154,30 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
         return;
     }
     WrapResource* wr = nullptr;
-    char          vdesc[208] = {};
+    char vdesc[208] = {};
     if (is_view) {
         if (WrapView* v = AsWrapView(iface)) {
             wr = v->wres;
             if (v->kind == 't') {
                 const D3D11_SHADER_RESOURCE_VIEW_DESC& vd = static_cast<WrapSRV*>(v)->desc;
                 if (vd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
-                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE,
-                        "SRV buf fmt=%u first=%u nelem=%u", (unsigned)vd.Format,
-                        (unsigned)vd.Buffer.FirstElement, (unsigned)vd.Buffer.NumElements);
+                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE, "SRV buf fmt=%u first=%u nelem=%u",
+                        (unsigned)vd.Format, (unsigned)vd.Buffer.FirstElement, (unsigned)vd.Buffer.NumElements);
                 else if (!vd.ViewDimension && !vd.Format)
                     _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE,
                         "SRV NULL-DESC (default full-resource view -- legal, not a fault)");
                 else
-                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE, "SRV dim=%u fmt=%u",
-                        (unsigned)vd.ViewDimension, (unsigned)vd.Format);
+                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE, "SRV dim=%u fmt=%u", (unsigned)vd.ViewDimension,
+                        (unsigned)vd.Format);
             } else if (v->kind == 'u') {
                 const D3D11_UNORDERED_ACCESS_VIEW_DESC& vd = static_cast<WrapUAV*>(v)->desc;
                 if (vd.ViewDimension == D3D11_UAV_DIMENSION_BUFFER)
-                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE,
-                        "UAV buf fmt=%u first=%u nelem=%u flags=%u", (unsigned)vd.Format,
-                        (unsigned)vd.Buffer.FirstElement, (unsigned)vd.Buffer.NumElements,
+                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE, "UAV buf fmt=%u first=%u nelem=%u flags=%u",
+                        (unsigned)vd.Format, (unsigned)vd.Buffer.FirstElement, (unsigned)vd.Buffer.NumElements,
                         (unsigned)vd.Buffer.Flags);
                 else
-                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE, "UAV dim=%u fmt=%u",
-                        (unsigned)vd.ViewDimension, (unsigned)vd.Format);
+                    _snprintf_s(vdesc, sizeof(vdesc), _TRUNCATE, "UAV dim=%u fmt=%u", (unsigned)vd.ViewDimension,
+                        (unsigned)vd.Format);
             }
         }
     } else {
@@ -185,7 +185,7 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
     }
     if (wr && vdesc[0]) {
         const unsigned obs = wr->foreign ? ObservedResourceState(wr->dx12) : kResStateUnknown;
-        char           flg[48] = "";
+        char flg[48] = "";
         if (wr->dx12) {
             const UINT f = (UINT)wr->dx12->GetDesc().Flags;
             _snprintf_s(flg, sizeof(flg), _TRUNCATE, " flags=0x%x%s", f,
@@ -193,8 +193,8 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
         }
         char own[80];
         if (obs != kResStateUnknown)
-            _snprintf_s(own, sizeof(own), _TRUNCATE, " | GAME-owned state=0x%x observed=0x%x",
-                (unsigned)wr->state, obs);
+            _snprintf_s(
+                own, sizeof(own), _TRUNCATE, " | GAME-owned state=0x%x observed=0x%x", (unsigned)wr->state, obs);
         else
             _snprintf_s(own, sizeof(own), _TRUNCATE, " | %s state=0x%x",
                 wr->foreign ? "GAME-owned (never observed)" : "ours", (unsigned)wr->state);
@@ -210,13 +210,13 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
         return;
     }
 
-    ID3D12Resource*           src = wr->dx12;
+    ID3D12Resource* src = wr->dx12;
     const D3D12_RESOURCE_DESC sd = src->GetDesc();
-    const bool                is_buffer = (sd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+    const bool is_buffer = (sd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
 
-    UINT64                             off = 0;
-    UINT64                             bytes = 0;
-    UINT64                             src_size = 0;
+    UINT64 off = 0;
+    UINT64 bytes = 0;
+    UINT64 src_size = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     if (is_buffer) {
         if (wr->gpu_va) { // a WINDOW into a bigger game allocation
@@ -231,7 +231,7 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
         src_size = bytes;
         if (bytes > kSkCapPerResource) bytes = kSkCapPerResource;
     } else {
-        UINT   rows = 0;
+        UINT rows = 0;
         UINT64 rowbytes = 0;
         UINT64 total = 0;
         dev->GetCopyableFootprints(&sd, 0, 1, 0, &fp, &rows, &rowbytes, &total);
@@ -265,8 +265,7 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
     if (!staging) {
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         g_skcap_budget += bytes;
-        logger::write("SKCAP  seq=%u %-8s staging alloc FAILED (%llu B)", seq, name,
-            (unsigned long long)bytes);
+        logger::write("SKCAP  seq=%u %-8s staging alloc FAILED (%llu B)", seq, name, (unsigned long long)bytes);
         return;
     }
 
@@ -286,7 +285,7 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
         }
     };
     D3D12_HEAP_PROPERTIES hp{};
-    D3D12_HEAP_FLAGS      hf{};
+    D3D12_HEAP_FLAGS hf{};
     src->GetHeapProperties(&hp, &hf);
     if (hp.Type == D3D12_HEAP_TYPE_DEFAULT)
         CopyAsSource(cl, src, ListStateOf(cl, wr), copy);
@@ -294,21 +293,19 @@ void SkCapSnap(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* nam
         copy();
 
     std::lock_guard<std::mutex> l(g_skcap_mtx);
-    g_skcap.push_back(SkCapSlot{ 'M', {}, name, post, staging, bytes, src_size, off,
-        (const void*)src, (unsigned long long)(src->GetGPUVirtualAddress() + off),
-        seq, cs, gx, gy, gz });
+    g_skcap.push_back(SkCapSlot{ 'M', {}, name, post, staging, bytes, src_size, off, (const void*)src,
+        (unsigned long long)(src->GetGPUVirtualAddress() + off), seq, cs, gx, gy, gz });
     g_skcap.back().frame = g_skcap_frame.load(std::memory_order_relaxed);
     if (vdesc[0]) memcpy(g_skcap.back().view, vdesc, sizeof(vdesc));
 }
 
-void SkCapSnapAll(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, bool post,
-    const void* cs, unsigned seq, UINT x, UINT y, UINT z,
-    const std::vector<ShaderReg>* regs)
+void SkCapSnapAll(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, bool post, const void* cs, unsigned seq, UINT x,
+    UINT y, UINT z, const std::vector<ShaderReg>* regs)
 {
     PipeState& st = State();
-    char       nm[24];
+    char nm[24];
     const bool declared_only = g_skcap_mode.load(std::memory_order_relaxed) == 1 && regs && !regs->empty();
-    auto       declared = [&](char kind, int reg) {
+    auto declared = [&](char kind, int reg) {
         if (!declared_only) return true;
         for (const ShaderReg& r : *regs)
             if (r.kind == kind && r.reg == (UINT)reg) return true;
@@ -334,7 +331,7 @@ void SkCapSnapAll(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, bool post,
 long long SkCapMapCount(SkCapSlot& e, std::vector<uint8_t>& out)
 {
     if (!e.staging) return -1;
-    void*       p = nullptr;
+    void* p = nullptr;
     D3D12_RANGE rr{ 0, (SIZE_T)e.bytes };
     if (FAILED(e.staging->Map(0, &rr, &p)) || !p) return -1;
     out.assign((const uint8_t*)p, (const uint8_t*)p + (size_t)e.bytes);
@@ -349,16 +346,16 @@ long long SkCapMapCount(SkCapSlot& e, std::vector<uint8_t>& out)
 void SkCapFlushFrameLocked(unsigned f)
 {
     struct Loaded {
-        size_t               idx;
+        size_t idx;
         std::vector<uint8_t> b;
-        long long            nz;
+        long long nz;
     };
     std::vector<Loaded> loaded;
     for (size_t i = 0; i < g_skcap.size(); ++i) {
         SkCapSlot& e = g_skcap[i];
         if (e.done || e.frame != f || !e.staging) continue;
         std::vector<uint8_t> b;
-        const long long      nz = SkCapMapCount(e, b);
+        const long long nz = SkCapMapCount(e, b);
         loaded.push_back(Loaded{ i, std::move(b), nz });
     }
     if (loaded.empty()) return;
@@ -368,16 +365,16 @@ void SkCapFlushFrameLocked(unsigned f)
         SkCapSlot& e = g_skcap[L.idx];
 
         if (L.nz < 0) {
-            sprintf_s(line, " %c f=%-2u %3u %-9s %-4s %10llu %9llu       MAP FAILED -- no conclusion\n",
-                e.owner, e.frame, e.seq, e.name.c_str(), e.post ? "post" : "pre",
-                (unsigned long long)e.bytes, (unsigned long long)e.src_size);
+            sprintf_s(line, " %c f=%-2u %3u %-9s %-4s %10llu %9llu       MAP FAILED -- no conclusion\n", e.owner,
+                e.frame, e.seq, e.name.c_str(), e.post ? "post" : "pre", (unsigned long long)e.bytes,
+                (unsigned long long)e.src_size);
             e.digest = line;
         } else {
-            const size_t             n = L.b.size() / 4;
-            const uint32_t*          w = (const uint32_t*)L.b.data();
-            std::vector<uint32_t>    vals;
-            size_t                   nzw = 0;
-            size_t                   comp[6] = { 0, 0, 0, 0, 0, 0 };
+            const size_t n = L.b.size() / 4;
+            const uint32_t* w = (const uint32_t*)L.b.data();
+            std::vector<uint32_t> vals;
+            size_t nzw = 0;
+            size_t comp[6] = { 0, 0, 0, 0, 0, 0 };
             const unsigned long long fnv = Fnv1a64Words(w, n);
             for (size_t i = 0; i < n; ++i) {
                 if (!w[i]) continue;
@@ -387,27 +384,27 @@ void SkCapFlushFrameLocked(unsigned f)
             }
             unsigned long long p50 = 0;
             unsigned long long mx = 0;
-            double             fp50 = 0.0;
+            double fp50 = 0.0;
             if (!vals.empty()) {
                 std::nth_element(vals.begin(), vals.begin() + vals.size() / 2, vals.end());
                 p50 = vals[vals.size() / 2];
                 for (uint32_t v : vals)
                     if (v > mx) mx = v;
-                float          fv;
+                float fv;
                 const uint32_t bits = (uint32_t)p50;
                 memcpy(&fv, &bits, 4);
                 fp50 = (double)fv;
             }
-            sprintf_s(line, " %c f=%-2u %3u %-9s %-4s %10llu %9llu %8zu %5.1f%%  u32 p50=%llu max=%llu"
-                            "  asfloat(p50)=%.6g fnv=%016llx%s\n",
-                e.owner, e.frame, e.seq, e.name.c_str(), e.post ? "post" : "pre",
-                (unsigned long long)e.bytes, (unsigned long long)e.src_size, nzw,
-                n ? 100.0 * (double)nzw / (double)n : 0.0, p50, mx, fp50, fnv,
+            sprintf_s(line,
+                " %c f=%-2u %3u %-9s %-4s %10llu %9llu %8zu %5.1f%%  u32 p50=%llu max=%llu"
+                "  asfloat(p50)=%.6g fnv=%016llx%s\n",
+                e.owner, e.frame, e.seq, e.name.c_str(), e.post ? "post" : "pre", (unsigned long long)e.bytes,
+                (unsigned long long)e.src_size, nzw, n ? 100.0 * (double)nzw / (double)n : 0.0, p50, mx, fp50, fnv,
                 vals.size() >= (1u << 21) ? "  (p50 over first 2M non-zero)" : "");
             e.digest = line;
 
             if (nzw) {
-                int  k = sprintf_s(line, "        comp6={");
+                int k = sprintf_s(line, "        comp6={");
                 bool first = true;
                 for (int c = 0; c < 6; ++c)
                     if (comp[c]) {
@@ -422,10 +419,10 @@ void SkCapFlushFrameLocked(unsigned f)
                 for (auto& P : loaded) {
                     SkCapSlot& q = g_skcap[P.idx];
                     if (q.post || q.seq != e.seq || q.name != e.name || P.nz < 0) continue;
-                    const size_t    m = (P.b.size() < L.b.size() ? P.b.size() : L.b.size()) / 4;
+                    const size_t m = (P.b.size() < L.b.size() ? P.b.size() : L.b.size()) / 4;
                     const uint32_t* a = (const uint32_t*)P.b.data();
-                    size_t          changed = 0;
-                    double          maxd = 0.0;
+                    size_t changed = 0;
+                    double maxd = 0.0;
                     for (size_t i = 0; i < m; ++i) {
                         if (a[i] == w[i]) continue;
                         ++changed;
@@ -438,8 +435,7 @@ void SkCapFlushFrameLocked(unsigned f)
                         if (ad == ad && ad > maxd) maxd = ad; // NaN-safe: a delta that is not a
                     } // number cannot be the maximum
                     sprintf_s(line, "        vs pre: %zu dword(s) changed of %zu, max |float delta| = %.6g%s\n",
-                        changed, m, maxd,
-                        changed ? "" : "   <- THIS PASS WROTE NOTHING TO THIS SLOT");
+                        changed, m, maxd, changed ? "" : "   <- THIS PASS WROTE NOTHING TO THIS SLOT");
                     e.digest += line;
                     break;
                 }
@@ -472,7 +468,7 @@ void SkCapFlushFrameLocked(unsigned f)
 bool SkCapWrite(const std::wstring& dir, const std::wstring& leaf, const void* data, size_t bytes)
 {
     std::wstring path = dir + L"\\" + leaf;
-    FILE*        f = nullptr;
+    FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
     const bool ok = (bytes == 0) || (fwrite(data, 1, bytes, f) == bytes);
     fclose(f);
@@ -487,31 +483,29 @@ bool SkCapArmed()
 }
 
 struct SkCapBail {
-    const void*   cs;
-    UINT          gx;
-    UINT          gy;
-    UINT          gz;
+    const void* cs;
+    UINT gx;
+    UINT gy;
+    UINT gz;
     unsigned long tid;
-    unsigned      depth;
-    bool          had_dev;
-    unsigned      frame;
+    unsigned depth;
+    bool had_dev;
+    unsigned frame;
 };
-static std::mutex             g_skcap_bail_mtx;
+static std::mutex g_skcap_bail_mtx;
 static std::vector<SkCapBail> g_skcap_bails;
 
 void SkCapRecordBail(const void* cs, UINT x, UINT y, UINT z, bool had_device)
 {
     if (g_skcap_arm.load(std::memory_order_relaxed) <= 0) return;
-    SkCapBail                   e{ cs, x, y, z, (unsigned long)GetCurrentThreadId(),
-        ::PortApi::BridgeStackDepth(), had_device,
+    SkCapBail e{ cs, x, y, z, (unsigned long)GetCurrentThreadId(), ::PortApi::BridgeStackDepth(), had_device,
         g_skcap_frame.load(std::memory_order_relaxed) };
     std::lock_guard<std::mutex> l(g_skcap_bail_mtx);
     if (g_skcap_bails.size() < 512) g_skcap_bails.push_back(e);
 }
 
-static void SkCapStageRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name,
-    ID3D12Resource* src, UINT64 off, UINT64 bytes, UINT state,
-    const void* cs, unsigned seq, UINT gx, UINT gy, UINT gz, const char* prov,
+static void SkCapStageRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name, ID3D12Resource* src,
+    UINT64 off, UINT64 bytes, UINT state, const void* cs, unsigned seq, UINT gx, UINT gy, UINT gz, const char* prov,
     char owner, bool counts_as_dispatch)
 {
     if (!dev || !cl || !src || !bytes || !name) return;
@@ -525,12 +519,11 @@ static void SkCapStageRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, cons
 
     // X12 rule 2: in FRAME mode a GAME row spends the G rows' own share of the slice, never the M/D rows'.
     const bool game_share = (owner == 'G') && g_skcap_mode.load(std::memory_order_relaxed) == 1;
-    UINT64&    budget = game_share ? g_skcap_game_budget : g_skcap_budget;
+    UINT64& budget = game_share ? g_skcap_game_budget : g_skcap_budget;
     {
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         if (bytes > budget) {
-            logger::write("SKCAP  seq=%u %-8s %s SKIPPED -- %s exhausted", seq, name,
-                owner == 'D' ? "DRAW" : "GAME",
+            logger::write("SKCAP  seq=%u %-8s %s SKIPPED -- %s exhausted", seq, name, owner == 'D' ? "DRAW" : "GAME",
                 game_share ? "the GAME rows' share of this frame's slice (X12)" : "staging budget");
             return;
         }
@@ -545,7 +538,7 @@ static void SkCapStageRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, cons
     }
 
     D3D12_HEAP_PROPERTIES hp{};
-    D3D12_HEAP_FLAGS      hf{};
+    D3D12_HEAP_FLAGS hf{};
     src->GetHeapProperties(&hp, &hf);
     const auto copy = [&] { cl->CopyBufferRegion(staging, 0, src, off, bytes); };
     if (hp.Type == D3D12_HEAP_TYPE_DEFAULT)
@@ -556,8 +549,7 @@ static void SkCapStageRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, cons
     if (counts_as_dispatch) {
         static std::atomic<unsigned> s_last_seq{ 0xFFFFFFFFu };
         if (s_last_seq.exchange(seq) != seq) {
-            if (g_skcap_mode.load(std::memory_order_relaxed) == 0 &&
-                g_skcap_arm.load(std::memory_order_relaxed) > 0)
+            if (g_skcap_mode.load(std::memory_order_relaxed) == 0 && g_skcap_arm.load(std::memory_order_relaxed) > 0)
                 g_skcap_arm.fetch_sub(1, std::memory_order_relaxed);
             g_skcap_wait.store(3);
         }
@@ -593,19 +585,17 @@ static void SkCapStageRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, cons
     }
 }
 
-void SkCapSnapRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name,
-    ID3D12Resource* src, UINT64 off, UINT64 bytes, UINT state,
-    const void* cs, unsigned seq, UINT gx, UINT gy, UINT gz, const char* prov)
+void SkCapSnapRaw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name, ID3D12Resource* src, UINT64 off,
+    UINT64 bytes, UINT state, const void* cs, unsigned seq, UINT gx, UINT gy, UINT gz, const char* prov)
 {
     SkCapStageRaw(dev, cl, name, src, off, bytes, state, cs, seq, gx, gy, gz, prov, 'G', true);
 }
 
-void SkCapSnapDraw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name,
-    ID3D12Resource* src, UINT64 off, UINT64 bytes, UINT state, unsigned seq,
-    const char* prov)
+void SkCapSnapDraw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, const char* name, ID3D12Resource* src, UINT64 off,
+    UINT64 bytes, UINT state, unsigned seq, const char* prov)
 {
     if (g_skcap_mode.load(std::memory_order_relaxed) == 1) {
-        const unsigned              f = g_skcap_frame.load(std::memory_order_relaxed);
+        const unsigned f = g_skcap_frame.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         for (const SkCapDSeen& s : g_skcap_d_seen)
             if (s.frame == f && s.cl == (const void*)cl && s.res == (const void*)src && s.off == off) {
@@ -689,8 +679,8 @@ void SkCapArmFrames(int frames)
                   "histogram and a post-vs-pre changed-dword count -- every statistic this chain's "
                   "diagnoses have actually rested on. Staging %llu MB sliced to %llu MB per frame, freed "
                   "3 frames after capture so peak stays at one frame.",
-        frames, (unsigned long long)(kSkCapFullWrite >> 10),
-        (unsigned long long)(kSkCapTotalBudget >> 20), (unsigned long long)(slice >> 20));
+        frames, (unsigned long long)(kSkCapFullWrite >> 10), (unsigned long long)(kSkCapTotalBudget >> 20),
+        (unsigned long long)(slice >> 20));
 }
 
 void SkCapBeforeDispatch(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z)
@@ -698,7 +688,7 @@ void SkCapBeforeDispatch(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, UINT 
     if (g_skcap_arm.load(std::memory_order_relaxed) <= 0) return;
 
     const void* cs = (const void*)State().shader[5];
-    unsigned    seq;
+    unsigned seq;
     {
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         seq = g_skcap_seq;
@@ -739,11 +729,11 @@ void SkCapAfterDispatch(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, UINT x
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         if (!g_skcap_pass.empty()) g_skcap_pass.back().t_end_us = SkCapNowUs();
     }
-    if (g_skcap_mode.load(std::memory_order_relaxed) == 0 &&
-        g_skcap_arm.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    if (g_skcap_mode.load(std::memory_order_relaxed) == 0 && g_skcap_arm.fetch_sub(1, std::memory_order_relaxed) <= 0)
+        return;
 
     const void* cs = (const void*)State().shader[5];
-    unsigned    seq;
+    unsigned seq;
     {
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         seq = g_skcap_seq++;
@@ -753,7 +743,7 @@ void SkCapAfterDispatch(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, UINT x
     ShaderCode* sc = AsShaderCode(State().shader[5]);
     SkCapSnapAll(dev, cl, /*post=*/true, cs, seq, x, y, z, sc ? &sc->regs : nullptr);
     {
-        const uint32_t              mask = g_cs_uav_bound_mask.exchange(0, std::memory_order_relaxed);
+        const uint32_t mask = g_cs_uav_bound_mask.exchange(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> l(g_skcap_mtx);
         for (auto it = g_skcap_pass.rbegin(); it != g_skcap_pass.rend(); ++it)
             if (it->seq == seq) {
@@ -770,9 +760,9 @@ void SkCapDrain()
     if (g_skcap_frames_left.load(std::memory_order_relaxed) > 0) {
         if (g_skcap_frames_left.fetch_sub(1, std::memory_order_relaxed) <= 1) {
             g_skcap_arm.store(0, std::memory_order_relaxed); // stop capturing
-            g_skcap_wait.store(3);                           // then let the readback settle
+            g_skcap_wait.store(3); // then let the readback settle
         } else {
-            const unsigned              cur = g_skcap_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+            const unsigned cur = g_skcap_frame.fetch_add(1, std::memory_order_relaxed) + 1;
             std::lock_guard<std::mutex> l(g_skcap_mtx);
             if (cur >= 3) SkCapFlushFrameLocked(cur - 3);
             g_skcap_budget = kSkCapTotalBudget /
@@ -798,18 +788,19 @@ void SkCapDrain()
     SYSTEMTIME st{};
     GetLocalTime(&st);
     wchar_t stamp[64];
-    swprintf_s(stamp, L"SKCAP-%04u%02u%02u_%02u%02u%02u",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    swprintf_s(
+        stamp, L"SKCAP-%04u%02u%02u_%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     std::wstring dir = (DumpDir().empty() ? std::wstring(L".") : DumpDir()) + L"\\" + stamp;
     CreateDirectoryW(dir.c_str(), nullptr);
 
     std::string man;
     man.reserve(1 << 16);
-    char      line[1024];
+    char line[1024];
     const int armed = g_skcap_frames_armed.load(std::memory_order_relaxed);
-    sprintf_s(line, "SKCAP capture -- PRE/POST snapshots taken around each Dispatch, copies recorded into\n"
-                    "the GAME's command list so POST bytes are genuinely after the dispatch executed.\n"
-                    "%d frame(s) armed, %zu pass(es), %zu staged slot(s).\n\n",
+    sprintf_s(line,
+        "SKCAP capture -- PRE/POST snapshots taken around each Dispatch, copies recorded into\n"
+        "the GAME's command list so POST bytes are genuinely after the dispatch executed.\n"
+        "%d frame(s) armed, %zu pass(es), %zu staged slot(s).\n\n",
         armed, g_skcap_pass.size(), g_skcap.size());
     man += line;
 
@@ -835,13 +826,15 @@ void SkCapDrain()
         man += "  frame  passes  refused  staged-slots\n";
         for (size_t i = 0; i < pf.size(); ++i) {
             sprintf_s(line, "  %5zu  %6u  %7u  %12u%s\n", i, pf[i], bf[i], sf[i],
-                (pf[i] == 0 && bf[i] == 0) ? "   <- no compute dispatch seen at all" : (pf[i] == 0 ? "   <- CHAIN DID NOT RUN THIS FRAME" : ""));
+                (pf[i] == 0 && bf[i] == 0) ? "   <- no compute dispatch seen at all"
+                                           : (pf[i] == 0 ? "   <- CHAIN DID NOT RUN THIS FRAME" : ""));
             man += line;
         }
         if (g_skcap_mode.load(std::memory_order_relaxed) == 1) {
-            sprintf_s(line, "  X12: passes staged only their DECLARED registers; GAME rows had 1/%llu of each slice;\n"
-                            "  %u D row(s) not staged because the same list had already staged that slot-6 resource\n"
-                            "  this frame (a list's later draws read what its first draw read).\n",
+            sprintf_s(line,
+                "  X12: passes staged only their DECLARED registers; GAME rows had 1/%llu of each slice;\n"
+                "  %u D row(s) not staged because the same list had already staged that slot-6 resource\n"
+                "  this frame (a list's later draws read what its first draw read).\n",
                 (unsigned long long)kSkCapGameShareDiv, g_skcap_d_dedup);
             man += line;
         }
@@ -855,29 +848,28 @@ void SkCapDrain()
             if (p.uav_bound_mask) {
                 int n = 0;
                 for (int r = 0; r < 16; ++r)
-                    if (p.uav_bound_mask & (1u << r)) n += sprintf_s(ub + n, sizeof(ub) - n, "%su%d",
-                                                          n ? "," : "", r);
+                    if (p.uav_bound_mask & (1u << r)) n += sprintf_s(ub + n, sizeof(ub) - n, "%su%d", n ? "," : "", r);
             }
-            sprintf_s(line, "    BOUND compute UAV registers this dispatch: %s   (what actually reached a "
-                            "root parameter -- if the register the shader writes is missing here, the "
-                            "write goes nowhere)\n",
+            sprintf_s(line,
+                "    BOUND compute UAV registers this dispatch: %s   (what actually reached a "
+                "root parameter -- if the register the shader writes is missing here, the "
+                "write goes nowhere)\n",
                 ub);
             man += line;
         }
         char cl2[256];
         _sprintf_s_l(cl2, sizeof(cl2), "    t=%llu..%lluus (%lluus)  caller: cs=%016llx tgy=%u mod=%d ns='%ls'\n",
             logger::utf8_locale(), p.t_begin_us, p.t_end_us,
-            p.t_end_us > p.t_begin_us ? p.t_end_us - p.t_begin_us : 0ull,
-            p.caller_cs, p.caller_tgy, p.caller_mod, p.caller_ns);
+            p.t_end_us > p.t_begin_us ? p.t_end_us - p.t_begin_us : 0ull, p.caller_cs, p.caller_tgy, p.caller_mod,
+            p.caller_ns);
         man += cl2;
-        sprintf_s(line, "PASS f=%u seq=%u  cs=%p  groups=%u,%u,%u  bytecode=%zu B\n",
-            p.frame, p.seq, p.cs, p.gx, p.gy, p.gz, p.code.size());
+        sprintf_s(line, "PASS f=%u seq=%u  cs=%p  groups=%u,%u,%u  bytecode=%zu B\n", p.frame, p.seq, p.cs, p.gx, p.gy,
+            p.gz, p.code.size());
         man += line;
         if (!p.code.empty()) {
             wchar_t leaf[64];
             swprintf_s(leaf, L"%03u_cs.cso", p.seq);
-            if (!SkCapWrite(dir, leaf, p.code.data(), p.code.size()))
-                man += "    (bytecode write FAILED)\n";
+            if (!SkCapWrite(dir, leaf, p.code.data(), p.code.size())) man += "    (bytecode write FAILED)\n";
         } else {
             man += "    (no bytecode -- AsShaderCode returned nothing for this dispatch)\n";
         }
@@ -895,16 +887,17 @@ void SkCapDrain()
     {
         std::lock_guard<std::mutex> bail_lock(g_skcap_bail_mtx);
         if (!g_skcap_bails.empty()) {
-            sprintf_s(line, "REFUSED DISPATCHES: %zu -- recorded at the `!b.cl || !b.device` gate, which sits\n"
-                            "  BEFORE the capture hook, so these never appear as PASS rows. depth>0 with cl=null\n"
-                            "  means a draw scope IS open somewhere and this thread is not seeing it.\n",
+            sprintf_s(line,
+                "REFUSED DISPATCHES: %zu -- recorded at the `!b.cl || !b.device` gate, which sits\n"
+                "  BEFORE the capture hook, so these never appear as PASS rows. depth>0 with cl=null\n"
+                "  means a draw scope IS open somewhere and this thread is not seeing it.\n",
                 g_skcap_bails.size());
             man += line;
             size_t shown = 0;
             for (auto& e : g_skcap_bails) {
                 if (shown++ >= 64) break; // ten armed frames refuse far more than 16
-                sprintf_s(line, "  BAIL f=%u cs=%p groups=%u,%u,%u thread=%lu bridgeStackDepth=%u device=%s\n",
-                    e.frame, e.cs, e.gx, e.gy, e.gz, e.tid, e.depth, e.had_dev ? "yes" : "NO");
+                sprintf_s(line, "  BAIL f=%u cs=%p groups=%u,%u,%u thread=%lu bridgeStackDepth=%u device=%s\n", e.frame,
+                    e.cs, e.gx, e.gy, e.gz, e.tid, e.depth, e.had_dev ? "yes" : "NO");
                 man += line;
             }
             g_skcap_bails.clear();
@@ -914,21 +907,20 @@ void SkCapDrain()
         sprintf_s(line, "CHAIN CONFIG -- their parsed values. allow_buffer_resize(G) = %s\n",
             ::PortApi::AllowBufferResize() ? "TRUE" : "FALSE");
         man += line;
-        man += "  (their parser gates the whole resize block on that global, IniHandler.cpp parse_texture_override_common)\n";
+        man +=
+            "  (their parser gates the whole resize block on that global, IniHandler.cpp parse_texture_override_common)\n";
         man += "  section                                             hash      byte_width  num_elem  prio\n";
         struct Ctx {
             std::string* out;
-            size_t       shown;
+            size_t shown;
         };
         Ctx ctx{ &man, 0 };
         ::PortApi::ForEachTextureOverrideConfig(
             [](unsigned hash, int bw, int ne, int prio, const wchar_t* section, void* user) {
-                Ctx*         c = (Ctx*)user;
+                Ctx* c = (Ctx*)user;
                 std::wstring low = section ? section : L"";
                 for (wchar_t& ch : low) ch = (wchar_t)towlower(ch);
-                const bool interesting =
-                    bw > 0 ||
-                    low.find(L"shapekey") != std::wstring::npos ||
+                const bool interesting = bw > 0 || low.find(L"shapekey") != std::wstring::npos ||
                     low.find(L"position") != std::wstring::npos;
                 if (!interesting || c->shown >= 400) return;
                 ++c->shown;
@@ -961,7 +953,7 @@ void SkCapDrain()
         for (auto& e : g_skcap) {
             if (!e.bytes || e.bytes > 0xFFFFFFFFull) continue;
             const unsigned bw = (unsigned)e.src_size;
-            bool           have = false;
+            bool have = false;
             for (unsigned x : sizes)
                 if (x == bw) {
                     have = true;
@@ -972,10 +964,10 @@ void SkCapDrain()
         size_t shown = 0;
         for (unsigned bw : sizes) {
             if (shown++ >= 24) break;
-            bool           amb = false;
+            bool amb = false;
             const unsigned assumed = ::PortApi::GameComputeUavBufferHash(bw);
             const unsigned searched = ::PortApi::GameBufferHashSearch(bw, 0, &amb);
-            const char*    note = amb   ? "AMBIGUOUS -- several declared hashes reachable"
+            const char* note = amb      ? "AMBIGUOUS -- several declared hashes reachable"
                 : (!searched)           ? "no declared hash matches any plausible desc"
                 : (searched == assumed) ? "agree"
                                         : "DISAGREE -- the port names this buffer wrongly";
@@ -999,8 +991,7 @@ void SkCapDrain()
             man += e.digest;
             if (!e.keep.empty()) {
                 wchar_t leaf[96];
-                swprintf_s(leaf, L"%03u_f%u_%hs.%hs.buf",
-                    e.seq, e.frame, e.name.c_str(), e.post ? "post" : "pre");
+                swprintf_s(leaf, L"%03u_f%u_%hs.%hs.buf", e.seq, e.frame, e.name.c_str(), e.post ? "post" : "pre");
                 if (SkCapWrite(dir, leaf, e.keep.data(), e.keep.size()))
                     ++files;
                 else
@@ -1012,12 +1003,11 @@ void SkCapDrain()
         man += "  (a row with no view= is a RAW resource capture, not a bound view -- absence is not a fault)\n";
         for (auto& e : g_skcap) {
             std::vector<uint8_t> bytes;
-            const long long      nz = SkCapMapCount(e, bytes);
+            const long long nz = SkCapMapCount(e, bytes);
             if (nz < 0) {
                 sprintf_s(line, " %c  %3u %-9s %-4s %10llu %9llu %9llu %13llx      MAP FAILED -- no conclusion\n",
-                    e.owner, e.seq, e.name.c_str(), e.post ? "post" : "pre",
-                    (unsigned long long)e.bytes, (unsigned long long)e.src_size,
-                    (unsigned long long)e.src_off, e.src_va);
+                    e.owner, e.seq, e.name.c_str(), e.post ? "post" : "pre", (unsigned long long)e.bytes,
+                    (unsigned long long)e.src_size, (unsigned long long)e.src_off, e.src_va);
                 man += line;
             } else {
                 wchar_t leaf[96];
@@ -1027,12 +1017,10 @@ void SkCapDrain()
                 // Same identity as the FRAME-mode digest, so a D row and an M row match by eye here too.
                 const unsigned long long fnv = Fnv1a64Words((const uint32_t*)bytes.data(), bytes.size() / 4);
                 sprintf_s(line, " %c  %3u %-9s %-4s %10llu %9llu %9llu %13llx %8lld %5.1f  fnv=%016llx  %s%s\n",
-                    e.owner, e.seq, e.name.c_str(), e.post ? "post" : "pre",
-                    (unsigned long long)e.bytes, (unsigned long long)e.src_size,
-                    (unsigned long long)e.src_off, e.src_va, nz,
+                    e.owner, e.seq, e.name.c_str(), e.post ? "post" : "pre", (unsigned long long)e.bytes,
+                    (unsigned long long)e.src_size, (unsigned long long)e.src_off, e.src_va, nz,
                     e.bytes ? 100.0 * (double)nz / (double)e.bytes : 0.0, fnv,
-                    e.prov[0] ? e.prov : (nz == 0 ? "ALL ZERO " : ""),
-                    wrote ? "" : "(write FAILED)");
+                    e.prov[0] ? e.prov : (nz == 0 ? "ALL ZERO " : ""), wrote ? "" : "(write FAILED)");
                 man += line;
                 if (e.view[0]) {
                     sprintf_s(line, "        view= %s\n", e.view);
@@ -1059,8 +1047,7 @@ void SkCapDrain()
         }
     }
 
-    if (!SkCapWrite(dir, L"manifest.txt", man.data(), man.size()))
-        logger::write("SKCAP: manifest write FAILED");
+    if (!SkCapWrite(dir, L"manifest.txt", man.data(), man.size())) logger::write("SKCAP: manifest write FAILED");
 
     char narrow[512];
     WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, narrow, sizeof(narrow), nullptr, nullptr);

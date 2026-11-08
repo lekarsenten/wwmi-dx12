@@ -173,8 +173,6 @@ private:
 // The single instance our HackerContext shim hands to their engine.
 Dx12Context* Context();
 
-} // namespace MigotoPort
-
 template <class T>
 void BindSlot(T*& slot, T* v)
 {
@@ -183,3 +181,5 @@ void BindSlot(T*& slot, T* v)
     if (slot) slot->Release();
     slot = v;
 }
+
+} // namespace MigotoPort

@@ -25,26 +25,26 @@ struct RfxDxilCut {
 };
 
 struct RfxDxilSpec {
-    unsigned                glow_reg = 50;   // Texture2D: the GlowMap
-    unsigned                fx_reg = 51;     // Texture2D: the FX map
-    unsigned                params_reg = 52; // Buffer<float4>: [0] = hue turns, sat bias, val bias, brightness (x217..w217)
-    bool                    decensor = false;
-    bool                    inject = true; // false: the decensor constants only, no SRVs added (the game's own root signature)
-    std::vector<RfxDxilCut> cuts;          // not empty: these cuts alone -- no RabbitFX blocks, no decensor
+    unsigned glow_reg = 50; // Texture2D: the GlowMap
+    unsigned fx_reg = 51; // Texture2D: the FX map
+    unsigned params_reg = 52; // Buffer<float4>: [0] = hue turns, sat bias, val bias, brightness (x217..w217)
+    bool decensor = false;
+    bool inject = true; // false: the decensor constants only, no SRVs added (the game's own root signature)
+    std::vector<RfxDxilCut> cuts; // not empty: these cuts alone -- no RabbitFX blocks, no decensor
 };
 
 struct RfxDxilResult {
-    std::vector<uint8_t> code;            // the patched, validated, signed container
-    std::string          why;             // on failure: the step and the reason; on success: what was resolved
-    bool                 settled = false; // the outcome follows from the shader and the spec alone, so it can be kept on disk
-    std::string          ll_before;       // the disassembly and the patched text, for the corpus dump
-    std::string          ll_after;
-    unsigned             srv_max_reg = 0;
-    bool                 has_glow = false;
-    std::string          glow_why;
-    unsigned             decensored = 0; // COLOR0.w - 1/3 constants moved to -0.15
-    unsigned             degated = 0;    // dither subtractions neutralised
-    unsigned             unmasked = 0;   // FMin - 1/3 discard thresholds moved to +1
+    std::vector<uint8_t> code; // the patched, validated, signed container
+    std::string why; // on failure: the step and the reason; on success: what was resolved
+    bool settled = false; // the outcome follows from the shader and the spec alone, so it can be kept on disk
+    std::string ll_before; // the disassembly and the patched text, for the corpus dump
+    std::string ll_after;
+    unsigned srv_max_reg = 0;
+    bool has_glow = false;
+    std::string glow_why;
+    unsigned decensored = 0; // COLOR0.w - 1/3 constants moved to -0.15
+    unsigned degated = 0; // dither subtractions neutralised
+    unsigned unmasked = 0; // FMin - 1/3 discard thresholds moved to +1
 };
 
 bool RfxDxilInit(const wchar_t* dll_dir, std::string& why);

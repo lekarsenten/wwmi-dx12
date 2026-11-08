@@ -18,7 +18,7 @@ namespace MigotoPort {
 // DumpPreview.cso, handed over by the addon (which owns the cso directory) at init.
 void SetDumpPreviewShader(const void* cso, size_t bytes);
 
-bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Texture2D* source,
-    DXGI_FORMAT view_format, const wchar_t* path);
+bool DumpPreviewJpeg(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Texture2D* source, DXGI_FORMAT view_format,
+    const wchar_t* path);
 
 }

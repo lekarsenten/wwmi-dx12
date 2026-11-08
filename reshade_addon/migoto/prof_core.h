@@ -7,44 +7,44 @@ inline constexpr int kProfMaxBuckets = 96; // room for the addon's bucket list (
 
 enum ProfGwKind {
     PGW_ShimCopy = 0, // Dx12Context::CopyResource / CopySubresourceRegion, buffer -> buffer (bytes)
-    PGW_ShimCopyTex,  // the same calls on textures (count only)
-    PGW_Upload,       // FlushPendingUploads, buffer: every Unmap / UpdateSubresource / initial data (bytes)
-    PGW_UploadTex,    // FlushPendingUploads, texture (bytes = the staging footprint)
-    PGW_SkCopy,       // the shapekey chain's own CopyBufferRegion calls (bytes)
-    PGW_ViewCreate,   // a D3D11 view created by the shim: one staging descriptor each (count only)
-    PGW_Barrier,      // Transition(): a ResourceBarrier recorded (count only)
-    PGW_Promoted,     // Transition(): a state change taken by implicit promotion, no barrier (count only)
-    PGW_UavBarrier,   // a UAV barrier a compute write owed, recorded (count only, per resource)
-    PGW_UavCovered,   // a UAV barrier a compute write owed, covered by the transition its next access took (count only)
-    PGW_ReadKept,     // OwnedTransition: a read of a buffer already in a read state that includes it, no barrier (count only)
-    PGW_UploadDedup,  // QueueTextureUpload: an update written over one still queued for the same texture (count only)
+    PGW_ShimCopyTex, // the same calls on textures (count only)
+    PGW_Upload, // FlushPendingUploads, buffer: every Unmap / UpdateSubresource / initial data (bytes)
+    PGW_UploadTex, // FlushPendingUploads, texture (bytes = the staging footprint)
+    PGW_SkCopy, // the shapekey chain's own CopyBufferRegion calls (bytes)
+    PGW_ViewCreate, // a D3D11 view created by the shim: one staging descriptor each (count only)
+    PGW_Barrier, // Transition(): a ResourceBarrier recorded (count only)
+    PGW_Promoted, // Transition(): a state change taken by implicit promotion, no barrier (count only)
+    PGW_UavBarrier, // a UAV barrier a compute write owed, recorded (count only, per resource)
+    PGW_UavCovered, // a UAV barrier a compute write owed, covered by the transition its next access took (count only)
+    PGW_ReadKept, // OwnedTransition: a read of a buffer already in a read state that includes it, no barrier (count only)
+    PGW_UploadDedup, // QueueTextureUpload: an update written over one still queued for the same texture (count only)
     PGW_COUNT
 };
 
 // The lib's timed steps. The addon binds each to its row (profiler.h, ProfBindLibSteps).
 enum ProfLibStep {
     PL_UploadQueue = 0, // QueueUpload / QueueTextureUpload: MakeStaging + Map + memcpy
-    PL_UploadFlush,     // FlushPendingUploads: copies + transitions + staging retire
-    PL_IssueDraw,       // MigotoPort::IssueDraw
-    PL_IssueDispatch,   // MigotoPort::IssueDispatch
-    PL_SK_Lock,         // EngineLock WAIT inside RunResolvedCommandList
-    PL_Disp_Lock,       // EngineLock WAIT in DispatchShaderOverride
-    PL_DI_PsLookup,     // RunSectionByName: the fq name -> section lookup
-    PL_PS_Trace,        // CommandTrampoline: ini_line narrowed per command
-    PL_PS_Observe,      // TypedTrampoline: registry keys narrowed + the addon's typed hooks
-    PL_TexSel_Engine,   // SelectTextureOverride for a hash that HAS a section
-    PL_TexSel_Lock,     // EngineLock WAIT in it
+    PL_UploadFlush, // FlushPendingUploads: copies + transitions + staging retire
+    PL_IssueDraw, // MigotoPort::IssueDraw
+    PL_IssueDispatch, // MigotoPort::IssueDispatch
+    PL_SK_Lock, // EngineLock WAIT inside RunResolvedCommandList
+    PL_Disp_Lock, // EngineLock WAIT in DispatchShaderOverride
+    PL_DI_PsLookup, // RunSectionByName: the fq name -> section lookup
+    PL_PS_Trace, // CommandTrampoline: ini_line narrowed per command
+    PL_PS_Observe, // TypedTrampoline: registry keys narrowed + the addon's typed hooks
+    PL_TexSel_Engine, // SelectTextureOverride for a hash that HAS a section
+    PL_TexSel_Lock, // EngineLock WAIT in it
     PL_COUNT
 };
 
 inline bool g_prof_enabled = false;
 
-inline constexpr int         kProfThreads = 24;
-inline std::atomic<uint32_t> g_prof_tid[kProfThreads];                        // 0 = unclaimed; last slot = OTHER
-inline std::atomic<uint64_t> g_prof_ns_t[kProfThreads][kProfMaxBuckets];      // INCLUSIVE, this frame, per thread
+inline constexpr int kProfThreads = 24;
+inline std::atomic<uint32_t> g_prof_tid[kProfThreads]; // 0 = unclaimed; last slot = OTHER
+inline std::atomic<uint64_t> g_prof_ns_t[kProfThreads][kProfMaxBuckets]; // INCLUSIVE, this frame, per thread
 inline std::atomic<uint64_t> g_prof_self_ns_t[kProfThreads][kProfMaxBuckets]; // EXCLUSIVE, same
-inline std::atomic<uint32_t> g_prof_calls_t[kProfThreads][kProfMaxBuckets];   // call count, same
-inline std::atomic<int>      g_prof_thread_n{ 0 };                            // slots claimed (drain only these)
+inline std::atomic<uint32_t> g_prof_calls_t[kProfThreads][kProfMaxBuckets]; // call count, same
+inline std::atomic<int> g_prof_thread_n{ 0 }; // slots claimed (drain only these)
 
 inline int ProfThreadSlot()
 {
@@ -77,7 +77,7 @@ inline double g_prof_percall_ns = 0.0; // calibrated once when the profiler is f
 
 inline std::atomic<uint64_t> g_gw_n[PGW_COUNT];
 inline std::atomic<uint64_t> g_gw_bytes[PGW_COUNT];
-inline void                  ProfGpuWork(int kind, uint64_t bytes)
+inline void ProfGpuWork(int kind, uint64_t bytes)
 {
     if (!g_prof_enabled) return;
     g_gw_n[kind].fetch_add(1, std::memory_order_relaxed);
@@ -88,7 +88,11 @@ inline int g_prof_lib_bucket[PL_COUNT] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -
 
 inline int64_t prof_qpc_freq()
 {
-    static int64_t f = [] { LARGE_INTEGER li; QueryPerformanceFrequency(&li); return li.QuadPart; }();
+    static int64_t f = [] {
+        LARGE_INTEGER li;
+        QueryPerformanceFrequency(&li);
+        return li.QuadPart;
+    }();
     return f;
 }
 inline int64_t prof_qpc_now()
@@ -104,8 +108,8 @@ inline void ProfCalibrate()
     static std::atomic<uint64_t> sink{ 0 };
     static std::atomic<uint64_t> sink2{ 0 };
     static std::atomic<uint32_t> sink3{ 0 };
-    const int                    N = 50000;
-    const int64_t                t0 = prof_qpc_now();
+    const int N = 50000;
+    const int64_t t0 = prof_qpc_now();
     for (int i = 0; i < N; ++i) {
         const int64_t a = prof_qpc_now();
         const int64_t b = prof_qpc_now();
@@ -114,18 +118,18 @@ inline void ProfCalibrate()
         sink2.fetch_add((uint64_t)(b - a), std::memory_order_relaxed);
     }
     const int64_t t1 = prof_qpc_now();
-    const double  per = (double)(t1 - t0) * 1000000000.0 / (double)prof_qpc_freq() / (double)N;
+    const double per = (double)(t1 - t0) * 1000000000.0 / (double)prof_qpc_freq() / (double)N;
     g_prof_percall_ns = per > 0.0 ? per : 1.0; // never 0 (would hide overhead)
 }
 
 struct ProfScope;
 inline thread_local ProfScope* t_prof_cur = nullptr;
 struct ProfScope {
-    int        b;
-    int64_t    t0 = 0;
-    uint64_t   child = 0;      // ns spent in scopes that ran DIRECTLY inside this one
+    int b;
+    int64_t t0 = 0;
+    uint64_t child = 0; // ns spent in scopes that ran DIRECTLY inside this one
     ProfScope* prev = nullptr; // the scope this one nests in, on this thread
-    int        slot = 0;       // this thread's per-thread row
+    int slot = 0; // this thread's per-thread row
     explicit ProfScope(int bucket)
         : b(g_prof_enabled ? bucket : -1)
     {

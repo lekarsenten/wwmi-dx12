@@ -33,8 +33,11 @@ inline LPVOID GetProcedureAddress(HINSTANCE hModule, LPCSTR szProcName)
 
 class CNktHookLib {
 public:
-    DWORD Hook(SIZE_T* /*nHookId*/, LPVOID* /*lpCallOriginal*/, LPVOID /*lpProcToHook*/,
-        LPVOID /*lpNewProcAddr*/, DWORD /*dwFlags*/ = 0) { return ERROR_NOT_SUPPORTED; }
+    DWORD Hook(SIZE_T* /*nHookId*/, LPVOID* /*lpCallOriginal*/, LPVOID /*lpProcToHook*/, LPVOID /*lpNewProcAddr*/,
+        DWORD /*dwFlags*/ = 0)
+    {
+        return ERROR_NOT_SUPPORTED;
+    }
     DWORD UnhookAll() { return ERROR_NOT_SUPPORTED; }
-    void  SetEnableDebugOutput(BOOL /*bEnable*/) {}
+    void SetEnableDebugOutput(BOOL /*bEnable*/) {}
 };

@@ -4,7 +4,7 @@
 //  See dx12_context.h and docs/PORT-DX11-TO-DX12-TRANSITIONS.md.
 // ===========================================================================
 #include "dx12_context.h"
-#include "../../src/log.h"
+#include "../core/log.h"
 #include <set>
 #include <string>
 #include <mutex>

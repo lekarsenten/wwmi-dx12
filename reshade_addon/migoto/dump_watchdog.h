@@ -5,8 +5,8 @@
 // ===========================================================================
 namespace MigotoPort {
 
-void               DumpStage(const char* stage, unsigned long long detail = 0);
-const char*        DumpStageName(); // the last DumpStage, for a failure report
+void DumpStage(const char* stage, unsigned long long detail = 0);
+const char* DumpStageName(); // the last DumpStage, for a failure report
 unsigned long long DumpStageDetail();
 // Started with the capture, stopped at its end. Logs "DUMP WATCHDOG" every 5 s of no stage change.
 void DumpWatchdogStart();

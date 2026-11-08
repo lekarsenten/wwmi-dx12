@@ -12,9 +12,15 @@ jobs:
   package:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: true
+      - name: Check out this commit and its two submodules
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          git init -q .
+          git remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+          git fetch -q --depth 1 origin $env:GITHUB_SHA
+          git checkout -q FETCH_HEAD
+          git submodule update --init --depth 1
 
       - name: Fetch Dear ImGui, the one ReShade SDK dependency the build uses
         run: git -C reshade_addon/sdk submodule update --init deps/imgui
@@ -35,16 +41,6 @@ jobs:
           $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
           & $msbuild package.proj -m -nologo
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wwmi-dx12
-          path: build_addon/release/*.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wwmi-dx12-map
-          path: build_addon/wwmi_dx12.map
 
       - name: Attach the zip to the release
         if: startsWith(github.ref, 'refs/tags/')

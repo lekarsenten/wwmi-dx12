@@ -78,6 +78,12 @@
     <ClCompile Include="reshade_addon\migoto\dx12_pipeline.cpp">
       <Filter>migoto</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\migoto\dxbc_link.cpp">
+      <Filter>migoto</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\migoto\dx12_present_snap.cpp">
+      <Filter>migoto</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\migoto\dx12_skcap.cpp">
       <Filter>migoto</Filter>
     </ClCompile>
@@ -99,7 +105,19 @@
     <ClCompile Include="reshade_addon\migoto\port_dispatch.cpp">
       <Filter>migoto</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\migoto\port_keygate.cpp">
+    <ClCompile Include="reshade_addon\migoto\key_gate.cpp">
+      <Filter>migoto</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\migoto\command_observer.cpp">
+      <Filter>migoto</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\migoto\selection_watch.cpp">
+      <Filter>migoto</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\migoto\shim_unmet.cpp">
+      <Filter>migoto</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\migoto\port_compat.cpp">
       <Filter>migoto</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\migoto\port_skel_copies.cpp">
@@ -158,7 +176,19 @@
     <ClInclude Include="reshade_addon\migoto\dx12_pipeline.h">
       <Filter>migoto</Filter>
     </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\dxbc_link.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
     <ClInclude Include="reshade_addon\migoto\dx12_pipeline_internal.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\dx12_context_impl.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\dx12_present_snap.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\dx12_skcap.h">
       <Filter>migoto</Filter>
     </ClInclude>
     <ClInclude Include="reshade_addon\migoto\dx12_wrap.h">
@@ -186,6 +216,21 @@
       <Filter>migoto</Filter>
     </ClInclude>
     <ClInclude Include="reshade_addon\migoto\port_keygate.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\key_gate.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\command_observer.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\selection_watch.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\shim_unmet.h">
+      <Filter>migoto</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\migoto\port_ini.h">
       <Filter>migoto</Filter>
     </ClInclude>
     <ClInclude Include="reshade_addon\migoto\frame_analysis_driver.h">

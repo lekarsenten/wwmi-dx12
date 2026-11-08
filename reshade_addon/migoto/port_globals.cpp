@@ -66,12 +66,15 @@
 #include "nvprofile.h"     // ProfileSettings
 #include "Hunting.h"       // MigotoIncludeHandler, ParseHuntingSection
 #include "IniHandler.h"    // GetIniStringAndLog -- their own ini reader, for analyse_options
+#include "input.h"
 #include "util.h"          // parse_enum_option_string
 #include "DLLMainHook.h"   // cHookMgr
-#include "../../src/log.h" // our logger, which LogOverlay is routed to
+#include "../core/log.h" // our logger, which LogOverlay is routed to
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
+#include <string>
 
 Globals  StaticG;
 Globals* G = &StaticG;
@@ -133,12 +136,26 @@ void ParseHuntingSection()
     }
     logger::write("PORT: [Hunting] analyse_options = 0x%08x (from d3dx.ini)",
         (unsigned)G->def_analyse_options);
+    G->config_reloadable = RegisterIniKeyBinding(L"Hunting", L"reload_config", FlagConfigReload, NULL, 0, NULL);
 }
 
 // CleanupShaderMaps drops a released shader from their hunting maps. We keep no such maps.
 void CleanupShaderMaps(ID3D11DeviceChild*) {}
 
-MigotoIncludeHandler::MigotoIncludeHandler(const char*) {}
+// theirs: Hunting.cpp MigotoIncludeHandler -- an #include resolves against the including file's directory
+// (recursive_include) or the first file's, else the working directory; their file is not built here.
+MigotoIncludeHandler::MigotoIncludeHandler(const char* path)
+{
+    push_dir(path);
+}
+
+void MigotoIncludeHandler::push_dir(const char* path)
+{
+    const char* const bs = strrchr(path, '\\');
+    const char* const fs = strrchr(path, '/');
+    const char* const dir_sep = !bs ? fs : !fs ? bs : (bs > fs ? bs : fs);
+    dir_stack.push_back(dir_sep ? std::string(path, (size_t)(dir_sep - path + 1)) : std::string());
+}
 
 HRESULT MigotoIncludeHandler::Open(D3D_INCLUDE_TYPE, LPCSTR pFileName, LPCVOID,
     LPCVOID* ppData, UINT* pBytes)
@@ -146,8 +163,13 @@ HRESULT MigotoIncludeHandler::Open(D3D_INCLUDE_TYPE, LPCSTR pFileName, LPCVOID,
     if (!ppData || !pBytes) return E_INVALIDARG;
     *ppData = nullptr;
     *pBytes = 0;
-    FILE* f = nullptr;
-    if (fopen_s(&f, pFileName, "rb") != 0 || !f) return E_FAIL;
+    std::string apath = (G->recursive_include ? dir_stack.back() : dir_stack.front()) + pFileName;
+    FILE*       f = nullptr;
+    if ((fopen_s(&f, apath.c_str(), "rb") != 0 || !f) && !G->recursive_include) {
+        apath = pFileName;
+        fopen_s(&f, apath.c_str(), "rb");
+    }
+    if (!f) return E_FAIL;
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -161,12 +183,14 @@ HRESULT MigotoIncludeHandler::Open(D3D_INCLUDE_TYPE, LPCSTR pFileName, LPCVOID,
     buf[got] = '\0';
     *ppData = buf;
     *pBytes = (UINT)got;
+    push_dir(apath.c_str());
     return S_OK;
 }
 
 HRESULT MigotoIncludeHandler::Close(LPCVOID pData)
 {
     delete[] (char*)pData;
+    dir_stack.pop_back();
     return S_OK;
 }
 

@@ -2,14 +2,17 @@
 #include <algorithm>
 #include <windows.h>
 #include <psapi.h>
-#include "diag.h"
+#include "diag_gate.h"
 #include "vram_meter.h"
-#include "../addon_state.h"
+#include "../addon/addon.h"
 #include "../build_stamp.h"
-#include "../config.h"
+#include "../addon/settings.h"
+#include "../textures/tex_toggles.h"
 #include "../migoto/port_toggles.h"
 #include "../textures/tex_gc.h"
-#include "../../src/mod_loader.h"
+#include "../textures/mod_texture_store.h"
+#include "../mods/mod_registry.h"
+#include "../mods/mod_set.h"
 
 PerfMonitor g_perf;
 
@@ -26,7 +29,7 @@ const char* OnOff(bool v)
 std::string Utf8(const std::wstring& w)
 {
     if (w.empty()) return std::string();
-    const int   n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
     std::string s((size_t)(n > 0 ? n : 0), '\0');
     if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
     return s;
@@ -34,8 +37,8 @@ std::string Utf8(const std::wstring& w)
 
 std::wstring LogDir()
 {
-    const size_t slash = g_addon_ini_path.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? std::wstring() : g_addon_ini_path.substr(0, slash + 1);
+    const size_t slash = g_settings.ini_path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : g_settings.ini_path.substr(0, slash + 1);
 }
 
 const char* StepName(int i)
@@ -82,7 +85,7 @@ void PerfSpan::Add(const PerfFrame& f)
     if (frames == 1 || f.frame_ms > slowest_ms) slowest_ms = f.frame_ms;
     if (frames == 1 || f.frame_ms < fastest_ms) fastest_ms = f.frame_ms;
     for (int i = 0; i < PROF_COUNT; ++i) {
-        PerfStep&       s = steps[i];
+        PerfStep& s = steps[i];
         const PerfStep& x = f.steps[i];
         s.incl_ms += (x.incl_ms - s.incl_ms) * inv;
         s.self_ms += (x.self_ms - s.self_ms) * inv;
@@ -91,14 +94,13 @@ void PerfSpan::Add(const PerfFrame& f)
     }
     if (f.n_threads > n_threads) n_threads = f.n_threads;
     for (int t = 0; t < n_threads; ++t) {
-        PerfThread&       m = threads[t];
+        PerfThread& m = threads[t];
         const PerfThread& x = f.threads[t];
-        const bool        here = t < f.n_threads;
+        const bool here = t < f.n_threads;
         if (here) m.tid = x.tid;
         m.self_ms += ((here ? x.self_ms : 0.0) - m.self_ms) * inv;
         m.scopes += ((here ? x.scopes : 0.0) - m.scopes) * inv;
-        for (int i = 0; i < PROF_COUNT; ++i)
-            m.step_ms[i] += ((here ? x.step_ms[i] : 0.0) - m.step_ms[i]) * inv;
+        for (int i = 0; i < PROF_COUNT; ++i) m.step_ms[i] += ((here ? x.step_ms[i] : 0.0) - m.step_ms[i]) * inv;
     }
     for (int k = 0; k < GT_COUNT; ++k) {
         gpu_ns[k] += f.gpu_ns[k];
@@ -118,7 +120,7 @@ PerfFigures PerfFigures::Of(const PerfSpan& s, double seconds)
     r.fastest_fps = s.fastest_ms > 0.0 ? 1000.0 / s.fastest_ms : 0.0;
     for (int t = 0; t < s.n_threads; ++t) {
         const PerfThread& th = s.threads[t];
-        const double      net = ThreadNet(th);
+        const double net = ThreadNet(th);
         r.timers_ms += th.scopes * g_prof_percall_ns / 1e6;
         r.cpu_all_ms += net;
         if (th.self_ms > 0.001) ++r.cpu_threads;
@@ -211,7 +213,7 @@ void PerfMonitor::FrameEnd()
 {
     const int64_t freq = prof_qpc_freq();
     const int64_t now = prof_qpc_now();
-    const double  frame_ms = last_frame_ ? (double)(now - last_frame_) * 1000.0 / (double)freq : 0.0;
+    const double frame_ms = last_frame_ ? (double)(now - last_frame_) * 1000.0 / (double)freq : 0.0;
     last_frame_ = now;
     if (g_prof_enabled != was_enabled_) {
         was_enabled_ = g_prof_enabled;
@@ -273,10 +275,10 @@ void PerfMonitor::Drain(double frame_ms)
     }
     for (PerfStep& s : f.steps) s.max_ms = s.incl_ms;
     for (int k = 0; k < GT_COUNT; ++k) {
-        f.gpu_ns[k] = (double)g_gt_ns[k].exchange(0, std::memory_order_relaxed);
-        f.gpu_n[k] = (double)g_gt_n[k].exchange(0, std::memory_order_relaxed);
+        f.gpu_ns[k] = (double)g_gpu_timer_stats.ns[k].exchange(0, std::memory_order_relaxed);
+        f.gpu_n[k] = (double)g_gpu_timer_stats.n[k].exchange(0, std::memory_order_relaxed);
     }
-    f.gpu_frames = g_gt_frames_read.exchange(0, std::memory_order_relaxed);
+    f.gpu_frames = g_gpu_timer_stats.frames_read.exchange(0, std::memory_order_relaxed);
 }
 
 void PerfMonitor::SampleMemory(int64_t now, int64_t freq)
@@ -284,7 +286,7 @@ void PerfMonitor::SampleMemory(int64_t now, int64_t freq)
     if (mem_last_ && now - mem_last_ < freq) return;
     mem_last_ = now;
 
-    PerfMemory  m;
+    PerfMemory m;
     VramReading v;
     if (g_vram.Read(&v)) {
         m.vram_budget = v.budget;
@@ -318,12 +320,12 @@ void PerfMonitor::StartReport(int64_t now)
         r.gw_n0[k] = g_gw_n[k].load(std::memory_order_relaxed);
         r.gw_bytes0[k] = g_gw_bytes[k].load(std::memory_order_relaxed);
     }
-    r.th_all0 = g_th_all.load(std::memory_order_relaxed);
-    r.th_rehash0 = g_th_rehash.load(std::memory_order_relaxed);
-    r.th_same0 = g_th_same.load(std::memory_order_relaxed);
-    r.th_bytes0 = g_th_bytes.load(std::memory_order_relaxed);
-    r.gt_dropped0 = g_gt_dropped.load(std::memory_order_relaxed);
-    r.gt_untimed0 = g_gt_untimed.load(std::memory_order_relaxed);
+    r.th_all0 = g_tex_stats.hash_all.load(std::memory_order_relaxed);
+    r.th_rehash0 = g_tex_stats.hash_rehash.load(std::memory_order_relaxed);
+    r.th_same0 = g_tex_stats.hash_same.load(std::memory_order_relaxed);
+    r.th_bytes0 = g_tex_stats.hash_bytes.load(std::memory_order_relaxed);
+    r.gt_dropped0 = g_gpu_timer_stats.dropped.load(std::memory_order_relaxed);
+    r.gt_untimed0 = g_gpu_timer_stats.untimed.load(std::memory_order_relaxed);
     PortApi::CommandCostMark();
     r.mem_start = mem_;
     r.have_mem_start = have_mem_;
@@ -347,7 +349,7 @@ void PerfMonitor::FinishReport(int64_t now, int64_t freq)
     swprintf_s(name, L"wwmi_dx12_perf_%04d%02d%02d_%02d%02d%02d.txt", st.wYear, st.wMonth, st.wDay, st.wHour,
         st.wMinute, st.wSecond);
     const std::wstring path = LogDir() + name;
-    FILE*              f = nullptr;
+    FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"w") == 0 && f) {
         WriteReport(f, (double)(now - report_.start) / (double)freq);
         std::fclose(f);
@@ -360,9 +362,10 @@ void PerfMonitor::FinishReport(int64_t now, int64_t freq)
 
 void PerfMonitor::WriteReport(FILE* f, double seconds) const
 {
+    ModSetRef set_ref;
     const PerfReportRun& r = report_;
-    const PerfFigures    s = PerfFigures::Of(r.span, seconds);
-    SYSTEMTIME           st;
+    const PerfFigures s = PerfFigures::Of(r.span, seconds);
+    SYSTEMTIME st;
     GetLocalTime(&st);
     std::fprintf(f, "WWMI-DX12 performance report\n");
     std::fprintf(f, "Add-on %s (build %s), %04d-%02d-%02d %02d:%02d:%02d\n", WWMI_VERSION, WWMI_BUILD_SHA, st.wYear,
@@ -373,16 +376,16 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
     std::vector<double> slow = r.frame_ms;
     std::sort(slow.begin(), slow.end(), [](double a, double b) { return a > b; });
     const size_t n1 = (std::max<size_t>)(1, slow.size() / 100);
-    double       low_ms = 0.0;
+    double low_ms = 0.0;
     for (size_t i = 0; i < n1 && i < slow.size(); ++i) low_ms += slow[i];
     low_ms = slow.empty() ? 0.0 : low_ms / (double)(std::min)(n1, slow.size());
     static const double kBandFps[] = { 100.0, 75.0, 50.0, 30.0 };
-    static const char*  kBandName[] = { "over 100 FPS", "75 to 100", "50 to 75", "30 to 50", "under 30" };
-    double              band_ms[5] = {};
-    double              total_ms = 0.0;
+    static const char* kBandName[] = { "over 100 FPS", "75 to 100", "50 to 75", "30 to 50", "under 30" };
+    double band_ms[5] = {};
+    double total_ms = 0.0;
     for (double ms : r.frame_ms) {
         const double fps = ms > 0.0 ? 1000.0 / ms : 0.0;
-        int          b = 4;
+        int b = 4;
         for (int k = 0; k < 4; ++k)
             if (fps > kBandFps[k]) {
                 b = k;
@@ -393,12 +396,14 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
     }
     std::fprintf(f, "FRAME RATE\n");
     std::fprintf(f, "  Average          %6.1f FPS\n", s.fps);
-    std::fprintf(f, "  1%% low           %6.1f FPS   the slowest 1%% of frames\n", low_ms > 0.0 ? 1000.0 / low_ms : 0.0);
+    std::fprintf(
+        f, "  1%% low           %6.1f FPS   the slowest 1%% of frames\n", low_ms > 0.0 ? 1000.0 / low_ms : 0.0);
     std::fprintf(f, "  Slowest frame    %6.1f FPS\n", s.slowest_fps);
     std::fprintf(f, "  Fastest frame    %6.1f FPS\n", s.fastest_fps);
     std::fprintf(f, "  Time spent at   ");
     for (int k = 0; k < 5; ++k)
-        std::fprintf(f, "%s %s %.0f%%", k ? " |" : "", kBandName[k], total_ms > 0.0 ? 100.0 * band_ms[k] / total_ms : 0.0);
+        std::fprintf(
+            f, "%s %s %.0f%%", k ? " |" : "", kBandName[k], total_ms > 0.0 ? 100.0 * band_ms[k] / total_ms : 0.0);
     std::fprintf(f, "\n\n");
 
     std::fprintf(f, "WHAT THE ADD-ON COSTS\n");
@@ -410,17 +415,18 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
             PerfFpsGain(s.frame_ms, s.gpu_ms));
     else
         std::fprintf(f, "  Graphics card  no reading\n");
-    std::fprintf(f, "  Measuring      %.2f ms a frame over all threads, left out of the processor figures\n", s.timers_ms);
-    std::fprintf(f, "  \"Up to\": the processor and the graphics card work side by side, and a frame rate cap hides any gain.\n\n");
+    std::fprintf(
+        f, "  Measuring      %.2f ms a frame over all threads, left out of the processor figures\n", s.timers_ms);
+    std::fprintf(f,
+        "  \"Up to\": the processor and the graphics card work side by side, and a frame rate cap hides any gain.\n\n");
 
     std::fprintf(f, "WHERE THE PROCESSOR TIME GOES (ms a frame, all threads)\n");
-    for (int a = 0; a < PA_COUNT; ++a)
-        std::fprintf(f, "  %-46s %7.3f\n", kPerfAreaNames[a], s.area_ms[a]);
+    for (int a = 0; a < PA_COUNT; ++a) std::fprintf(f, "  %-46s %7.3f\n", kPerfAreaNames[a], s.area_ms[a]);
     std::fprintf(f, "\nWHERE THE GRAPHICS CARD TIME GOES (ms a frame)\n");
     for (int a = 0; a < kPerfGpuAreaCount; ++a)
         std::fprintf(f, "  %-52s %7.3f\n", kPerfGpuAreas[a].name, s.gpu_area_ms[a]);
-    const uint32_t untimed = g_gt_untimed.load(std::memory_order_relaxed) - r.gt_untimed0;
-    const uint32_t dropped = g_gt_dropped.load(std::memory_order_relaxed) - r.gt_dropped0;
+    const uint32_t untimed = g_gpu_timer_stats.untimed.load(std::memory_order_relaxed) - r.gt_untimed0;
+    const uint32_t dropped = g_gpu_timer_stats.dropped.load(std::memory_order_relaxed) - r.gt_dropped0;
     std::fprintf(f, "  Read for %u of %d frames", r.span.gpu_frames, s.frames);
     if (dropped) std::fprintf(f, "; %u frame(s) came back too late to read", dropped);
     if (untimed) std::fprintf(f, "; %u step(s) went untimed, too many in one frame -- the figures are low", untimed);
@@ -438,39 +444,42 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
         mem_.game_working_set / kGB);
     std::fprintf(f, "\n");
 
-    int mods = 0;
-    ModLoader::GetLastStats(mods);
+    const int mods = Mods().DiscoveredCount();
     std::fprintf(f, "SETTINGS\n");
     std::fprintf(f, "  Active mods: %d\n", mods);
     std::fprintf(f, "  A2 Debug log: %s\n", OnOff(r.debug_was));
-    std::fprintf(f, "  A4 Decensor: %s\n", OnOff(g_decensor));
-    std::fprintf(f, "  A5 Hide UID: %s\n", OnOff(g_hide_uid));
-    std::fprintf(f, "  A12 Mod textures in the background: %s\n", OnOff(g_tex_deferred));
-    std::fprintf(f, "  A13 Look-alike texture matches: %s\n", OnOff(g_texlod_resemblance));
-    std::fprintf(f, "  A14 Texture match cache: %s\n", OnOff(g_texlod_cache));
+    std::fprintf(f, "  A4 Decensor: %s\n", OnOff(g_settings.decensor));
+    std::fprintf(f, "  A5 Hide UID: %s\n", OnOff(g_settings.hide_uid));
+    std::fprintf(f, "  A12 Mod textures in the background: %s\n", OnOff(g_settings.tex_deferred));
+    std::fprintf(f, "  A13 Look-alike texture matches: %s\n", OnOff(g_settings.texlod_resemblance));
+    std::fprintf(f, "  A14 Texture match cache: %s\n", OnOff(g_settings.texlod_cache));
     std::fprintf(f, "  A16 Mod buffers in video memory: %s\n", OnOff(MigotoPort::g_buffers_in_vram));
-    std::fprintf(f, "  A19 Mod texture budget: %s\n", TexBudgetName(g_tex_mod_budget));
-    std::fprintf(f, "  A20 Mod textures follow the game's distance sizes: %s\n", OnOff(g_tex_distance));
+    std::fprintf(f, "  A19 Mod texture budget: %s\n", TexBudgetName(g_settings.tex_mod_budget));
+    std::fprintf(f, "  A20 Mod textures follow the game's distance sizes: %s\n", OnOff(g_settings.tex_distance));
     {
-        const TexCollector::Reading& vr = g_tex_gc.Now();
+        const TexGc::Reading& vr = g_tex_gc.Now();
         if (vr.valid)
-            std::fprintf(f, "      video memory %.0f of %.0f MB in use, the game's %.0f MB, mod textures %.0f of %.0f MB allowed%s\n",
-                (double)vr.used / 1048576.0, (double)vr.budget / 1048576.0, (double)vr.game_now / 1048576.0, (double)vr.mods / 1048576.0,
-                (double)vr.room / 1048576.0, g_tex_gc.Tight() ? " (short)" : "");
+            std::fprintf(f,
+                "      video memory %.0f of %.0f MB in use, the game's %.0f MB, mod textures %.0f of %.0f MB allowed%s\n",
+                (double)vr.used / 1048576.0, (double)vr.budget / 1048576.0, (double)vr.game_now / 1048576.0,
+                (double)vr.mods / 1048576.0, (double)vr.room / 1048576.0, g_tex_gc.Tight() ? " (short)" : "");
     }
     std::fprintf(f, "\n");
 
     PortApi::GpuWorkTotals g1;
     PortApi::GetGpuWorkTotals(&g1);
     const double inv = s.frames > 0 ? 1.0 / (double)s.frames : 0.0;
-    auto         pf = [&](unsigned a1, unsigned a0) { return (double)(unsigned)(a1 - a0) * inv; };
+    auto pf = [&](unsigned a1, unsigned a0) { return (double)(unsigned)(a1 - a0) * inv; };
     std::fprintf(f, "MOD SCRIPTS, a frame (the counters 3DMigoto shows on DX11)\n");
-    std::fprintf(f, "  Values sent to shaders (IniParams)    %8.1f\n", pf(g1.iniparams_updates, r.gw0.iniparams_updates));
+    std::fprintf(
+        f, "  Values sent to shaders (IniParams)    %8.1f\n", pf(g1.iniparams_updates, r.gw0.iniparams_updates));
     std::fprintf(f, "  Resource copies                        %8.1f\n", pf(g1.full_copies, r.gw0.full_copies));
-    std::fprintf(f, "  Resources bound by reference           %8.1f\n", pf(g1.reference_copies, r.gw0.reference_copies));
+    std::fprintf(
+        f, "  Resources bound by reference           %8.1f\n", pf(g1.reference_copies, r.gw0.reference_copies));
     std::fprintf(f, "  Buffer region copies                   %8.1f\n", pf(g1.region_copies, r.gw0.region_copies));
     std::fprintf(f, "  Resources cleared                      %8.1f\n", pf(g1.views_cleared, r.gw0.views_cleared));
-    std::fprintf(f, "  Resources created                      %8.1f\n", pf(g1.resources_created, r.gw0.resources_created));
+    std::fprintf(
+        f, "  Resources created                      %8.1f\n", pf(g1.resources_created, r.gw0.resources_created));
     std::fprintf(f, "  Resource pool swaps                    %8.1f\n", pf(g1.pool_swaps, r.gw0.pool_swaps));
     std::fprintf(f, "  Draws and compute added by mods        %8.1f\n", pf(g1.injected_draws, r.gw0.injected_draws));
     std::fprintf(f, "  Section scripts   reused %7.1f   recorded again %7.1f   run in full %7.1f\n",
@@ -494,7 +503,8 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
         "Reads of a buffer already readable, no barrier",
         "Texture uploads merged into one still waiting",
     };
-    static const bool kGwBytes[PGW_COUNT] = { true, false, true, true, true, false, false, false, false, false, false, false };
+    static const bool kGwBytes[PGW_COUNT] = { true, false, true, true, true, false, false, false, false, false, false,
+        false };
     std::fprintf(f, "WORK GIVEN TO THE GRAPHICS CARD, a frame\n");
     for (int k = 0; k < PGW_COUNT; ++k) {
         const double n = (double)(g_gw_n[k].load(std::memory_order_relaxed) - r.gw_n0[k]) * inv;
@@ -504,22 +514,26 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
         else
             std::fprintf(f, "  %-48s %8.1f\n", kGwNames[k], n);
     }
-    std::fprintf(f, "  Game textures read to recognise them: %llu (%.1f MB), of them %llu read again (%llu unchanged)\n\n",
-        (unsigned long long)(g_th_all.load() - r.th_all0), (double)(g_th_bytes.load() - r.th_bytes0) / kMB,
-        (unsigned long long)(g_th_rehash.load() - r.th_rehash0), (unsigned long long)(g_th_same.load() - r.th_same0));
+    std::fprintf(f,
+        "  Game textures read to recognise them: %llu (%.1f MB), of them %llu read again (%llu unchanged)\n\n",
+        (unsigned long long)(g_tex_stats.hash_all.load() - r.th_all0),
+        (double)(g_tex_stats.hash_bytes.load() - r.th_bytes0) / kMB,
+        (unsigned long long)(g_tex_stats.hash_rehash.load() - r.th_rehash0),
+        (unsigned long long)(g_tex_stats.hash_same.load() - r.th_same0));
 
     std::fprintf(f, "DETAILS FOR BUG REPORTS\n\n");
-    std::fprintf(f, "Every measured step, ms a frame over all threads. \"With inner\" includes the steps indented under it.\n");
+    std::fprintf(
+        f, "Every measured step, ms a frame over all threads. \"With inner\" includes the steps indented under it.\n");
     std::fprintf(f, "  %-22s %10s %10s %13s %12s\n", "step", "with inner", "own", "slowest frame", "calls a frame");
     for (int i = 0; i < PROF_COUNT; ++i) {
         const PerfStep& p = s.steps[i];
-        std::fprintf(f, "  %-22s %10.3f %10.3f %13.3f %12.0f\n", kProfSteps[i].name, p.incl_ms, p.self_ms, p.max_ms,
-            p.calls);
+        std::fprintf(
+            f, "  %-22s %10.3f %10.3f %13.3f %12.0f\n", kProfSteps[i].name, p.incl_ms, p.self_ms, p.max_ms, p.calls);
     }
     std::fprintf(f, "\nGraphics card steps, ms a frame (indented rows run inside the row above)\n");
     std::fprintf(f, "  %-46s %9s %11s\n", "step", "ms", "per frame");
     for (int k = 0; k < GT_COUNT; ++k)
-        std::fprintf(f, "  %-46s %9.3f %11.1f\n", g_gt_names[k], s.gpu_step_ms[k], s.gpu_step_n[k]);
+        std::fprintf(f, "  %-46s %9.3f %11.1f\n", kGtNames[k], s.gpu_step_ms[k], s.gpu_step_n[k]);
 
     std::fprintf(f, "\nBusiest threads, ms a frame, each with its largest steps\n");
     int order[kProfThreads];

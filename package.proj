@@ -16,6 +16,7 @@
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\Bc7Half.cso" To="wwmi_dx12\Bc7Half.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.lodcache" To="wwmi_dx12\cache\seed-$(WwmiVersion).lodcache" />
     <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.texlook" To="wwmi_dx12\cache\seed-$(WwmiVersion).texlook" />
+    <WwmiPackageFile Include="$(WwmiRoot)shaderpairs\wwmi_dx12_seed.shaderpairs" To="wwmi_dx12\cache\wwmi_dx12_seed.shaderpairs" />
     <WwmiPackageFile Include="$(WwmiRoot)LICENSE" To="wwmi_dx12\LICENSE" />
     <WwmiPackageFile Include="$(WwmiRoot)THIRD-PARTY-NOTICES.md" To="wwmi_dx12\THIRD-PARTY-NOTICES.md" />
     <WwmiPackageFile Include="$(WwmiRoot)third_party\3Dmigoto\COPYING.txt" To="wwmi_dx12\licenses\3Dmigoto-COPYING.txt" />
@@ -49,7 +50,7 @@ File.WriteAllText(Destination, File.ReadAllText(Source), Encoding.Unicode);
              Properties="Configuration=Release;Platform=x64;WwmiRT=0;WwmiDeploy=false" />
     <RemoveDir Directories="$(WwmiStage)" />
     <Copy SourceFiles="@(WwmiPackageFile)" DestinationFiles="@(WwmiPackageFile->'$(WwmiStage)%(To)')" />
-    <WwmiWriteUtf16 Source="$(WwmiRoot)package\wwmi_dx12.ini" Destination="$(WwmiStage)wwmi_dx12.ini" />
+    <WwmiWriteUtf16 Source="$(WwmiRoot)package\wwmi_dx12.ini" Destination="$(WwmiStage)wwmi_dx12.ini.seed" />
     <ZipDirectory SourceDirectory="$(WwmiStage)" DestinationFile="$(WwmiZip)" Overwrite="true" />
     <GetFileHash Files="$(WwmiZip)" Algorithm="SHA256">
       <Output TaskParameter="Hash" PropertyName="WwmiZipHash" />

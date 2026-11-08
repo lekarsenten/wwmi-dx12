@@ -31,10 +31,10 @@ bool SignatureNames(const uint8_t* d, size_t n, std::vector<std::string>& out)
     if (!u32_at(d, n, 0, &count) || !u32_at(d, n, 4, &first) || count > 64) return false;
     for (uint32_t e = 0; e < count; ++e) {
         const size_t at = (size_t)first + (size_t)e * 32;
-        uint32_t     name = 0;
-        uint32_t     index = 0;
+        uint32_t name = 0;
+        uint32_t index = 0;
         if (!u32_at(d, n, at + 4, &name) || !u32_at(d, n, at + 8, &index) || name >= n) return false;
-        const char*  s = reinterpret_cast<const char*>(d + name);
+        const char* s = reinterpret_cast<const char*>(d + name);
         const size_t len = strnlen(s, n - name);
         if (len == n - name) return false;
         out.push_back(std::string(s, len) + std::to_string(index));
@@ -57,11 +57,11 @@ bool DxilShaderSrvRegs(const void* code, size_t size, DxilSrvRegs& out)
         if (off + 8 > size || memcmp(p + off, "PSV0", 4) != 0) continue;
         if (!u32_at(p, size, off + 4, &psize) || off + 8 + (size_t)psize > size) return false;
         const uint8_t* d = p + off + 8;
-        const size_t   n = psize;
-        uint32_t       info_size = 0;
-        uint32_t       res_count = 0;
-        uint32_t       rec_size = 0;
-        size_t         pos = 0;
+        const size_t n = psize;
+        uint32_t info_size = 0;
+        uint32_t res_count = 0;
+        uint32_t rec_size = 0;
+        size_t pos = 0;
         if (!u32_at(d, n, pos, &info_size)) return false;
         pos += 4 + info_size;
         if (!u32_at(d, n, pos, &res_count)) return false;
@@ -119,7 +119,7 @@ bool DxilShaderShape(const void* code, size_t size, DxilShape& out)
         if (!u32_at(p, size, 32 + (size_t)i * 4, &off) || off + 8 > size) return false;
         if (!u32_at(p, size, off + 4, &psize) || off + 8 + (size_t)psize > size) return false;
         const uint8_t* d = p + off + 8;
-        const size_t   n = psize;
+        const size_t n = psize;
         if (memcmp(p + off, "ISG1", 4) == 0)
             isg = SignatureNames(d, n, out.inputs);
         else if (memcmp(p + off, "OSG1", 4) == 0)
@@ -128,7 +128,7 @@ bool DxilShaderShape(const void* code, size_t size, DxilShape& out)
             uint32_t info_size = 0;
             uint32_t res_count = 0;
             uint32_t rec_size = 0;
-            size_t   pos = 0;
+            size_t pos = 0;
             if (!u32_at(d, n, pos, &info_size)) return false;
             pos += 4 + info_size;
             if (!u32_at(d, n, pos, &res_count)) return false;

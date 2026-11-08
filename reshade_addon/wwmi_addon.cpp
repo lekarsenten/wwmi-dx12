@@ -1,19 +1,25 @@
-// The addon's shared include block. Every hook module compiled into this addon sees the world through
-// addon_common.h, so an extracted file is a move rather than a re-derivation of which header declares
-// what. It is .cpp-only: it ends with `using namespace reshade::api`, which no header may impose.
+// The addon's entry: registration with ReShade, the D3D12 device's activation (our directories, every event hook)
+// and the DLL's unload. The hooks' bodies live in their modules; the ones that need the SEH guard are wrapped here.
 #include "addon_common.h"
 #include <shlwapi.h>
 #include "migoto/dump_preview.h"
-#include "mods/claim_state.h"
-#include "mods/skeleton.h"
-#include "hooks/pipeline_hooks.h"
+#include "mods/character_recognition.h"
+#include "mods/component_table.h"
+#include "mods/game_cb_reader.h"
+#include "mods/layout_registry.h"
+#include "hooks/pipeline_registry.h"
 #include "hooks/cmd_bind_hooks.h"
+#include "hooks/command_list_registry.h"
+#include "hooks/rt_block_hooks.h"
 #include "hooks/resource_tracker.h"
 #include "dispatch/dispatch_parts.h"
-#include "present/present_parts.h"
-#include "instrumentation/device_watch.h" // DredWatchdogStop
-#include "rabbitfx/pso_blend.h"           // RfxPatchWorkerStop
-#include "textures/texture_module.h"      // g_tex_lod_worker
+#include "present/present_hook.h"
+#include "instrumentation/watchdogs.h"
+#include "instrumentation/debug_pipe.h"
+#include "rabbitfx/rfx_patch.h" // RfxPatchWorker::Stop
+#include "textures/tex_hooks.h"
+#include "textures/tex_look_worker.h"
+#include "textures/tex_look.h"
 #include "textures/tex_crawl.h"
 #include "textures/tex_defer.h"
 #include "textures/tex_gc.h"
@@ -22,40 +28,29 @@
 #include "migoto/port_toggles.h" // g_buffers_in_vram
 #include "instrumentation/removal_pin.h"
 #include "instrumentation/hot_path.h"
+#include "instrumentation/game_draw_record.h"
 #include "draw/draw_hook.h"
-#include "instrumentation/draw_dump_publish.h" // X27ResolveVsCbs -- the game's bone CBs per game draw (X23)
-
-bool g_is_dx12 = false;
-
-ID3D12InfoQueue* g_infoq = nullptr;
-
-static ID3D12InfoQueue1* s_infoq1 = nullptr;
-static DWORD             s_infoq1_cookie = 0;
-
-static void __stdcall OnDebugLayerMessage(
-    D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID id, LPCSTR, void*)
-{
-    if (sev > D3D12_MESSAGE_SEVERITY_ERROR) return;
-    static std::mutex                        s_mtx;
-    static std::unordered_map<int, unsigned> s_traced;
-    unsigned                                 k = 0;
-    {
-        std::lock_guard<std::mutex> l(s_mtx);
-        unsigned&                   seen = s_traced[(int)id];
-        if (seen >= 3) return;
-        k = ++seen;
-    }
-    char stack[3072];
-    CrashHandler::FormatCallers(stack, sizeof(stack), 1);
-    const wchar_t* ctx = CrashHandler::Context();
-    logger::write("DBGCALLER id=%d #%u thread %lu%s%ls: %s", (int)id, k, GetCurrentThreadId(),
-        ctx ? " in section " : "", ctx ? ctx : L"", stack);
-}
+#include "draw/draw_sectex.h"
+#include "present/present_log.h"
+#include "addon/addon.h"
+#include "addon/debug_layer.h"
+#include "addon/settings.h"
+#include "build_stamp.h"
+#include "instrumentation/crash_handler.h"
+#include "textures/tex_lod.h"
+#include "textures/tex_toggles.h"
+#include "ui/overlay.h"
+#include "mods/wwmi_runtime.h"
+#include "instrumentation/morph_dump.h"
+#include "migoto/dx12_bridge.h"
+#include "migoto/dx12_pipeline.h"
+#include "mods/buffer_relocation.h"
+#include "textures/mod_texture_store.h"
+#include "mods/mod_set.h"
 
 extern HINSTANCE migoto_handle;
 
-// Mods directory, set in ActivateD3D12.
-std::wstring g_wwmi_dir;
+static std::wstring s_win64; // the game exe's folder, with its trailing separator
 
 static void on_destroy_swapchain(swapchain*, bool resize)
 {
@@ -64,21 +59,20 @@ static void on_destroy_swapchain(swapchain*, bool resize)
         return;
     }
     ::logger::write("Exit: swapchain destroyed -- stopping the watchdogs and saving the persistent settings");
-    FrameEndForgetSwapchain();
-    StallWatchdogStop();
-    DredWatchdogStop();
+    g_frame_step.ForgetSwapchain();
+    g_watchdogs.Stop();
     PortApi::SaveSettingsOnExit();
 }
+
 static void on_destroy_device(device*)
 {
-    StallWatchdogStop();
-    DredWatchdogStop();
-    RfxPatchWorkerStop(); // it creates PSOs on this device
-    g_heap_to_res.unwatch_all();
-    g_tex_lod_worker.Stop();
-    TexCrawlFlushIfQuiet(0);
-    TexLodOnExit();
-    TexLookOnExit();
+    g_watchdogs.Stop();
+    g_rfx_patch.Stop(); // it creates PSOs on this device
+    g_descriptors.UnwatchAll();
+    g_tex_look_worker.Stop();
+    g_tex_crawl.FlushIfQuiet(0);
+    g_tex_lod.OnExit();
+    g_tex_look.OnExit();
     g_tex_defer.Stop();
     g_tex_gc.Stop();
     g_tex_replace.Stop();
@@ -94,13 +88,27 @@ static device* DeviceOf(device_object* obj)
     return obj->get_device();
 }
 
-template <auto Fn>
-struct OwnDevice;
-template <typename R, typename First, typename... A, R (*Fn)(First, A...)>
-struct OwnDevice<Fn> {
+#ifdef WWMI_DEBUG
+static bool on_draw_guarded(command_list* cmd_list, uint32_t vertex_count)
+{
+    WWMI_GUARD_BEGIN("on_draw")
+    g_tex_draw_watch.NoteNonIndexed(cmd_list, vertex_count);
+    return false;
+    WWMI_GUARD_END(false)
+}
+
+static bool on_draw(command_list* cmd_list, uint32_t vertex_count, uint32_t, uint32_t, uint32_t)
+{
+    if (g_addon.disabled) return false;
+    return on_draw_guarded(cmd_list, vertex_count);
+}
+#endif
+
+template <auto Fn> struct OwnDevice;
+template <typename R, typename First, typename... A, R (*Fn)(First, A...)> struct OwnDevice<Fn> {
     static R call(First first, A... a)
     {
-        if (DeviceOf(first) != g_reshade_device) return R();
+        if (DeviceOf(first) != g_addon.reshade_device) return R();
         return Fn(first, a...);
     }
 };
@@ -115,46 +123,21 @@ static void on_init_device(device* dev)
         ::logger::write("Init: not a D3D12 device -- its events are ignored");
         return;
     }
-    if (g_reshade_device) {
+    if (g_addon.reshade_device) {
         ::logger::write("Init: a further D3D12 device -- its events are ignored, the addon stays on the first");
         return;
     }
-    {
-        g_is_dx12 = true;
-        g_reshade_device = dev;
-        ActivateD3D12();
-        ::logger::write("Init: d3d12 device; calling ModLoader::Init");
-        ModLoader::Init(dev);
-        ::logger::write("Init: ModLoader::Init returned");
+    g_addon.is_dx12 = true;
+    g_addon.reshade_device = dev;
+    ActivateD3D12();
+    ::logger::write("Init: d3d12 device; calling g_mod_textures.Init");
+    g_mod_textures.Init(dev);
+    ::logger::write("Init: g_mod_textures.Init returned");
 
-        auto* d3d12_dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
-        g_d3d12_device = d3d12_dev;
-        if (g_dx12_debug_layer && d3d12_dev && !g_infoq) {
-            if (SUCCEEDED(d3d12_dev->QueryInterface(IID_PPV_ARGS(&g_infoq))) && g_infoq) {
-                g_infoq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
-                g_infoq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
-                D3D12_MESSAGE_SEVERITY  keep[] = { D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR };
-                D3D12_INFO_QUEUE_FILTER flt{};
-                flt.AllowList.NumSeverities = _countof(keep);
-                flt.AllowList.pSeverityList = keep;
-                g_infoq->PushStorageFilter(&flt);
-                ::logger::write("DX12 DEBUG LAYER: InfoQueue attached -- validation errors (not warnings) will be "
-                                "logged as DBGLAYER");
-                if (SUCCEEDED(g_infoq->QueryInterface(IID_PPV_ARGS(&s_infoq1))) && s_infoq1 &&
-                    SUCCEEDED(s_infoq1->RegisterMessageCallback(
-                        OnDebugLayerMessage, D3D12_MESSAGE_CALLBACK_FLAG_NONE, s_infoq1, &s_infoq1_cookie)))
-                    ::logger::write("DX12 DEBUG LAYER: the call stack of each error id is logged as DBGCALLER, "
-                                    "first 3 per id");
-                else
-                    ::logger::write("DX12 DEBUG LAYER: no message callback on this layer -- errors carry no call "
-                                    "stack");
-            } else {
-                ::logger::write("DX12 DEBUG LAYER: no ID3D12InfoQueue on this device -- the layer is on but "
-                                "nothing can be read back");
-            }
-        }
-        ::logger::write("Init: on_init_device complete");
-    }
+    auto* d3d12_dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
+    g_addon.d3d12_device = d3d12_dev;
+    if (g_settings.dx12_debug_layer) g_debug_layer.Attach(d3d12_dev);
+    ::logger::write("Init: on_init_device complete");
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "wwmi-dx12";
@@ -164,8 +147,8 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Wuthering Waves Mod 
 static unsigned MoveShaderCache(const std::wstring& from, const std::wstring& to)
 {
     std::vector<std::wstring> names;
-    WIN32_FIND_DATAW          fd;
-    const HANDLE              h = FindFirstFileW((from + L"\\*.rfx*").c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    const HANDLE h = FindFirstFileW((from + L"\\*.rfx*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) names.emplace_back(fd.cFileName);
@@ -182,126 +165,33 @@ static bool on_draw_indexed_guarded(command_list* cmd_list, uint32_t index_count
     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
     WWMI_GUARD_BEGIN("on_draw_indexed")
-    return on_draw_indexed_body(cmd_list, index_count, instance_count, first_index, vertex_offset,
-        first_instance);
+    return on_draw_indexed_body(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
     WWMI_GUARD_END(false) // false = let the game draw its own geometry for this call
 }
 
-// X23: the J1 game-draw table (morph_dump.h GameDrawRecord). Outside the SEH guard on purpose:
-// this layer holds a struct and takes a lock, which the guard function may not (C2712). Entry state is read
-// BEFORE the body -- the pass as the GAME set it, untouched by anything the port binds -- and the outcome
-// AFTER, from the body's return value and the t_x23_* flags. While J1 is not armed this costs one relaxed
-// load and a branch per draw.
-// X25: the mesh buffers CLAIMED draws bound, remembered so a draw of the same buffers through
-// an index range the ini does not declare can be listed too (comp = -1, same_mesh). Only armed J1 reaches
-// this. A handful of entries: one character = one vb0 and one IB.
-namespace {
-struct X25Mesh {
-    uint64_t vb0;
-    uint64_t ib;
-    int      mod;
-};
-std::mutex g_x25_mtx;
-X25Mesh    g_x25[16];
-int        g_x25_n = 0;
-}
-static bool X23Begin(command_list* cmd_list, uint32_t index_count, uint32_t instance_count,
-    uint32_t first_index, MorphDump::GameDrawRecord* r)
+// Outside the SEH guard on purpose: this layer holds a struct and takes a lock, which the guard function may not
+// (C2712). While J1 is not armed this costs one relaxed load and a branch per draw.
+static bool on_draw_indexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+    int32_t vertex_offset, uint32_t first_instance)
 {
-    auto       hit = g_first_to_comp.find(FirstCountKey(first_index, index_count));
-    const bool is_comp = !(hit == g_first_to_comp.end() || hit->second < 0 || hit->second >= (int)g_merged_comps.size());
-    int        mod_id = -1;
-    {
-        const auto& gs = CmdGfx(cmd_list);
-        r->pso = gs.gfx_pso;
-        if (gs.vp_count) {
-            r->vp_w = gs.vp[0].Width;
-            r->vp_h = gs.vp[0].Height;
-        }
-        r->stencil_ref = gs.stencil_ref;
-        r->stencil_ref_set = gs.stencil_ref_set ? 1 : 0;
-        r->vb0_va = gs.vb[0].va;
-        r->vb6_va = gs.vb[6].va;
-        r->vb6_stride = gs.vb[6].stride;
-        r->ib_va = gs.ib.va;
-        const CmdRT& rt = CmdRt(cmd_list);
-        if (rt.valid) {
-            r->rtv_count = rt.rtv_count;
-            r->has_dsv = rt.has_dsv ? 1 : 0;
-            r->dsv = rt.dsv;
-            r->pass_gen = rt.pass_gen;
-        }
-    }
-    if (is_comp) {
-        const MergedComp& mc = g_merged_comps[hit->second];
-        mod_id = mc.mod_id;
-        r->comp = mc.comp_idx;
-        if (r->vb0_va || r->ib_va) {
-            std::lock_guard<std::mutex> l(g_x25_mtx);
-            bool                        known = false;
-            for (int i = 0; i < g_x25_n; ++i)
-                if (g_x25[i].mod == mod_id && g_x25[i].vb0 == r->vb0_va && g_x25[i].ib == r->ib_va) {
-                    known = true;
-                    break;
-                }
-            if (!known && g_x25_n < 16) g_x25[g_x25_n++] = X25Mesh{ r->vb0_va, r->ib_va, mod_id };
-        }
-    } else {
-        // Not a component. The same character's mesh through another index range?
-        if (!r->vb0_va && !r->ib_va) return false;
-        uint8_t same = 0;
-        {
-            std::lock_guard<std::mutex> l(g_x25_mtx);
-            for (int i = 0; i < g_x25_n; ++i) {
-                uint8_t s = 0;
-                if (r->vb0_va && g_x25[i].vb0 == r->vb0_va) s |= 1;
-                if (r->ib_va && g_x25[i].ib == r->ib_va) s |= 2;
-                if (s) {
-                    same = s;
-                    mod_id = g_x25[i].mod;
-                    break;
-                }
-            }
-        }
-        if (!same) return false;
-        r->same_mesh = same;
-        r->comp = -1;
-    }
-    r->frame = g_frame_id;
-    r->mod_id = mod_id;
-    r->list = (uint64_t)cmd_list->get_native();
-    r->thread = (uint32_t)GetCurrentThreadId();
-    r->index_count = index_count;
-    r->first_index = first_index;
-    r->instance_count = instance_count;
-    cmd_list->get_private_data(s_iid_vs_hash, &r->vs);
-    cmd_list->get_private_data(s_iid_ps_hash, &r->ps);
-    if (mod_id >= 0 && mod_id < (int)g_geomods.size()) r->ns = g_geomods[mod_id].wcl_ns.c_str();
-    X27Cb cbs[8];
-    X27ResolveVsCbs(cmd_list, cbs);
-    r->cb3_va = cbs[3].va;
-    r->cb4_va = cbs[4].va;
-    t_x23_claimed = t_x23_shadow = t_x23_cast = t_x23_hidden = 0;
-    t_x23_injected = 0;
-    t_x23_merges = 0;
-    return true;
-}
-
-static bool on_draw_indexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count,
-    uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
-{
-    CmdNoteDraw(cmd_list);
+    g_command_lists.NoteDraw(cmd_list);
 #ifdef WWMI_DEBUG
-    if (g_present_log_left.load(std::memory_order_relaxed) > 0) {
-        g_present_log_draws.fetch_add(1, std::memory_order_relaxed);
-        g_frame_end_draws.fetch_add(1, std::memory_order_relaxed);
+    if (g_present_log.left.load(std::memory_order_relaxed) > 0) {
+        g_present_log.draws.fetch_add(1, std::memory_order_relaxed);
+        g_present_log.frame_end_draws.fetch_add(1, std::memory_order_relaxed);
     }
 #endif
-    if (!MorphDump::Armed() || !g_merged_loaded || g_addon_disabled)
-        return on_draw_indexed_guarded(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
+    if (g_addon.disabled)
+        return on_draw_indexed_guarded(
+            cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
+    ModSetScope set_scope(cmd_list);
+    if (!MorphDump::Armed() || !Comps().Loaded())
+        return on_draw_indexed_guarded(
+            cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
     MorphDump::GameDrawRecord r{};
-    const bool                row = X23Begin(cmd_list, index_count, instance_count, first_index, &r);
-    const bool                ret = on_draw_indexed_guarded(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
+    const bool row = g_game_draw_recorder.Begin(cmd_list, index_count, instance_count, first_index, &r);
+    const bool ret =
+        on_draw_indexed_guarded(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
     if (row) {
         r.claimed = t_x23_claimed;
         r.shadow = t_x23_shadow;
@@ -318,55 +208,17 @@ static bool on_draw_indexed(command_list* cmd_list, uint32_t index_count, uint32
 static void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*)
 {
     WWMI_GUARD_BEGIN("on_present")
-    on_present_body(queue, sc);
+    g_frame_step.OnPresent(queue, sc);
     WWMI_GUARD_END_VOID()
 }
 
-static int g_dred_armed = 0;
-
-void DrainDebugLayer(const char* when)
+// Our folders under the game's: the mod tree (wwmi_dir from the ini), the data and cache directories.
+static void SetupDirectories()
 {
-    if (!g_infoq) return;
-    const UINT64 n = g_infoq->GetNumStoredMessages();
-    for (UINT64 i = 0; i < n; ++i) {
-        SIZE_T len = 0;
-        if (FAILED(g_infoq->GetMessage(i, nullptr, &len)) || !len) continue;
-        std::vector<char> buf(len);
-        D3D12_MESSAGE*    m = (D3D12_MESSAGE*)buf.data();
-        if (FAILED(g_infoq->GetMessage(i, m, &len))) continue;
-        if (m->Severity > D3D12_MESSAGE_SEVERITY_ERROR) continue;
-        static std::unordered_map<int, uint64_t> s_seen;
-        const uint64_t                           k = ++s_seen[(int)m->ID];
-        const bool                               full = k <= 3 || strcmp(when, "frame") != 0;
-        bool                                     decade = false;
-        for (uint64_t p = 10; p <= k; p *= 10)
-            if (k == p) {
-                decade = true;
-                break;
-            }
-        if (full)
-            logger::write("DBGLAYER [%s] sev=%d id=%d #%llu: %.*s", when, (int)m->Severity, (int)m->ID,
-                (unsigned long long)k, (int)m->DescriptionByteLength, m->pDescription);
-        else if (decade)
-            logger::write("DBGLAYER id=%d seen %llu times (only the first 3 are printed)", (int)m->ID,
-                (unsigned long long)k);
-    }
-    if (n) g_infoq->ClearStoredMessages();
-}
-
-static std::wstring s_win64;
-
-static void ActivateD3D12()
-{
-    static std::atomic<bool> s_done{ false };
-    if (s_done.exchange(true)) return;
-    HotPath::Init();
-    CrashHandler::InitReporting();                // report file + module range; needed by the SEH guards
-    if (g_crash_handler) CrashHandler::Install(); // the last-chance filter is the optional part
     wchar_t wwmi_dir_buf[MAX_PATH] = {};
     {
         wchar_t raw[MAX_PATH] = {};
-        GetPrivateProfileStringW(L"wwmi-dx12", L"wwmi_dir", L"", raw, MAX_PATH, g_addon_ini_path.c_str());
+        wcscpy_s(raw, g_settings.String(L"wwmi_dir").c_str());
         if (raw[0] && PathIsRelativeW(raw)) {
             const std::wstring joined = s_win64 + raw;
             if (!GetFullPathNameW(joined.c_str(), MAX_PATH, wwmi_dir_buf, nullptr)) wwmi_dir_buf[0] = 0;
@@ -376,44 +228,48 @@ static void ActivateD3D12()
         const size_t n = wcslen(wwmi_dir_buf);
         if (n && (wwmi_dir_buf[n - 1] == L'\\' || wwmi_dir_buf[n - 1] == L'/')) wwmi_dir_buf[n - 1] = 0;
     }
-    if (wwmi_dir_buf[0]) {
-        MigotoPort::SetDumpDir((std::wstring(wwmi_dir_buf) + L"\\DX12_Dumps").c_str()); // every capture's root
-        g_data_dir = s_win64 + L"wwmi_dx12";
-        const std::wstring cache_dir = g_data_dir + L"\\cache";
-        CreateDirectoryW(g_data_dir.c_str(), nullptr);
-        CreateDirectoryW(cache_dir.c_str(), nullptr);
-        g_shader_cache_dir = cache_dir + L"\\shaders";
-        CreateDirectoryW(g_shader_cache_dir.c_str(), nullptr);
-        if (const unsigned moved = MoveShaderCache(cache_dir, g_shader_cache_dir))
-            ::logger::write("Config: %u cached shader patch(es) moved into %S", moved, g_shader_cache_dir.c_str());
-        if (GetPrivateProfileIntW(L"wwmi-dx12", L"clear_cache", 0, g_addon_ini_path.c_str()) != 0) {
-            unsigned         shaders = 0;
-            WIN32_FIND_DATAW fd;
-            const HANDLE     h = FindFirstFileW((g_shader_cache_dir + L"\\*.rfx*").c_str(), &fd);
-            if (h != INVALID_HANDLE_VALUE) {
-                do {
-                    if (DeleteFileW((g_shader_cache_dir + L"\\" + fd.cFileName).c_str())) ++shaders;
-                } while (FindNextFileW(h, &fd));
-                FindClose(h);
-            }
-            const bool lod = DeleteFileW((cache_dir + L"\\lod_tex_cache.lodcache").c_str()) != 0;
-            WritePrivateProfileStringW(L"wwmi-dx12", L"clear_cache", L"0", g_addon_ini_path.c_str());
-            ::logger::write("Config: clear_cache=1 -- removed %u cached shader patch(es) and %s texture match cache",
-                shaders, lod ? "the" : "no");
-        }
-        g_wwmi_dir = wwmi_dir_buf;
-        ModLoader::Reload(); // deferred -- executes on first Tick() after device init
-        TexLodInit(cache_dir);
-        TexLookInit(cache_dir);
-        ::logger::write("Config: wwmi_dir=%S (their engine reads d3dx.ini there, and every mod it includes)",
-            wwmi_dir_buf);
-    } else {
-        ::logger::write("Config: wwmi_dx12.ini not found or wwmi_dir not set (looked at %S)", g_addon_ini_path.c_str());
+    if (!wwmi_dir_buf[0]) {
+        ::logger::write(
+            "Config: wwmi_dx12.ini not found or wwmi_dir not set (looked at %S)", g_settings.ini_path.c_str());
+        return;
     }
+    MigotoPort::SetDumpDir((std::wstring(wwmi_dir_buf) + L"\\DX12_Dumps").c_str()); // every capture's root
+    g_addon.data_dir = s_win64 + L"wwmi_dx12";
+    const std::wstring cache_dir = g_addon.data_dir + L"\\cache";
+    CreateDirectoryW(g_addon.data_dir.c_str(), nullptr);
+    CreateDirectoryW(cache_dir.c_str(), nullptr);
+    g_addon.shader_cache_dir = cache_dir + L"\\shaders";
+    CreateDirectoryW(g_addon.shader_cache_dir.c_str(), nullptr);
+    if (const unsigned moved = MoveShaderCache(cache_dir, g_addon.shader_cache_dir))
+        ::logger::write("Config: %u cached shader patch(es) moved into %S", moved, g_addon.shader_cache_dir.c_str());
+    if (g_settings.Int(L"clear_cache", 0) != 0) {
+        unsigned shaders = 0;
+        WIN32_FIND_DATAW fd;
+        const HANDLE h = FindFirstFileW((g_addon.shader_cache_dir + L"\\*.rfx*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (DeleteFileW((g_addon.shader_cache_dir + L"\\" + fd.cFileName).c_str())) ++shaders;
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        const bool lod = DeleteFileW((cache_dir + L"\\lod_tex_cache.lodcache").c_str()) != 0;
+        g_settings.Save(L"clear_cache", false);
+        ::logger::write("Config: clear_cache=1 -- removed %u cached shader patch(es) and %s texture match cache",
+            shaders, lod ? "the" : "no");
+    }
+    g_addon.wwmi_dir = wwmi_dir_buf;
+    g_mod_textures.Reload(); // deferred -- executes on first Tick() after device init
+    g_tex_lod.Init(cache_dir);
+    g_tex_look.Init(cache_dir);
+    ::logger::write("Config: wwmi_dir=%S (their engine reads d3dx.ini there, and every mod it includes)", wwmi_dir_buf);
+}
 
+static void RegisterEvents()
+{
     reshade::register_event<reshade::addon_event::destroy_device>(OWN_DEVICE(HP(destroy_device)));
     reshade::register_event<reshade::addon_event::destroy_swapchain>(OWN_DEVICE(HP(destroy_swapchain)));
-    reshade::register_event<reshade::addon_event::create_resource>(OWN_DEVICE(HP(create_resource))); // ALLOW_UNORDERED_ACCESS on a shapekey buffer at creation
+    reshade::register_event<reshade::addon_event::create_resource>(
+        OWN_DEVICE(HP(create_resource))); // ALLOW_UNORDERED_ACCESS on a shapekey buffer at creation
     reshade::register_event<reshade::addon_event::init_resource>(OWN_DEVICE(HP(init_resource)));
     reshade::register_event<reshade::addon_event::update_texture_region>(OWN_DEVICE(HP(update_texture_region)));
     reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OWN_DEVICE(HP(copy_buffer_to_texture)));
@@ -421,46 +277,57 @@ static void ActivateD3D12()
     reshade::register_event<reshade::addon_event::copy_resource>(OWN_DEVICE(HP(copy_resource)));
     reshade::register_event<reshade::addon_event::copy_buffer_region>(OWN_DEVICE(HP(copy_buffer_region)));
     reshade::register_event<reshade::addon_event::barrier>(OWN_DEVICE(HP(barrier)));
-    MigotoPort::SetResourceStateQuery(ResourceStateOf);
+    MigotoPort::SetResourceStateQuery([](void* res) { return g_resources.StateOf(res); });
     {
-        const auto cso = WwmiReadFile((g_cso_dir + L"\\DumpPreview.cso").c_str()); // the capture's .jpg beside each .dds
+        const auto cso =
+            WwmiReadFile((g_addon.cso_dir + L"\\DumpPreview.cso").c_str()); // the capture's .jpg beside each .dds
         MigotoPort::SetDumpPreviewShader(cso.data(), cso.size());
     }
     /* Same contract as the state query above: the addon owns g_buffer_reloc, the port leaf asks. */
-    MigotoPort::g_query_reloc = [](unsigned long long res, unsigned long long* va,
-                                    unsigned long long* bytes) -> bool {
+    MigotoPort::g_query_reloc = [](unsigned long long res, unsigned long long* va, unsigned long long* bytes) -> bool {
         RelocBuf rb{};
         if (!g_buffer_reloc.Resolve(reinterpret_cast<ID3D12Resource*>(res), &rb)) return false;
         if (va) *va = rb.va;
         if (bytes) *bytes = rb.bytes;
         return true;
     };
-    reshade::register_event<reshade::addon_event::execute_command_list>(OWN_DEVICE(HP(execute_command_list))); // submission order vs record order
+    reshade::register_event<reshade::addon_event::execute_command_list>(
+        OWN_DEVICE(HP(execute_command_list))); // submission order vs record order
 
     reshade::register_event<reshade::addon_event::destroy_resource>(OWN_DEVICE(HP(destroy_resource)));
     reshade::register_event<reshade::addon_event::init_resource_view>(OWN_DEVICE(HP(init_resource_view)));
     reshade::register_event<reshade::addon_event::update_descriptor_tables>(OWN_DEVICE(HP(update_descriptor_tables)));
     reshade::register_event<reshade::addon_event::copy_descriptor_tables>(OWN_DEVICE(HP(copy_descriptor_tables)));
-    reshade::register_event<reshade::addon_event::create_pipeline>(OWN_DEVICE(HP(create_pipeline))); // shader replacement (DXIL swap by hash)
+    reshade::register_event<reshade::addon_event::create_pipeline>(
+        OWN_DEVICE(HP(create_pipeline))); // shader replacement (DXIL swap by hash)
     reshade::register_event<reshade::addon_event::init_pipeline>(OWN_DEVICE(HP(init_pipeline)));
     reshade::register_event<reshade::addon_event::init_pipeline_layout>(OWN_DEVICE(HP(init_pipeline_layout)));
     reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(OWN_DEVICE(HP(destroy_pipeline_layout)));
     reshade::register_event<reshade::addon_event::destroy_pipeline>(OWN_DEVICE(HP(destroy_pipeline)));
     reshade::register_event<reshade::addon_event::bind_pipeline>(OWN_DEVICE(HP(bind_pipeline)));
     reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OWN_DEVICE(HP(bind_descriptor_tables)));
-    reshade::register_event<reshade::addon_event::reset_command_list>(OWN_DEVICE(HP(reset_command_list))); // the record follows D3D12: nothing survives a Reset
+    reshade::register_event<reshade::addon_event::reset_command_list>(
+        OWN_DEVICE(HP(reset_command_list))); // the record follows D3D12: nothing survives a Reset
+    reshade::register_event<reshade::addon_event::destroy_command_list>(OWN_DEVICE(on_destroy_command_list));
     reshade::register_event<reshade::addon_event::close_command_list>(OWN_DEVICE(HP(close_command_list)));
-    reshade::register_event<reshade::addon_event::build_acceleration_structure>(OWN_DEVICE(HP(build_acceleration_structure))); // RT ACTIVE + the game's RT work in the pin's tallies
+    reshade::register_event<reshade::addon_event::build_acceleration_structure>(
+        OWN_DEVICE(HP(build_acceleration_structure))); // RT ACTIVE + the game's RT work in the pin's tallies
     reshade::register_event<reshade::addon_event::dispatch_rays>(OWN_DEVICE(HP(dispatch_rays)));
     reshade::register_event<reshade::addon_event::push_descriptors>(OWN_DEVICE(HP(push_descriptors)));
+    reshade::register_event<reshade::addon_event::push_constants>(
+        OWN_DEVICE(HP(push_constants))); // root constants, for putting the game's signature back
     reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OWN_DEVICE(HP(bind_vertex_buffers)));
     reshade::register_event<reshade::addon_event::bind_index_buffer>(OWN_DEVICE(HP(bind_index_buffer)));
-    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OWN_DEVICE(HP(bind_render_targets)));
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+        OWN_DEVICE(HP(bind_render_targets)));
     // The game's non-PSO state, so IssueDraw can restore what it overwrites (their CommandList.cpp:2385).
     reshade::register_event<reshade::addon_event::bind_viewports>(OWN_DEVICE(HP(bind_viewports)));
     reshade::register_event<reshade::addon_event::bind_scissor_rects>(OWN_DEVICE(HP(bind_scissor_rects)));
     reshade::register_event<reshade::addon_event::bind_pipeline_states>(OWN_DEVICE(HP(bind_pipeline_states)));
     reshade::register_event<reshade::addon_event::draw_indexed>(OWN_DEVICE(HP(draw_indexed)));
+#ifdef WWMI_DEBUG
+    reshade::register_event<reshade::addon_event::draw>(OWN_DEVICE(&on_draw));
+#endif
     reshade::register_event<reshade::addon_event::dispatch>(OWN_DEVICE(HP(dispatch)));
     reshade::register_event<reshade::addon_event::present>(OWN_DEVICE(HP(present)));
 
@@ -468,6 +335,17 @@ static void ActivateD3D12()
     DockOverlayPanelOnce();
     reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnOverlayOpen);
     reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOverlayPanel);
+}
+
+static void ActivateD3D12()
+{
+    static std::atomic<bool> s_done{ false };
+    if (s_done.exchange(true)) return;
+    HotPath::Init();
+    CrashHandler::InitReporting(); // report file + module range; needed by the SEH guards
+    if (g_addon.crash_handler) CrashHandler::Install(); // the last-chance filter is the optional part
+    SetupDirectories();
+    RegisterEvents();
     ::logger::write("Init: D3D12 device -- events + overlay registered");
 }
 
@@ -476,24 +354,95 @@ static constexpr uint32_t kOldestReShadeApi = 18;
 static bool RegisterWithReShade(HMODULE addon_module)
 {
     if (reshade::register_addon(addon_module)) {
-        g_reshade_api = RESHADE_API_VERSION;
+        g_addon.reshade_api = RESHADE_API_VERSION;
         return true;
     }
     const HMODULE rs = reshade::internal::get_reshade_module_handle();
-    const auto    reg = rs ? reinterpret_cast<bool (*)(void*, uint32_t)>(GetProcAddress(rs, "ReShadeRegisterAddon")) : nullptr;
-    const auto    imgui = rs ? reinterpret_cast<const imgui_function_table* (*)(uint32_t)>(GetProcAddress(rs, "ReShadeGetImGuiFunctionTable")) : nullptr;
+    const auto reg =
+        rs ? reinterpret_cast<bool (*)(void*, uint32_t)>(GetProcAddress(rs, "ReShadeRegisterAddon")) : nullptr;
+    const auto imgui = rs ? reinterpret_cast<const imgui_function_table* (*)(uint32_t)>(
+                                GetProcAddress(rs, "ReShadeGetImGuiFunctionTable"))
+                          : nullptr;
     if (!reg || !imgui) return false;
     for (uint32_t v = RESHADE_API_VERSION - 1; v >= kOldestReShadeApi; --v) {
         if (!reg(addon_module, v)) continue;
-        g_reshade_api = v;
+        g_addon.reshade_api = v;
         imgui_function_table_instance() = imgui(IMGUI_VERSION_NUM);
         return imgui_function_table_instance() != nullptr;
     }
     return false;
 }
 
+// DRED armed before the device exists: 1 on, 0 not wanted, negative = -(the failing HRESULT's low word).
+static int ArmDred()
+{
+    if (!g_settings.dred) return 0;
+    ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+    HRESULT hr = D3D12GetDebugInterface(IID_PPV_ARGS(&dred));
+    if (FAILED(hr) || !dred) return -(int)(hr & 0xffff);
+    dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    {
+        ID3D12DeviceRemovedExtendedDataSettings1* s1 = nullptr;
+        if (SUCCEEDED(dred->QueryInterface(IID_PPV_ARGS(&s1))) && s1) {
+            s1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            s1->Release();
+        }
+    }
+    dred->Release();
+    return 1;
+}
+
+static void EnableDebugLayer()
+{
+    ID3D12Debug* dbg = nullptr;
+    const HRESULT hrd = D3D12GetDebugInterface(IID_PPV_ARGS(&dbg));
+    if (SUCCEEDED(hrd) && dbg) {
+        dbg->EnableDebugLayer();
+        ID3D12Debug1* dbg1 = nullptr;
+        if (SUCCEEDED(dbg->QueryInterface(IID_PPV_ARGS(&dbg1))) && dbg1) {
+            dbg1->SetEnableSynchronizedCommandQueueValidation(FALSE);
+            dbg1->Release();
+        }
+        dbg->Release();
+        ::logger::write("DX12 DEBUG LAYER: ENABLED (ini dx12_debug_layer=1), synchronized queue validation "
+                        "off -- still slow; every validation error is logged with DBGLAYER");
+    } else {
+        ::logger::write("DX12 DEBUG LAYER: requested but unavailable (hr=%08x) -- install the "
+                        "Graphics Tools optional feature",
+            (unsigned)hrd);
+    }
+}
+
+// The game's Engine.ini: full-resolution textures and streaming cvars, written only where they differ.
+static void ApplyEngineCvars()
+{
+    std::wstring eng = s_win64 + L"..\\..\\Saved\\Config\\WindowsNoEditor\\Engine.ini";
+    const wchar_t* cvars[][2] = { { L"r.Streaming.FullyLoadUsedTextures", L"1" }, { L"r.MipMapLODBias", L"-1" },
+        { L"r.Streaming.Boost", L"30" }, { L"r.Streaming.MinBoost", L"30" }, { L"r.Streaming.HLODStrategy", L"2" } };
+    unsigned written = 0;
+    bool failed = false;
+    for (const auto& kv : cvars) {
+        wchar_t cur[32] = {};
+        GetPrivateProfileStringW(L"SystemSettings", kv[0], L"", cur, (DWORD)std::size(cur), eng.c_str());
+        if (wcscmp(cur, kv[1]) == 0) continue; // already set: the file is left untouched
+        if (WritePrivateProfileStringW(L"SystemSettings", kv[0], kv[1], eng.c_str()))
+            ++written;
+        else
+            failed = true;
+    }
+    ::logger::write("Config: Engine.ini full-res + streaming cvars %s (%u written) (%S)",
+        failed        ? "FAILED"
+            : written ? "applied"
+                      : "already set",
+        written, eng.c_str());
+    g_addon.cfg_engine_path = eng;
+    g_addon.cfg_db_path = s_win64 + L"..\\..\\Saved\\LocalStorage\\LocalStorage.db";
+}
+
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
 {
+    InitModSets();
     if (!RegisterWithReShade(addon_module)) return false;
     migoto_handle = addon_module;
     wchar_t addon_path[MAX_PATH];
@@ -505,155 +454,71 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     GetModuleFileNameW(nullptr, win64, MAX_PATH);
     p = wcsrchr(win64, L'\\');
     if (p) *(p + 1) = L'\0';
+    s_win64 = win64;
     // Our shaders and dxc: wwmi_dx12\ next to the addon, else next to the game exe, else the addon's own dir.
-    g_cso_dir = addon_path;
-    for (const std::wstring& d : { std::wstring(addon_path) + L"\\wwmi_dx12", std::wstring(win64) + L"wwmi_dx12" }) {
+    g_addon.cso_dir = addon_path;
+    for (const std::wstring& d : { std::wstring(addon_path) + L"\\wwmi_dx12", s_win64 + L"wwmi_dx12" }) {
         const DWORD a = GetFileAttributesW(d.c_str());
         if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
-            g_cso_dir = d;
+            g_addon.cso_dir = d;
             break;
         }
     }
-    std::wstring ini_path = std::wstring(win64) + L"wwmi_dx12.ini";
-    ::logger::init((std::wstring(win64) + L"wwmi_dx12_addon.log").c_str());
+    g_settings.Load(s_win64 + L"wwmi_dx12.ini");
+    ::logger::init((s_win64 + L"wwmi_dx12_addon.log").c_str());
     ::logger::set_build_id(WWMI_VERSION " " WWMI_BUILD_SHA); // emitted the moment the level is raised above 0
 
-    if (GetPrivateProfileIntW(L"wwmi-dx12", L"dred", 0, ini_path.c_str()) != 0) {
-        ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
-        HRESULT                                  hr = D3D12GetDebugInterface(IID_PPV_ARGS(&dred));
-        if (SUCCEEDED(hr) && dred) {
-            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            {
-                ID3D12DeviceRemovedExtendedDataSettings1* s1 = nullptr;
-                if (SUCCEEDED(dred->QueryInterface(IID_PPV_ARGS(&s1))) && s1) {
-                    s1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    s1->Release();
-                }
-            }
-            dred->Release();
-            g_dred_armed = 1;
-        } else {
-            g_dred_armed = -(int)(hr & 0xffff);
-        }
-    }
+    const int dred_armed = ArmDred();
 
     {
-        const bool debug = GetPrivateProfileIntW(L"wwmi-dx12", L"debug", 0, ini_path.c_str()) != 0;
-        const int  lvl = GetPrivateProfileIntW(L"wwmi-dx12", L"log_level", g_log_verbosity, ini_path.c_str());
-        SetDiagnostics(debug, (lvl < 1) ? 1 : (lvl > 2) ? 2
-                                                        : lvl);
+        const int lvl = g_settings.log_level;
+        SetDiagnostics(g_settings.debug, (lvl < 1) ? 1 : (lvl > 2) ? 2 : lvl);
     }
 
     // Now that the level is live, say what the pre-log arming actually did.
-    if (g_dred_armed > 0)
+    if (dred_armed > 0)
         ::logger::write("DRED: breadcrumbs + page-fault tracking FORCED ON");
-    else if (g_dred_armed == 0)
+    else if (dred_armed == 0)
         ::logger::write("DRED: off (dred=1 in the ini turns it on)");
     else
         ::logger::write("DRED: unavailable (hr=....%04x) -- device likely already created; a removal will "
                         "report only a reason code",
-            (unsigned)(-g_dred_armed));
-    if (g_reshade_api != RESHADE_API_VERSION)
+            (unsigned)(-dred_armed));
+    if (g_addon.reshade_api != RESHADE_API_VERSION)
         ::logger::write("ReShade: add-on API %u accepted, not %u -- a ReShade older than 6.8.0, which is not supported",
-            g_reshade_api, (unsigned)RESHADE_API_VERSION);
+            g_addon.reshade_api, (unsigned)RESHADE_API_VERSION);
 
-    g_dx12_debug_layer = GetPrivateProfileIntW(L"wwmi-dx12", L"dx12_debug_layer", 0, ini_path.c_str()) != 0;
-    g_addon_ini_path = ini_path;
-    g_decensor = GetPrivateProfileIntW(L"wwmi-dx12", L"decensor", 0, ini_path.c_str()) != 0;
-    g_hide_uid = GetPrivateProfileIntW(L"wwmi-dx12", L"hide_uid", 0, ini_path.c_str()) != 0;
-#ifdef WWMI_DEBUG
-    g_hide_outline = GetPrivateProfileIntW(L"wwmi-dx12", L"hide_outline", 0, ini_path.c_str()) != 0;
-#endif
-    g_tex_deferred = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_background", 1, ini_path.c_str()) != 0;
-    g_texlod_resemblance = GetPrivateProfileIntW(L"wwmi-dx12", L"lod_resemblance", 1, ini_path.c_str()) != 0;
-    g_texlod_cache = GetPrivateProfileIntW(L"wwmi-dx12", L"lod_cache", 1, ini_path.c_str()) != 0;
-    MigotoPort::g_buffers_in_vram = GetPrivateProfileIntW(L"wwmi-dx12", L"buffers_in_vram", 1, ini_path.c_str()) != 0;
-    const int budget_step = (int)GetPrivateProfileIntW(L"wwmi-dx12", L"tex_mod_budget", 1, ini_path.c_str());
-    g_tex_mod_budget = budget_step >= 0 && budget_step < kTexBudgetSteps ? budget_step : 1;
-    g_tex_distance = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_distance", 0, ini_path.c_str()) != 0;
-#ifdef WWMI_DEBUG
-    g_tex_watch_ms = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_watch_ms", 2000, ini_path.c_str());
-    g_tex_vram_cap_mb = GetPrivateProfileIntW(L"wwmi-dx12", L"tex_vram_cap_mb", 0, ini_path.c_str());
-#endif
-    ::logger::write("Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d",
-        (int)g_decensor, (int)g_hide_uid, (int)g_texlod_resemblance, (int)g_texlod_cache, (int)MigotoPort::g_buffers_in_vram,
-        TexBudgetName(g_tex_mod_budget), (int)g_tex_distance);
+    MigotoPort::g_buffers_in_vram = g_settings.Int(L"buffers_in_vram", 1) != 0;
+    ::logger::write(
+        "Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d",
+        (int)g_settings.decensor, (int)g_settings.hide_uid, (int)g_settings.texlod_resemblance,
+        (int)g_settings.texlod_cache, (int)MigotoPort::g_buffers_in_vram, TexBudgetName(g_settings.tex_mod_budget),
+        (int)g_settings.tex_distance);
     g_tex_defer.Start();
-    if (g_dx12_debug_layer) {
-        ID3D12Debug*  dbg = nullptr;
-        const HRESULT hrd = D3D12GetDebugInterface(IID_PPV_ARGS(&dbg));
-        if (SUCCEEDED(hrd) && dbg) {
-            dbg->EnableDebugLayer();
-            ID3D12Debug1* dbg1 = nullptr;
-            if (SUCCEEDED(dbg->QueryInterface(IID_PPV_ARGS(&dbg1))) && dbg1) {
-                dbg1->SetEnableSynchronizedCommandQueueValidation(FALSE);
-                dbg1->Release();
-            }
-            dbg->Release();
-            ::logger::write("DX12 DEBUG LAYER: ENABLED (ini dx12_debug_layer=1), synchronized queue validation "
-                            "off -- still slow; every validation error is logged with DBGLAYER");
-        } else {
-            ::logger::write("DX12 DEBUG LAYER: requested but unavailable (hr=%08x) -- install the "
-                            "Graphics Tools optional feature",
-                (unsigned)hrd);
-        }
-    }
-    ::logger::write("Config: debug=%d (diagnostics %s, log level %d)", (int)g_debug,
-        g_debug ? "ON" : "off", g_debug ? g_log_verbosity : 0);
+    if (g_settings.dx12_debug_layer) EnableDebugLayer();
+    ::logger::write("Config: debug=%d (diagnostics %s, log level %d)", (int)g_debug, g_debug ? "ON" : "off",
+        g_debug ? g_log_verbosity : 0);
 
-    {
-        std::wstring   eng = std::wstring(win64) + L"..\\..\\Saved\\Config\\WindowsNoEditor\\Engine.ini";
-        const wchar_t* cvars[][2] = {
-            { L"r.Streaming.FullyLoadUsedTextures", L"1" }, { L"r.MipMapLODBias", L"-1" },
-            { L"r.Streaming.Boost", L"30" }, { L"r.Streaming.MinBoost", L"30" },
-            { L"r.Streaming.HLODStrategy", L"2" }
-        };
-        unsigned written = 0;
-        bool     failed = false;
-        for (const auto& kv : cvars) {
-            wchar_t cur[32] = {};
-            GetPrivateProfileStringW(L"SystemSettings", kv[0], L"", cur, (DWORD)std::size(cur), eng.c_str());
-            if (wcscmp(cur, kv[1]) == 0) continue; // already set: the file is left untouched
-            if (WritePrivateProfileStringW(L"SystemSettings", kv[0], kv[1], eng.c_str()))
-                ++written;
-            else
-                failed = true;
-        }
-        ::logger::write("Config: Engine.ini full-res + streaming cvars %s (%u written) (%S)",
-            failed ? "FAILED" : written ? "applied"
-                                        : "already set",
-            written, eng.c_str());
-        g_cfg_engine_path = eng;
-        g_cfg_db_path = std::wstring(win64) + L"..\\..\\Saved\\LocalStorage\\LocalStorage.db";
-    }
+    ApplyEngineCvars();
 
-    s_win64 = win64;
     reshade::register_event<reshade::addon_event::init_device>(on_init_device);
+    PortApi::SetParseObserver(&BuildModSet, nullptr);
     ::logger::write("Init: AddonInit complete; inactive until a D3D12 device is created");
     return true;
 }
 
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
 {
-    if (s_infoq1) {
-        if (s_infoq1_cookie) s_infoq1->UnregisterMessageCallback(s_infoq1_cookie);
-        s_infoq1->Release();
-        s_infoq1 = nullptr;
-    }
-    if (g_infoq) {
-        g_infoq->Release();
-        g_infoq = nullptr;
-    } // never survive a probe unload
+    g_debug_layer.Detach();
     PortApi::SaveSettingsOnExit();
-    StallWatchdogStop(); // no thread of this DLL may outlive its mapping
-    DredWatchdogStop();
-    RfxPatchWorkerStop();
-    g_heap_to_res.unwatch_all(); // a live heap's release must not call into this DLL once it is unmapped
-    g_tex_lod_worker.Stop();
-    TexCrawlFlushIfQuiet(0);
-    TexLodOnExit();
-    TexLookOnExit();
+    g_watchdogs.Stop(); // no thread of this DLL may outlive its mapping
+    DebugPipe::Shutdown();
+    g_rfx_patch.Stop();
+    g_descriptors.UnwatchAll(); // a live heap's release must not call into this DLL once it is unmapped
+    g_tex_look_worker.Stop();
+    g_tex_crawl.FlushIfQuiet(0);
+    g_tex_lod.OnExit();
+    g_tex_look.OnExit();
     g_tex_defer.Stop();
     g_tex_gc.Stop();
     g_tex_replace.Stop();

@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
+    <Filter Include="addon">
+      <UniqueIdentifier>{a0afe2e7-08c4-5147-9580-3bf80e7a627f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="core">
+      <UniqueIdentifier>{029c1848-45b6-5c1f-a19d-543b1caf6307}</UniqueIdentifier>
+    </Filter>
     <Filter Include="dispatch">
       <UniqueIdentifier>{623e37e7-c557-5dae-870f-32406d6d3da6}</UniqueIdentifier>
     </Filter>
@@ -34,9 +40,6 @@
     <Filter Include="shapekeys">
       <UniqueIdentifier>{d3f14080-c531-5741-9d42-e74ebec6172a}</UniqueIdentifier>
     </Filter>
-    <Filter Include="src">
-      <UniqueIdentifier>{520a53e9-6db3-5885-a28c-83642dd9a425}</UniqueIdentifier>
-    </Filter>
     <Filter Include="textures">
       <UniqueIdentifier>{1625466e-8911-5b67-b0d2-3975e56e310f}</UniqueIdentifier>
     </Filter>
@@ -46,16 +49,40 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="reshade_addon\wwmi_addon.cpp" />
+    <ClCompile Include="reshade_addon\addon\addon.cpp">
+      <Filter>addon</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\addon\settings.cpp">
+      <Filter>addon</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\addon\debug_layer.cpp">
+      <Filter>addon</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\game_draw_record.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\mods\layout_registry.cpp">
       <Filter>mods</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\mods\shader_alias.cpp">
       <Filter>mods</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\hooks\pipeline_hooks.cpp">
+    <ClCompile Include="reshade_addon\hooks\pipeline_registry.cpp">
+      <Filter>hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\hooks\rt_block_hooks.cpp">
       <Filter>hooks</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\hooks\cmd_bind_hooks.cpp">
+      <Filter>hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\hooks\command_list_registry.cpp">
+      <Filter>hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\hooks\descriptor_shadow.cpp">
+      <Filter>hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\hooks\stamp_ledger.cpp">
       <Filter>hooks</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\hooks\resource_tracker.cpp">
@@ -64,14 +91,17 @@
     <ClCompile Include="reshade_addon\rabbitfx\rabbitfx_bind.cpp">
       <Filter>rabbitfx</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_tex_class.cpp">
+      <Filter>rabbitfx</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\mods\port_section.cpp">
       <Filter>mods</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\dispatch\dispatch_hook.cpp">
       <Filter>dispatch</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\dispatch_diag.cpp">
-      <Filter>instrumentation</Filter>
+    <ClCompile Include="reshade_addon\dispatch\dispatch_diag.cpp">
+      <Filter>dispatch</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\dispatch\dispatch_overrides.cpp">
       <Filter>dispatch</Filter>
@@ -82,8 +112,8 @@
     <ClCompile Include="reshade_addon\present\present_hook.cpp">
       <Filter>present</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\present_diag.cpp">
-      <Filter>instrumentation</Filter>
+    <ClCompile Include="reshade_addon\present\present_diag.cpp">
+      <Filter>present</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\present\present_engine.cpp">
       <Filter>present</Filter>
@@ -94,7 +124,16 @@
     <ClCompile Include="reshade_addon\present\present_mod_load.cpp">
       <Filter>present</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\device_watch.cpp">
+    <ClCompile Include="reshade_addon\instrumentation\watchdogs.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\diag_arms.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\uav_stalker.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\perf_panel.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\draw\draw_hook.cpp">
@@ -103,8 +142,8 @@
     <ClCompile Include="reshade_addon\draw\draw_claim.cpp">
       <Filter>draw</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\draw_probes.cpp">
-      <Filter>instrumentation</Filter>
+    <ClCompile Include="reshade_addon\draw\draw_probes.cpp">
+      <Filter>draw</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\draw\draw_shadow.cpp">
       <Filter>draw</Filter>
@@ -118,7 +157,13 @@
     <ClCompile Include="reshade_addon\draw\draw_restore.cpp">
       <Filter>draw</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\draw\draw_comp.cpp">
+    <ClCompile Include="reshade_addon\draw\draw_component.cpp">
+      <Filter>draw</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\draw\draw_skel_copies.cpp">
+      <Filter>draw</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\draw\draw_sectex.cpp">
       <Filter>draw</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\draw\draw_section_draw.cpp">
@@ -127,11 +172,8 @@
     <ClCompile Include="reshade_addon\draw\section_ps_stamp.cpp">
       <Filter>draw</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\mods\claim_state.cpp">
+    <ClCompile Include="reshade_addon\mods\character_recognition.cpp">
       <Filter>mods</Filter>
-    </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\stall_watchdog.cpp">
-      <Filter>instrumentation</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\removal_pin.cpp">
       <Filter>instrumentation</Filter>
@@ -142,20 +184,74 @@
     <ClCompile Include="reshade_addon\rabbitfx\rfx_dxil.cpp">
       <Filter>rabbitfx</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\textures\texture_module.cpp">
+    <ClCompile Include="reshade_addon\textures\tex_toggles.cpp">
       <Filter>textures</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\rabbitfx\pso_blend.cpp">
+    <ClCompile Include="reshade_addon\textures\tex_identity.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_rules.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_select.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_place.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_mip_identity.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_upload_identity.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_readback.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_lineage.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_look_worker.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_hooks.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_lod_table.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_lod_file.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_lod_learn.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_look_ssim.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_look_index.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\rabbitfx\pso_clone.cpp">
       <Filter>rabbitfx</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\textures\tex_lod.cpp">
-      <Filter>textures</Filter>
+    <ClCompile Include="reshade_addon\rabbitfx\pso_variant.cpp">
+      <Filter>rabbitfx</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\textures\tex_look.cpp">
-      <Filter>textures</Filter>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_patch.cpp">
+      <Filter>rabbitfx</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\textures\tex_crawl.cpp">
-      <Filter>textures</Filter>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_patched_ps.cpp">
+      <Filter>rabbitfx</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_shadow_heap.cpp">
+      <Filter>rabbitfx</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_patch_srvs.cpp">
+      <Filter>rabbitfx</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_toggles.cpp">
+      <Filter>rabbitfx</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\textures\tex_defer.cpp">
       <Filter>textures</Filter>
@@ -172,10 +268,34 @@
     <ClCompile Include="reshade_addon\textures\tex_gc.cpp">
       <Filter>textures</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\vram_meter.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\tex_timing.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\mods\skeleton.cpp">
+    <ClCompile Include="reshade_addon\instrumentation\gpu_timer.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\perf_monitor.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_crawl.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\hud\uid_hide.cpp">
+      <Filter>hud</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\mods\component_table.cpp">
+      <Filter>mods</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\mods\game_cb_reader.cpp">
+      <Filter>mods</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\mods\mod_registry.cpp">
+      <Filter>mods</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\mods\mod_set.cpp">
       <Filter>mods</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\ui\overlay.cpp">
@@ -217,29 +337,29 @@
     <ClCompile Include="reshade_addon\instrumentation\crash_handler.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\gpu_timer.cpp">
-      <Filter>instrumentation</Filter>
-    </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\perf_monitor.cpp">
-      <Filter>instrumentation</Filter>
-    </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\vram_meter.cpp">
-      <Filter>instrumentation</Filter>
-    </ClCompile>
-    <ClCompile Include="reshade_addon\hud\uid_hide.cpp">
-      <Filter>hud</Filter>
-    </ClCompile>
     <ClCompile Include="reshade_addon\rt\rt_stub.cpp">
       <Filter>rt</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\chain_trace.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\diagnostics.cpp">
+    <ClCompile Include="reshade_addon\instrumentation\shader_capture.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\dispatch_capture.cpp">
+    <ClCompile Include="reshade_addon\instrumentation\debug_pipe.cpp">
       <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_pipe_alias.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_slot_log.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\draw\draw_diag.cpp">
+      <Filter>draw</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\dispatch\dispatch_capture.cpp">
+      <Filter>dispatch</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\draw_dump_publish.cpp">
       <Filter>instrumentation</Filter>
@@ -256,66 +376,111 @@
     <ClCompile Include="reshade_addon\instrumentation\occlusion_probe.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\instrumentation\skeleton_dump.cpp">
-      <Filter>instrumentation</Filter>
+    <ClCompile Include="reshade_addon\mods\skeleton_dump.cpp">
+      <Filter>mods</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\sk_ring.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
-    <ClCompile Include="src\mod_loader.cpp">
-      <Filter>src</Filter>
+    <ClCompile Include="reshade_addon\draw\draw_panel.cpp">
+      <Filter>draw</Filter>
     </ClCompile>
-    <ClCompile Include="src\dxil_cb.cpp">
-      <Filter>src</Filter>
+    <ClCompile Include="reshade_addon\textures\tex_panel.cpp">
+      <Filter>textures</Filter>
     </ClCompile>
-    <ClCompile Include="src\gpu_progress.cpp">
-      <Filter>src</Filter>
+    <ClCompile Include="reshade_addon\rabbitfx\rfx_panel.cpp">
+      <Filter>rabbitfx</Filter>
     </ClCompile>
-    <ClCompile Include="src\log.cpp">
-      <Filter>src</Filter>
+    <ClCompile Include="reshade_addon\draw\render_fixes_panel.cpp">
+      <Filter>draw</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\capture_panel.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\mods\port_panel.cpp">
+      <Filter>mods</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\shapekeys\sk_panel.cpp">
+      <Filter>shapekeys</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\morph_dump_panel.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\mod_texture_store.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\core\dxil_cb.cpp">
+      <Filter>core</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\core\gpu_progress.cpp">
+      <Filter>core</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\core\log.cpp">
+      <Filter>core</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="reshade_addon\addon_common.h" />
-    <ClInclude Include="reshade_addon\addon_core.h" />
-    <ClInclude Include="reshade_addon\addon_state.h" />
     <ClInclude Include="reshade_addon\build_stamp.h" />
-    <ClInclude Include="reshade_addon\config.h" />
+    <ClInclude Include="reshade_addon\rt\pt_skin.h">
+      <Filter>rt</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\rt\pt_skin_owned.h">
+      <Filter>rt</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\rt\rt_blas.h">
+      <Filter>rt</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\rt\rt_diag_dispatch.h">
+      <Filter>rt</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\rt\rt_draw.h">
+      <Filter>rt</Filter>
+    </ClInclude>
     <ClInclude Include="reshade_addon\rt\rt_hooks.h">
       <Filter>rt</Filter>
     </ClInclude>
-    <ClInclude Include="src\buffer_view_fit.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\rt\rt_pal_record.h">
+      <Filter>rt</Filter>
     </ClInclude>
-    <ClInclude Include="src\d3d12_barrier.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\rt\rt_rings.h">
+      <Filter>rt</Filter>
     </ClInclude>
-    <ClInclude Include="src\d3d12_buffer.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\buffer_view_fit.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\dxgi_bc.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\d3d12_barrier.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\dxgi_format_info.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\d3d12_buffer.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\dxil_cb.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\d3d12_name.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\fnv.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\dxgi_bc.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\gpu_progress.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\dxgi_format_info.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\gpu_queue.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\dxil_cb.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\log.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\fnv.h">
+      <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="src\mod_loader.h">
-      <Filter>src</Filter>
+    <ClInclude Include="reshade_addon\core\gpu_progress.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\core\gpu_queue.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\core\log.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="reshade_addon\textures\mod_texture_store.h">
+      <Filter>textures</Filter>
     </ClInclude>
     <ClInclude Include="reshade_addon\migoto\prof_core.h">
       <Filter>migoto</Filter>
