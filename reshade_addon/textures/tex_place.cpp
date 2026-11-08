@@ -142,7 +142,10 @@ bool TexPlacement::Swap(ID3D12Device* dev, uint64_t heap_handle, uint32_t slot, 
             const uint64_t held = reinterpret_cast<uint64_t>(res);
             std::lock_guard l(missed_mutex_); // its slot is recorded: retry it later
             missed_.insert(held);
-            if (loading) queued_[held] = QueuedPick{ loading, loading_gen, rule_hash, ++queued_seq_ };
+            if (loading)
+                queued_[held] = QueuedPick{ loading, loading_gen, rule_hash, ++queued_seq_ };
+            else if (from_snapshot)
+                queued_.erase(held);
             queued_n_.store(queued_.size(), std::memory_order_release);
         }
         if (loading && candidate && g_debug && DiagOnce("TEXQUEUE", (int)rule_hash))
@@ -428,9 +431,13 @@ void TexPlacement::RestampOnVarChange()
     });
     for (const auto& [res, rule] : carriers) {
         const bool ok = g_stamps.Restamp(res);
+        const bool given_back = !ok && g_stamps.Unstamp(res, false);
         if (logger::enabled(1) && DiagOnce("TEXVARS-RESTAMP", (int)rule))
             logger::write("TEXVARS-RESTAMP f=%u rule=%08x res=%p: a variable its section reads changed -- %s", g_frame_id,
-                rule, (void*)res, ok ? "swapped again" : "not swapped (no selection now, or no slot recorded)");
+                rule, (void*)res,
+                ok           ? "swapped again"
+                    : given_back ? "its section selects nothing now: the game's texture given back"
+                                 : "not swapped (no selection now, or no slot recorded)");
     }
 }
 
