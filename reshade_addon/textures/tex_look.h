@@ -21,6 +21,7 @@ public:
     void OnExit();
     bool Wants(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt, bool is_target);
     void OnCut(uint32_t hash, const TexLookCut& cut, bool is_target);
+    bool TakeRef(uint32_t hash, uint32_t target, const TexLookCut& cut);
     void AtPlace(uint64_t pass, uint32_t slot, uint32_t hash, uint32_t target); // a component draw's slot
     void AtMeshPlace(uint64_t place, uint32_t hash, uint32_t target); // a game character draw's
     void AddMeshPlace(uint64_t place, uint32_t target);
@@ -45,7 +46,7 @@ private:
     uint32_t TargetOf(uint32_t hash, bool is_target) const;
     bool Offered(uint32_t hash) const;
     bool KeepRef(uint32_t target, texlook::Ref&& r);
-    void Offer(uint32_t source, uint32_t target, texlook::LookSig&& sig);
+    bool Offer(uint32_t source, uint32_t target, texlook::LookSig&& sig);
     void Match(uint32_t hash, const texlook::LookSig& sig);
     void MarkDirty();
     bool KeepPlace(PlaceMap& m, uint64_t place, uint32_t target);

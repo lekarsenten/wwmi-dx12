@@ -94,9 +94,17 @@ bool TexLodCache::LearnLookalike(uint32_t low, uint32_t high, uint32_t mip, floa
     return true;
 }
 
-void TexLodCache::ChainAlias(uint32_t id, uint32_t rule, int depth, bool look, uint32_t mip, float ssim)
+void TexLodCache::ChainAlias(uint32_t id, int depth, uint32_t mip, ChainWalk& walk)
 {
+    const uint32_t rule = walk.rule;
+    const bool look = walk.look;
     if (!id || !rule || id == rule || depth > 16) return;
+    const auto walked = walk.depth_of.find(id);
+    if (walked != walk.depth_of.end() && walked->second <= depth) {
+        ++walk.rewalks_skipped;
+        return;
+    }
+    walk.depth_of[id] = depth;
     const bool degen = degenerate_.count(id) != 0;
     auto rec = records_.find(id);
     if (degen || (rec != records_.end() && TexLodExact(rec->second))) {
@@ -111,7 +119,7 @@ void TexLodCache::ChainAlias(uint32_t id, uint32_t rule, int depth, bool look, u
             return;
         }
     } else {
-        const bool added = look ? LearnLookalike(id, rule, mip, ssim, true, false)
+        const bool added = look ? LearnLookalike(id, rule, mip, walk.ssim, true, false)
                                 : LearnExact(id, rule, mip, true, false, "lineage-chain");
         if (g_debug && added)
             logger::write("LINEAGE-CHAIN %08x -> %08x mip %u (%s: fed a mip of a texture that is that target)", id,
@@ -119,7 +127,7 @@ void TexLodCache::ChainAlias(uint32_t id, uint32_t rule, int depth, bool look, u
     }
     auto it = feeders_.find(id);
     if (it == feeders_.end()) return;
-    for (const Feeder& f : it->second) ChainAlias(f.low, rule, depth + 1, look, TexLodBelow(mip, f.steps), ssim);
+    for (const Feeder& f : it->second) ChainAlias(f.low, depth + 1, TexLodBelow(mip, f.steps), walk);
 }
 
 void TexLodCache::Feeds(uint32_t lower, uint32_t big, uint32_t big_rule, uint32_t steps)
@@ -147,7 +155,16 @@ void TexLodCache::Feeds(uint32_t lower, uint32_t big, uint32_t big_rule, uint32_
                 : look ? "look-alike record"
                        : "exact record",
             rule);
-    ChainAlias(lower, rule, 0, look, mip, ssim);
+    ChainWalk walk;
+    walk.rule = rule;
+    walk.look = look;
+    walk.ssim = ssim;
+    ChainAlias(lower, 0, mip, walk);
+#ifdef WWMI_DEBUG
+    if (g_debug && walk.rewalks_skipped && DiagChanged(&feeders_, (int)lower, walk.depth_of.size()))
+        logger::write("LINEAGE-WEB %08x fed %08x: %zu texture(s) walked, %u route(s) to one already walked not taken",
+            lower, big, walk.depth_of.size(), walk.rewalks_skipped);
+#endif
 }
 
 void TexLodCache::TargetsReady(bool (*is_target)(uint32_t hash, void* user), void* user)
@@ -241,8 +258,11 @@ uint32_t TexLodCache::AddMipExact(uint32_t low, uint32_t high, unsigned mip, boo
         return prev;
     }
     auto it = feeders_.find(low); // what fed `low` is `high` at a lower resolution too
-    if (it != feeders_.end())
-        for (const Feeder& f : it->second) ChainAlias(f.low, high, 0, false, TexLodBelow(mip, f.steps), 0);
+    if (it != feeders_.end()) {
+        ChainWalk walk;
+        walk.rule = high;
+        for (const Feeder& f : it->second) ChainAlias(f.low, 0, TexLodBelow(mip, f.steps), walk);
+    }
     return prev;
 }
 

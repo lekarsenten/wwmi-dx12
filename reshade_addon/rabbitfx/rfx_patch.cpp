@@ -7,6 +7,9 @@
 #include "../migoto/dx12_bridge.h" // MigotoPort::DumpDir -- where the cutout's shader corpus goes
 #include "../mods/wwmi_runtime.h" // WwmiReadFile
 #include "../build_stamp.h" // WWMI_RFX_SRC_HASH: a cached patch is reused only by the patcher that wrote it
+#ifdef WWMI_DEBUG
+#include "../instrumentation/opacity_watch.h"
+#endif
 #include <cstring>
 #include <string>
 
@@ -19,6 +22,9 @@ struct RfxPatchedPs {
     unsigned max_reg = 0;
     bool has_glow = false;
     bool cached = false;
+#ifdef WWMI_DEBUG
+    std::vector<RfxOpacitySite> opacity;
+#endif
 }; // empty code = a patch that failed: said once, never retried
 
 namespace {
@@ -31,8 +37,17 @@ struct CacheHdr {
     uint32_t code_size;
     uint32_t max_reg;
     uint32_t has_glow;
+    uint32_t extra_size; // after the code: a debug build's fade-switch sites, skipped by release builds
+    uint32_t reserved;
 };
 constexpr uint32_t kCacheMagic = 0x43584652; // "RFXC"
+
+// The store holds every patch of a PS.
+uint64_t PsKey(uint64_t ps_hash, bool decensor, bool inject, const std::vector<RfxDxilCut>& cuts)
+{
+    return ps_hash ^ (decensor ? 0x9E3779B97F4A7C15ull : 0) ^ (inject ? 0 : 0xC2B2AE3D27D4EB4Full) ^
+        (cuts.empty() ? 0 : Fnv1a64(cuts.data(), cuts.size() * sizeof(RfxDxilCut)));
+}
 
 std::wstring CachePath(uint64_t ps_key)
 {
@@ -50,11 +65,17 @@ bool CacheLoad(uint64_t ps_key, uint64_t src_hash, size_t src_size, RfxPatchedPs
     if (f.size() < sizeof h) return false;
     memcpy(&h, f.data(), sizeof h);
     if (h.magic != kCacheMagic || h.version != WWMI_RFX_SRC_HASH || h.src_hash != src_hash ||
-        h.src_size != (uint32_t)src_size || f.size() != sizeof h + (size_t)h.code_size)
+        h.src_size != (uint32_t)src_size || f.size() != sizeof h + (size_t)h.code_size + h.extra_size)
         return false;
-    out.code.assign(f.begin() + sizeof h, f.end());
+    out.code.assign(f.begin() + sizeof h, f.begin() + sizeof h + h.code_size);
     out.max_reg = h.max_reg;
     out.has_glow = h.has_glow != 0;
+#ifdef WWMI_DEBUG
+    if (h.extra_size % sizeof(RfxOpacitySite) == 0) {
+        out.opacity.resize(h.extra_size / sizeof(RfxOpacitySite));
+        if (h.extra_size) memcpy(out.opacity.data(), f.data() + sizeof h + h.code_size, h.extra_size);
+    }
+#endif
     return true;
 }
 
@@ -66,12 +87,20 @@ void CacheStore(uint64_t ps_key, uint64_t src_hash, size_t src_size, const RfxPa
     const std::wstring tmp = path + L".tmp";
     const HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
+#ifdef WWMI_DEBUG
+    const uint32_t extra = (uint32_t)(p.opacity.size() * sizeof(RfxOpacitySite));
+#else
+    const uint32_t extra = 0;
+#endif
     const CacheHdr h{ kCacheMagic, WWMI_RFX_SRC_HASH, src_hash, (uint32_t)src_size, (uint32_t)p.code.size(), p.max_reg,
-        p.has_glow ? 1u : 0u };
+        p.has_glow ? 1u : 0u, extra, 0 };
     DWORD wr = 0;
     bool ok = WriteFile(f, &h, sizeof h, &wr, nullptr) && wr == sizeof h;
     if (ok && !p.code.empty())
         ok = WriteFile(f, p.code.data(), (DWORD)p.code.size(), &wr, nullptr) && wr == p.code.size();
+#ifdef WWMI_DEBUG
+    if (ok && extra) ok = WriteFile(f, p.opacity.data(), extra, &wr, nullptr) && wr == extra;
+#endif
     CloseHandle(f);
     if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp.c_str());
 }
@@ -158,9 +187,7 @@ void RfxPatchWorker::Build(Job& job)
     const shader_desc src_ps = *static_cast<const shader_desc*>(ps_so->data);
     if (!src_ps.code || !src_ps.code_size) return settle(nullptr);
     const uint64_t ps_hash = Fnv1a64(src_ps.code, src_ps.code_size);
-    const uint64_t ps_key = ps_hash ^ (decensor ? 0x9E3779B97F4A7C15ull : 0) ^ (inject ? 0 : 0xC2B2AE3D27D4EB4Full) ^
-        (cut ? Fnv1a64(job.cuts.data(), job.cuts.size() * sizeof(RfxDxilCut))
-             : 0); // the store holds every patch of a PS
+    const uint64_t ps_key = PsKey(ps_hash, decensor, inject, job.cuts);
 
     std::shared_ptr<RfxPatchedPs> patched;
     if (auto it = ps_.find(ps_key); it != ps_.end())
@@ -184,6 +211,9 @@ void RfxPatchWorker::Build(Job& job)
                 patched->code = std::move(r.code);
                 patched->max_reg = r.srv_max_reg;
                 patched->has_glow = r.has_glow;
+#ifdef WWMI_DEBUG
+                patched->opacity = std::move(r.opacity);
+#endif
             } else if (!r.why.empty())
                 why = r.why;
             if (cut)
@@ -214,6 +244,9 @@ void RfxPatchWorker::Build(Job& job)
             }
             if (r.settled) CacheStore(ps_key, ps_hash, src_ps.code_size, *patched);
         }
+#ifdef WWMI_DEBUG
+        if (decensor) g_opacity_watch.NoteShader(ps_hash, patched->opacity);
+#endif
         ps_.emplace(ps_key, patched);
         std::lock_guard l(mutex_);
         if (ok)
@@ -348,6 +381,25 @@ void RfxPatchWorker::QueueDecensor(reshade::api::device* dev, uint64_t src_pso0)
         queue_.push_back(std::move(job));
     }
     Wake();
+}
+
+bool RfxPatchWorker::DecensorCached(uint64_t ps_hash)
+{
+    std::call_once(cached_once_, [this] {
+        if (g_addon.shader_cache_dir.empty()) return;
+        WIN32_FIND_DATAW fd;
+        const HANDLE h = FindFirstFileW((g_addon.shader_cache_dir + L"\\*.rfx").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (fd.nFileSizeHigh == 0 && fd.nFileSizeLow <= sizeof(CacheHdr)) continue;
+            wchar_t* end = nullptr;
+            const uint64_t key = wcstoull(fd.cFileName, &end, 16);
+            if (end && _wcsicmp(end, L".rfx") == 0) cached_.insert(key);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        logger::write("RFXCACHE: %zu cached shader patch(es) with code", cached_.size());
+    });
+    return cached_.count(PsKey(ps_hash, true, false, {})) != 0;
 }
 
 void RfxPatchWorker::QueueUid(

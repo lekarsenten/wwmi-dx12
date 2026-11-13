@@ -51,7 +51,8 @@ public:
     bool RecogniseLod(uint32_t skel_hash, uint64_t vb0, bool* linked_now);
 
     // INDEX-BUFFER ANCHOR: an index buffer carrying a mod's complete declared component set is that mod's.
-    bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx); // ib_bytes: the IB's extent
+    bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx,
+        bool content_proven); // ib_bytes: the IB's extent
     void IbAnchorForget(uint64_t va, uint64_t bytes);
     bool IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint64_t* ib_base_va);
     bool IbAnchorJustLearned(uint64_t index_va); // this is the first frame its draws are claimed

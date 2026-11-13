@@ -59,7 +59,19 @@ ID3D12GraphicsCommandList* EngineFrame::Pass::Begin()
 {
     if (!ready) return nullptr;
     slot = (UINT)(counter % kRing);
-    WaitForFence(fence.Get(), slot_fence[slot], ev, 2000); // blocks only when we are kRing frames ahead
+    // blocks only when we are kRing frames ahead
+    const DWORD wait = WaitForFence(fence.Get(), slot_fence[slot], ev, 2000);
+    if (wait != WAIT_OBJECT_0) {
+        if (skipped++ == 0)
+            logger::report("PRESENTPASS: the GPU has not finished frame %llu (done %llu, wait %lu) -- the present "
+                           "pass skips frames until it has",
+                (unsigned long long)slot_fence[slot], (unsigned long long)fence->GetCompletedValue(), wait);
+        return nullptr;
+    }
+    if (skipped) {
+        logger::report("PRESENTPASS: the GPU caught up; %u frame(s) of the present pass skipped", skipped);
+        skipped = 0;
+    }
     if (FAILED(alloc[slot]->Reset())) return nullptr;
     if (FAILED(cl->Reset(alloc[slot].Get(), nullptr))) return nullptr;
     RemovalPin::OnReset(cl.Get()); // a native Reset: ReShade's reset_command_list does not fire for it
@@ -87,7 +99,13 @@ HRESULT EngineFrame::Pass::Submit(ID3D12CommandQueue* game_queue)
         (int)game_queue->GetDesc().Type, "present-pass submit");
     game_queue->ExecuteCommandLists(1, lists);
     slot_fence[slot] = ++counter;
-    game_queue->Signal(fence.Get(), slot_fence[slot]);
+    const HRESULT signal_hr = game_queue->Signal(fence.Get(), slot_fence[slot]);
+    if (FAILED(signal_hr)) {
+        static std::atomic<bool> once{ false };
+        if (!once.exchange(true))
+            logger::report("PRESENTPASS: Signal of frame %llu failed (%08lX)", (unsigned long long)slot_fence[slot],
+                (unsigned long)signal_hr);
+    }
     IbHash::Submitted(fence.Get(), slot_fence[slot]); // the hash recorded into this list completes with it
     g_gpu_timer.FrameSubmitted(fence.Get(), slot_fence[slot], game_queue);
     HotPath::GpuFrameSubmitted(fence.Get(), slot_fence[slot], game_queue);

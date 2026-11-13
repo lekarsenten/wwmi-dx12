@@ -42,6 +42,10 @@ void StampClaimedTextures(DrawContext& ctx); // draw_texswap.cpp
 // The game's bindings at this draw for the vs/ps registers a section reads and does not set: its descriptors for the
 // section's draws, its textures published for `checktextureoverride` and the like (draw_restore.cpp).
 void InheritGameBindings(PortApi::DrawListScope& scope, reshade::api::command_list* cmd_list);
+// The game's constant buffers of one stage ('v' or 'p') bound as root CBVs, but the registers in `skip`, pushed at the
+// size its shader declares, as a section's `vs-cbN` / `ps-cbN` read them on DX11; the registers pushed, as a mask
+// (draw_restore.cpp).
+uint16_t PushGameConstantBuffers(reshade::api::command_list* cmd_list, char stage, uint16_t skip);
 void StampOverrideSrvs(reshade::api::command_list* cmd_list, uint32_t srv_gen0);
 // `bb` for a section drawing on the game's list: the game's render target when it is a swap-chain buffer
 // (draw_restore.cpp).

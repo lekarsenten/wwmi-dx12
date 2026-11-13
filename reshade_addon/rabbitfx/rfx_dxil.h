@@ -33,6 +33,20 @@ struct RfxDxilSpec {
     std::vector<RfxDxilCut> cuts; // not empty: these cuts alone -- no RabbitFX blocks, no decensor
 };
 
+// One float a shader reads from a constant buffer: cb<reg>[row].xyzw[comp]. reg 0xFF: not a plain CB load.
+struct RfxCbRef {
+    uint8_t reg = 0xFF;
+    uint16_t row = 0;
+    uint8_t comp = 0;
+};
+
+// A fade switch the decensor edited: below 0.5 the fixed opacity min(a, b), else the camera fade.
+struct RfxOpacitySite {
+    RfxCbRef sw;
+    RfxCbRef a;
+    RfxCbRef b;
+};
+
 struct RfxDxilResult {
     std::vector<uint8_t> code; // the patched, validated, signed container
     std::string why; // on failure: the step and the reason; on success: what was resolved
@@ -45,6 +59,10 @@ struct RfxDxilResult {
     unsigned decensored = 0; // COLOR0.w - 1/3 constants moved to -0.15
     unsigned degated = 0; // dither subtractions neutralised
     unsigned unmasked = 0; // FMin - 1/3 discard thresholds moved to +1
+    unsigned unveiled = 0; // fixed opacities min(first, second) of one CB made min(second, second)
+#ifdef WWMI_DEBUG
+    std::vector<RfxOpacitySite> opacity; // where each of those switches and mins reads the material
+#endif
 };
 
 bool RfxDxilInit(const wchar_t* dll_dir, std::string& why);

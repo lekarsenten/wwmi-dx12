@@ -503,6 +503,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
 
     reshade::register_event<reshade::addon_event::init_device>(on_init_device);
     PortApi::SetParseObserver(&BuildModSet, nullptr);
+    PortApi::SetReloadGate(&ReloadGate::MayReload, &g_reload_gate);
     ::logger::write("Init: AddonInit complete; inactive until a D3D12 device is created");
     return true;
 }

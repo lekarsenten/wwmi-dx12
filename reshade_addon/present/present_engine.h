@@ -29,6 +29,7 @@ private:
         uint64_t counter = 0;
         uint64_t slot_fence[kRing] = {};
         UINT slot = 0;
+        uint32_t skipped = 0;
         bool ready = false;
         bool Init(ID3D12Device* dev);
         ID3D12GraphicsCommandList* Begin();

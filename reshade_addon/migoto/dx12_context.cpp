@@ -82,30 +82,6 @@ void STDMETHODCALLTYPE Dx12Context::DiscardView(ID3D11View*)
 {
     NOTIMPL_ONCE("DiscardView");
 }
-void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers1(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)
-{
-    NOTIMPL_ONCE("VSSetConstantBuffers1");
-}
-void STDMETHODCALLTYPE Dx12Context::HSSetConstantBuffers1(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)
-{
-    NOTIMPL_ONCE("HSSetConstantBuffers1");
-}
-void STDMETHODCALLTYPE Dx12Context::DSSetConstantBuffers1(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)
-{
-    NOTIMPL_ONCE("DSSetConstantBuffers1");
-}
-void STDMETHODCALLTYPE Dx12Context::GSSetConstantBuffers1(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)
-{
-    NOTIMPL_ONCE("GSSetConstantBuffers1");
-}
-void STDMETHODCALLTYPE Dx12Context::PSSetConstantBuffers1(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)
-{
-    NOTIMPL_ONCE("PSSetConstantBuffers1");
-}
-void STDMETHODCALLTYPE Dx12Context::CSSetConstantBuffers1(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)
-{
-    NOTIMPL_ONCE("CSSetConstantBuffers1");
-}
 void STDMETHODCALLTYPE Dx12Context::SwapDeviceContextState(ID3DDeviceContextState*, ID3DDeviceContextState** ppPreviousState)
 {
     NOTIMPL_ONCE("SwapDeviceContextState");

@@ -27,8 +27,11 @@ public:
     // The first ask queues the build.
     uint64_t DecensorVariant(reshade::api::device* dev, uint64_t pso);
     void SetDecensorVariant(uint64_t pso, uint64_t variant);
-    // A claimed character draw runs on `pso`: its pixel shader is one DecensorVariant answers for, from now on.
+    // A character draw (a mod's, or any skinned one) runs on `pso`: its pixel shader is one DecensorVariant answers
+    // for, from now on.
     void NoteCharacterDraw(uint64_t pso);
+    // Its input layout reads vertex stream 6, a character mesh's; lock-free.
+    bool ReadsStream6(uint64_t pso);
     // The PSO's UID-cut variant for a back buffer of `target` (UidHide::Target), lock-free; 0 = none (yet), or the
     // PSO does not draw UI text. The first ask for a target queues the build.
     uint64_t UidVariant(reshade::api::device* dev, uint64_t pso, uint32_t target);
@@ -38,6 +41,9 @@ public:
     // A copy of the set for `pso` / stage ('p' or 'v'), under the guard; an unparsed default when unknown.
     DxilSrvRegs SrvRegs(uint64_t pso, char stage);
     bool VsCbufferBytes(uint64_t pso, unsigned reg, uint32_t& bytes);
+    bool PsCbufferBytes(uint64_t pso, unsigned reg, uint32_t& bytes);
+    // All of a stage's ('v' or 'p') at once: b0..b15, 0 = not declared.
+    bool CbufferBytes(uint64_t pso, char stage, std::array<uint32_t, 16>& bytes);
     // The PSO's rasterizer cull mode, recorded at creation for every PSO; false when it stated none.
     bool CullMode(uint64_t pso, reshade::api::cull_mode* out);
     PipelineHookStats TakeStats();
@@ -60,6 +66,7 @@ private:
         std::atomic<uint32_t> ucz{ 0 };
         std::atomic<bool> chr{ false }; // its PS was seen on a character draw, as of character-shader generation chrg
         std::atomic<uint32_t> chrg{ 0 };
+        std::atomic<bool> vb6{ false }; // its input layout reads vertex stream 6
     };
     struct Tab {
         uint32_t cap;
@@ -70,6 +77,7 @@ private:
     static Slot* PutIn(Tab* t, uint64_t key);
     Slot* SlotOf(uint64_t key, bool create);
     bool CharacterPs(Slot* s, uint64_t ps);
+    void MarkCharacterPs(Slot* s, const char* why);
 
     std::atomic<Tab*> tab_{ new Tab{ 1u << 16, new Slot[1u << 16] } };
     std::mutex add_;
@@ -77,10 +85,11 @@ private:
     std::mutex char_ps_mutex_;
     std::unordered_set<uint64_t> char_ps_; // under char_ps_mutex_
     std::atomic<uint32_t> char_ps_gen_{ 0 };
-    std::mutex regs_mutex_; // guards the four maps below
+    std::mutex regs_mutex_; // guards the five maps below
     std::unordered_map<uint64_t, DxilSrvRegs> ps_regs_;
     std::unordered_map<uint64_t, DxilSrvRegs> vs_regs_;
     std::unordered_map<uint64_t, std::array<uint32_t, 16>> vs_cbs_; // b0..b15 (space 0), 0 = not declared
+    std::unordered_map<uint64_t, std::array<uint32_t, 16>> ps_cbs_; // the same for the pixel shader
     std::unordered_map<uint64_t, reshade::api::cull_mode> cull_;
     std::atomic<uint64_t> init_n_{ 0 };
     std::atomic<uint64_t> init_us_{ 0 };

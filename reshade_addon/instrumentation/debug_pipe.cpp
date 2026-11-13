@@ -8,7 +8,9 @@
 #include "../draw/draw_sectex.h" // g_tex_draw_watch
 #include "../mods/shader_alias.h" // ShaderAliasCommand
 #include "../mods/mod_set.h"
+#include "opacity_watch.h"
 #include "../textures/tex_pipe_alias.h"
+#include "../textures/tex_ref_take.h"
 #include "../textures/tex_slot_log.h"
 #include "../core/log.h"
 #include <windows.h>
@@ -105,14 +107,21 @@ const char* const kHelp =
     "texdraws <texhash>   watches draws, indexed or not, for that texture at ps-t0..t8 (earlier finds cleared)\n"
     "texdraws all         every draw's ps-t0..t8 textures, for about two frames\n"
     "texdraws [off]       what was found: ps, vs, register, texture; off stops watching\n"
+    "texrefs take         texture-match references of every texture game character draws read over two frames (A21)\n"
+    "texrefs              what the last take did\n"
     "texalias             every game texture hash taken as a mod target from the pipe\n"
     "texalias <game> <rule>  a game texture with that hash swaps as that mod target; texalias <game> off removes it\n"
     "alias                every DX12 -> DX11 shader-hash alias [ShaderOverride] sections see\n"
-    "alias <dx12> <dx11>  adds one, ahead of the built-in table; alias <dx12> off removes it\n"
+    "alias <dx12> <dx11>  adds one, ahead of the .shaderpairs files; alias <dx12> off removes it\n"
     "ovrpicks [texhash]   what checked draws' sections left per game texture, and how often it changed since "
     "the last ovrpicks\n"
     "textrace <texhash> [frames]  every write to that texture's slots for the next frames (240 by default): who, "
-    "which thread, which variables its sections read are set\n";
+    "which thread, which variables its sections read are set\n"
+    "cbrows <ps> <reg> <row> [rows]  that game pixel shader's cb<reg> rows (8) at its draws, a CBROWS line when "
+    "they change; cbrows: the latest; cbrows off\n"
+    "opacity [frames]     claimed draws of decensored shaders within that many frames (120): their fade switch and "
+    "fixed opacity as read from the game's material CB (needs A2 debug and A4 decensor); unmodded skinned draws are "
+    "mod -1 with their index count as the component\n";
 
 std::string ListShaders()
 {
@@ -189,9 +198,14 @@ std::string Execute(const std::string& line)
         return SmallMeshReport(w.size() == 2 ? (uint32_t)std::strtoul(w[1].c_str(), nullptr, 10) : 0u);
     if (c == "texdraws" && w.size() <= 2)
         return g_tex_draw_watch.Command(std::vector<std::string>(w.begin() + 1, w.end()));
+    if (c == "texrefs" && w.size() <= 2)
+        return g_tex_ref_take.Command(std::vector<std::string>(w.begin() + 1, w.end()));
     if (c == "texalias" && w.size() <= 3)
         return g_tex_pipe_alias.Command(std::vector<std::string>(w.begin() + 1, w.end()));
     if (c == "alias" && w.size() <= 3) return ShaderAliasCommand(std::vector<std::string>(w.begin() + 1, w.end()));
+    if (c == "cbrows" && w.size() <= 5) return g_cb_rows.Command(std::vector<std::string>(w.begin() + 1, w.end()));
+    if (c == "opacity" && w.size() <= 2)
+        return g_opacity_watch.Command(std::vector<std::string>(w.begin() + 1, w.end()));
     if (c == "ovrpicks" && w.size() <= 2)
         return OverridePickReport(w.size() == 2 ? (uint32_t)std::strtoul(w[1].c_str(), nullptr, 16) : 0u);
     if (c == "textrace" && (w.size() == 2 || w.size() == 3))

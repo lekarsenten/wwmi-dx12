@@ -3,6 +3,7 @@
 #include <dxcapi.h>
 #include <mutex>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -189,8 +190,89 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         const size_t e = m.t.find('\n', p + 1);
         return m.t.substr(p + key.size(), e - (p + key.size()));
     };
+#ifdef WWMI_DEBUG
+    auto cb_ref = [&](const std::string& v) -> RfxCbRef {
+        RfxCbRef r;
+        static const char kEv[] = "extractvalue %dx.types.CBufRet.f32 %";
+        static const char kHandle[] = "%dx.types.Handle %";
+        static const char kCreate[] = "call %dx.types.Handle @dx.op.createHandle(i32 57, i8 2, i32 ";
+        const std::string d = def_of(v);
+        if (d.rfind(kEv, 0) != 0) return r;
+        const size_t comma = d.rfind(',');
+        const std::string ld = def_of(d.substr(sizeof(kEv) - 2, comma - (sizeof(kEv) - 2)));
+        const size_t h = ld.find(kHandle);
+        if (ld.find("@dx.op.cbufferLoadLegacy.f32(") == std::string::npos || h == std::string::npos) return r;
+        const size_t h0 = h + sizeof(kHandle) - 2;
+        const size_t h1 = ld.find(',', h0);
+        const std::string hd = def_of(ld.substr(h0, h1 - h0));
+        const size_t i0 = hd.rfind(kCreate, 0) == 0 ? hd.find(", i32 ", sizeof(kCreate) - 1) : std::string::npos;
+        if (i0 == std::string::npos || !isdigit((unsigned char)hd[i0 + 6]) || !isdigit((unsigned char)ld[h1 + 6]))
+            return r;
+        r.reg = (uint8_t)std::strtoul(hd.c_str() + i0 + 6, nullptr, 10);
+        r.row = (uint16_t)std::strtoul(ld.c_str() + h1 + 6, nullptr, 10);
+        r.comp = (uint8_t)std::strtoul(d.c_str() + comma + 2, nullptr, 10);
+        return r;
+    };
+    out.opacity.clear();
+#endif
+    auto cb_of = [&](const std::string& v) -> std::string {
+        static const char kEv[] = "extractvalue %dx.types.CBufRet.f32 %";
+        const std::string d = def_of(v);
+        if (d.rfind(kEv, 0) != 0) return std::string();
+        const std::string ld = def_of(d.substr(sizeof(kEv) - 2, d.rfind(',') - (sizeof(kEv) - 2)));
+        const size_t h = ld.find("%dx.types.Handle %");
+        if (ld.find("@dx.op.cbufferLoadLegacy.f32(") == std::string::npos || h == std::string::npos)
+            return std::string();
+        return ld.substr(h, ld.find(',', h) - h);
+    };
+    out.unveiled = 0;
+    static const char kUlt[] = " = fcmp fast ult float %";
+    static const char kHalf[] = ", 5.000000e-01";
+    static const char kLabel[] = ", label %";
+    static const char kMin[] = " = call float @dx.op.binary.f32(i32 36, float %";
+    for (size_t p = 0; (p = m.t.find(kUlt, p)) != std::string::npos; p += sizeof(kUlt) - 1) {
+        const size_t ls = m.t.rfind('\n', p) + 1;
+        const size_t le = m.t.find('\n', p);
+        const std::string line = m.t.substr(ls, le - ls);
+        const size_t vh = line.size() - (sizeof(kHalf) - 1);
+        if (line.rfind("  %", 0) != 0 || line.size() <= sizeof(kHalf) ||
+            line.compare(vh, sizeof(kHalf) - 1, kHalf) != 0)
+            continue;
+        const std::string c = line.substr(2, line.find(' ', 2) - 2);
+        const size_t v0 = line.find('%', 3);
+        const std::string sw = line.substr(v0, vh - v0);
+        if (cb_of(sw).empty()) continue;
+        const std::string br = "\n  br i1 " + c + kLabel;
+        const size_t bp = m.t.find(br);
+        if (bp == std::string::npos) continue;
+        const size_t s0 = bp + br.size();
+        const size_t s1 = m.t.find_first_of(",\n", s0);
+        if (s1 == std::string::npos) continue;
+        const std::string own_label = "\n; <label>:" + m.t.substr(s0, s1 - s0);
+        size_t bs = m.t.find(own_label + " ");
+        if (bs == std::string::npos) bs = m.t.find(own_label + "\n");
+        if (bs == std::string::npos) continue;
+        bs += own_label.size();
+        const size_t be = (std::min)(m.t.find("\n; <label>:", bs), m.t.find("\n}\n", bs));
+        for (size_t q = m.t.find(kMin, bs); q != std::string::npos && q < be; q = m.t.find(kMin, q + 1)) {
+            const size_t a0 = q + sizeof(kMin) - 2;
+            const size_t a1 = m.t.find(',', a0);
+            const size_t b0 = m.t.find('%', a1);
+            const size_t b1 = m.t.find(')', b0);
+            const std::string a = m.t.substr(a0, a1 - a0);
+            const std::string b = m.t.substr(b0, b1 - b0);
+            const std::string cb = cb_of(a);
+            if (cb.empty() || cb != cb_of(b)) continue;
+#ifdef WWMI_DEBUG
+            out.opacity.push_back({ cb_ref(sw), cb_ref(a), cb_ref(b) });
+#endif
+            m.t.replace(a0, a.size(), b);
+            ++out.unveiled;
+            break;
+        }
+    }
     const std::string dcall = "call void @dx.op.discard(i32 82, i1 ";
-    for (size_t p = 0; (p = m.t.find(dcall, p)) != std::string::npos; p += dcall.size()) {
+    for (size_t p = 0; !out.unveiled && (p = m.t.find(dcall, p)) != std::string::npos; p += dcall.size()) {
         const size_t ce = m.t.find(')', p + dcall.size());
         const std::string cond = m.t.substr(p + dcall.size(), ce - (p + dcall.size()));
         if (cond.empty() || cond[0] != '%') continue;
@@ -234,7 +316,8 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         return end != op.c_str() && *end == '\0';
     };
     static const char kThirdOff[] = ", 0xBFD5";
-    for (size_t p = 0; (p = m.t.find(kThirdOff, p)) != std::string::npos; p += sizeof(kThirdOff) - 1) {
+    for (size_t p = 0; !out.unveiled && (p = m.t.find(kThirdOff, p)) != std::string::npos;
+         p += sizeof(kThirdOff) - 1) {
         const size_t ls = m.t.rfind('\n', p) + 1;
         const size_t le = m.t.find('\n', p);
         const std::string line = m.t.substr(ls, le - ls);
@@ -350,7 +433,9 @@ std::string Decensor(Module& m, int in_list_node, RfxDxilResult& out)
         ", dither gate: " +
         (out.degated ? std::to_string(out.degated) + " subtraction(s) -> -1" : std::string("none")) +
         ", vertex mask: " +
-        (out.decensored ? std::to_string(out.decensored) + " COLOR0.w - 1/3 -> -0.15" : std::string("none"));
+        (out.decensored ? std::to_string(out.decensored) + " COLOR0.w - 1/3 -> -0.15" : std::string("none")) +
+        ", fixed opacity: " +
+        (out.unveiled ? std::to_string(out.unveiled) + " min(first, second) -> second" : std::string("none"));
 }
 
 // A float as LLVM IR spells it exactly: the hex of its double.
@@ -517,7 +602,7 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
             return false;
         }
         const std::string dc = Decensor(m, il, out);
-        if (!out.decensored && !out.degated && !out.unmasked) {
+        if (!out.decensored && !out.degated && !out.unmasked && !out.unveiled) {
             why = "no censor chain";
             return false;
         }

@@ -24,7 +24,7 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
 - **UI mods** - loading screens, team-screen backgrounds and portraits, skills-tab art, icons, cards and
   menus, with their hotkeys, timers and screen flags
 - **Mods made for DX11 shaders** - mods that name the game's DX11 pixel shaders work for the characters
-  the shipped shader list (`wwmi_dx12\cache\wwmi_dx12_seed.shaderpairs`) covers
+  the built-in shader list covers; a `wwmi_dx12\pairs\*.shaderpairs` file adds more
 - **Copies of a character** - two copies of one modded character at once (an idle pose, an ult's clone) each
   keep their own skeleton instead of mixing as on DX11; tested on two characters, and with a mod that keeps
   one skeleton per copy
@@ -191,6 +191,8 @@ brings seeds of what was already learned (`wwmi_dx12\cache\seed-<version>.lodcac
 - In `<Win64>\wwmi_dx12\cache`: learned texture matches and patched shaders.
 - In your WWMI folder: only `d3dx_user.ini` (as in DX11). Mods are only read.
 - The launcher stops on a `dxgi.dll` that is not ReShade.
+- The launcher reads this project's public release list from GitHub (`api.github.com`). When a newer
+  release is out it shows a "Please update" line and what is new; with no connection it shows nothing.
 - **Uninstall:** delete everything starting with `wwmi_dx12` in `<Win64>` (the `wwmi_dx12` folder holds
   the caches); ReShade if nothing else uses it; optionally the `Engine.ini` and `UserEngine.ini` lines.
 

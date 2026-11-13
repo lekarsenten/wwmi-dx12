@@ -41,6 +41,7 @@
 #include "../textures/mod_texture_store.h"
 #include "../textures/tex_select.h"
 #include "../textures/tex_readback.h"
+#include "../textures/tex_ref_take.h"
 #include "../mods/mod_set.h"
 
 FrameSync g_frames;
@@ -258,6 +259,7 @@ void FrameStepper::Step(command_queue* queue, swapchain* sc, bool at_present)
         IbHash::DrainQueue();
     } // GPU IB-hash anchor: hash queued char IBs (bounded, cached) -- needed in prod too
     DebugPipe::RunQueued();
+    g_tex_ref_take.Tick();
     if (g_debug) {
         PROF(PROF_DiagPresent);
         if (g_diag_arms.dump_shaders_requested.exchange(false)) g_shader_capture.Dump();

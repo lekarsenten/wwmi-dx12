@@ -72,6 +72,8 @@ std::recursive_mutex& EngineLock()
 
 static void (*g_parse_observer)(void* user) = nullptr;
 static void* g_parse_observer_user = nullptr;
+static bool (*g_reload_gate_fn)(void* user) = nullptr;
+static void* g_reload_gate_user = nullptr;
 static double g_last_parse_ms = 0.0;
 
 static void NotifyParse(std::chrono::steady_clock::time_point parse_start)
@@ -129,6 +131,12 @@ void SetParseObserver(void (*after_parse)(void* user), void* user)
 {
     g_parse_observer = after_parse;
     g_parse_observer_user = user;
+}
+
+void SetReloadGate(bool (*may_reload)(void* user), void* user)
+{
+    g_reload_gate_fn = may_reload;
+    g_reload_gate_user = user;
 }
 
 void RequestReload()
@@ -312,7 +320,7 @@ static void BumpGeneration()
 
 static void FrameDriverConfig()
 {
-    if (G->gReloadConfigPending) {
+    if (G->gReloadConfigPending && (!g_reload_gate_fn || g_reload_gate_fn(g_reload_gate_user))) {
         const auto parse_start = std::chrono::steady_clock::now();
         BumpGeneration();
         ReloadConfig(&g_dev);

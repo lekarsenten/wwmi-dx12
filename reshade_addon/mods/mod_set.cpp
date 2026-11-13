@@ -6,6 +6,7 @@
 #include "../draw/draw_toggles.h"
 #include "../hooks/command_list_registry.h"
 #include "../migoto/dx12_context_impl.h"
+#include "../textures/tex_defer.h"
 #include <chrono>
 #include <intrin.h>
 #ifdef WWMI_DEBUG
@@ -91,7 +92,42 @@ void BuildModSet(void*)
         set->comps.Count(), set->held.size(), ms);
     logger::report("RELOAD: parse %.0f ms, build %.0f ms, %zu units, set #%u", PortApi::LastParseMs(), ms,
         set->mods.Count(), set->id);
-    if (ModSet* const old = g_mod_sets.Publish(set, GpuStamp())) old->retired_frame = g_frame_id;
+    const uint64_t stamp = GpuStamp();
+    if (ModSet* const old = g_mod_sets.Publish(set, stamp)) old->retired_frame = g_frame_id;
+    g_reload_gate.Published(stamp);
+}
+
+ReloadGate g_reload_gate;
+
+const char* ReloadGate::Waiting() const
+{
+    if (published_ && !GpuPassed(published_)) return "the GPU is still drawing frames from before the last reload";
+    if (g_tex_defer.Loading()) return "mod textures are still loading";
+    return nullptr;
+}
+
+bool ReloadGate::MayReload(void* self)
+{
+    constexpr std::chrono::seconds kLongestHold{ 5 };
+    ReloadGate& g = *static_cast<ReloadGate*>(self);
+    const auto now = std::chrono::steady_clock::now();
+    const double held_ms = std::chrono::duration<double, std::milli>(now - g.since_).count();
+    const char* const why = g.Waiting();
+    if (!why) {
+        if (g.holding_) logger::report("RELOAD-HOLD: released after %.0f ms", held_ms);
+        g.holding_ = false;
+        return true;
+    }
+    if (!g.holding_) {
+        g.holding_ = true;
+        g.since_ = now;
+        logger::report("RELOAD-HOLD: the reload waits: %s; key presses until then make one reload", why);
+        return false;
+    }
+    if (now - g.since_ < kLongestHold) return false;
+    logger::report("RELOAD-HOLD: %s after %.0f ms; reloading anyway", why, held_ms);
+    g.holding_ = false;
+    return true;
 }
 
 void DrainModSets()

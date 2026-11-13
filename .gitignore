@@ -6,5 +6,6 @@
 build_addon/
 shaders_cso/
 reshade_addon/build_stamp.h
+reshade_addon/mods/shader_pairs_seed.h
 *.vcxproj.user
 .vs/

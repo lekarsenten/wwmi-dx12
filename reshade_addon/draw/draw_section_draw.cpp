@@ -28,6 +28,7 @@
 #include "draw_toggles.h"
 #include "../rabbitfx/pso_clone.h"
 #include "../rabbitfx/pso_variant.h"
+#include "../rabbitfx/decensor_rest.h"
 #include "../rabbitfx/rfx_patch.h"
 #include "../rabbitfx/rfx_patch_srvs.h"
 #include "../rabbitfx/rfx_toggles.h"
@@ -140,7 +141,7 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
                 restore_pso = g_command_lists.Gfx(cmd_list).gfx_pso;
             }
             blend_pso = g_pso_variants.BlendFromDesc(cmd_list->get_device(), restore_pso, &cs_blend->blend,
-                MigotoPort::State().blend_factor, g_settings.decensor);
+                MigotoPort::State().blend_factor, DecensorOn());
             if (blend_pso) {
                 d3d12_cl->SetPipelineState(blend_pso);
                 const FLOAT* bf = MigotoPort::State().blend_factor;
@@ -169,7 +170,7 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         const uint64_t src = g_command_lists.Gfx(cmd_list).gfx_pso;
         if (layout_ovr.pso == src)
             layout_pso = g_pso_variants.InputLayout(
-                cmd_list->get_device(), src, layout_ovr.elements, layout_ovr.count, g_settings.decensor, false);
+                cmd_list->get_device(), src, layout_ovr.elements, layout_ovr.count, DecensorOn(), false);
         else if (DiagOnce("ILAYOUT-PSO", CompKey(dm, wc ? (int)wc->index : 0)))
             logger::write(
                 "ILAYOUT mod=%d comp=%d: the layout override was made for pso=%llx, this draw has pso=%llx -- drawn with the game's layout",
@@ -188,7 +189,7 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
     uint64_t rfxp_restore = 0;
     bool rfxp_glow = false; // the variant carries the glow block AND this component armed it
     std::vector<WclSlotOvr> rfxp_binds;
-    const bool rfx_censor = g_settings.decensor;
+    const bool rfx_censor = DecensorOn();
     if (g_rfx_toggles.patch && (rfx_glow.fxmap.ptr || rfx_glow.active) && !dc.full_shadow) {
         if (blend_pso) {
             if (DiagOnce("RFXPATCH-BLEND", CompKey(dm, wc ? (int)wc->index : 0)))

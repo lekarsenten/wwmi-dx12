@@ -38,6 +38,8 @@ public:
     ID3D12PipelineState* Variant(
         reshade::api::device* dev, uint64_t src_pso, unsigned* ps_max_srv_reg, bool* has_glow, bool decensor);
     void QueueDecensor(reshade::api::device* dev, uint64_t src_pso);
+    // The disk cache holds a decensor patch that changed this pixel shader: one decensored in an earlier session.
+    bool DecensorCached(uint64_t ps_hash);
     // The UID-cut variant of a game PSO, for a back buffer of `target`: its pixel shader with `cuts`.
     void QueueUid(reshade::api::device* dev, uint64_t src_pso, uint32_t target, std::vector<RfxDxilCut> cuts);
     void Stop();
@@ -85,6 +87,8 @@ private:
     Thread worker_; // start (a draw thread) vs stop: under thread_mutex_
     std::mutex thread_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<RfxPatchedPs>> ps_; // WORKER THREAD ONLY
+    std::once_flag cached_once_;
+    std::unordered_set<uint64_t> cached_; // keys of the cache files holding patched code, as of the first lookup
     unsigned ps_patched_ = 0;
     unsigned ps_failed_ = 0;
     unsigned variants_made_ = 0;

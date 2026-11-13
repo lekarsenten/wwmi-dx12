@@ -283,6 +283,9 @@
     <ClCompile Include="reshade_addon\textures\tex_crawl.cpp">
       <Filter>textures</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_ref_take.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\hud\uid_hide.cpp">
       <Filter>hud</Filter>
     </ClCompile>
@@ -347,6 +350,9 @@
       <Filter>instrumentation</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\debug_pipe.cpp">
+      <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\instrumentation\opacity_watch.cpp">
       <Filter>instrumentation</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\textures\tex_pipe_alias.cpp">

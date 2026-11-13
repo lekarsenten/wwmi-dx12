@@ -67,10 +67,29 @@ struct LayoutOverride {
     UINT count = 0;
 };
 
+struct CbWindow {
+    bool set = false;
+    UINT first_constant = 0;
+    UINT num_constants = 0;
+};
+
+inline bool ClipToCbWindow(const CbWindow& w, UINT64* offset, UINT64* size)
+{
+    if (!w.set) return true;
+    const UINT64 start = (UINT64)w.first_constant * 16;
+    if (!w.num_constants || start >= *size) return false;
+    *offset += start;
+    *size -= start;
+    const UINT64 limit = (UINT64)w.num_constants * 16;
+    if (limit < *size) *size = limit;
+    return true;
+}
+
 struct PipeState {
     ID3D11DeviceChild* shader[kStages] = {};
     ID3D11Buffer* cb[kStages][kMaxCB] = {};
     uint32_t cb_gen[kStages][kMaxCB] = {};
+    CbWindow cb_window[kStages][kMaxCB] = {};
     ID3D11ShaderResourceView* srv[kStages][kMaxSRV] = {};
     uint32_t srv_gen[kStages][kMaxSRV] = {};
     ID3D11SamplerState* samp[kStages][kMaxSamp] = {};

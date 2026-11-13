@@ -80,7 +80,14 @@ private:
     void Proven(uint32_t low);
     bool LearnExact(uint32_t low, uint32_t high, uint32_t mip, bool chain, bool identity, const char* how);
     bool LearnLookalike(uint32_t low, uint32_t high, uint32_t mip, float ssim, bool chain, bool place);
-    void ChainAlias(uint32_t id, uint32_t rule, int depth, bool look, uint32_t mip, float ssim);
+    struct ChainWalk {
+        uint32_t rule = 0;
+        bool look = false;
+        float ssim = 0;
+        std::unordered_map<uint32_t, int> depth_of; // each texture walked, at the shallowest depth it was reached
+        unsigned rewalks_skipped = 0;
+    };
+    void ChainAlias(uint32_t id, int depth, uint32_t mip, ChainWalk& walk);
 
     std::mutex mutex_; // WRITERS only (records, table writes, dirs); see tab_
     std::atomic<EntryTab*> tab_{ TabNew(17) };

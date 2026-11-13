@@ -12,6 +12,7 @@
 #include "../textures/tex_place.h"
 #include "../textures/tex_lod.h" // TexLodCache::SetResemblance (A13), SetCache (A14)
 #include "../textures/tex_crawl.h" // the gallery crawl (A15)
+#include "../textures/tex_ref_take.h" // the reference take (A21)
 #include "../textures/tex_gc.h" // the video memory reading under A19
 #include "../hooks/stamp_ledger.h" // SetAddonDisabled (A1)
 #include "../migoto/port_toggles.h" // g_buffers_in_vram
@@ -469,6 +470,14 @@ bool OverlayPanel::DrawMaster()
                 "Gallery crawl: record every character texture's mips and where each character draw binds it; saved 10 s after the last new texture (at least once a minute), when switched off and at exit",
                 &crawl))
             g_tex_crawl.Set(crawl);
+    }
+    if (NButton("A21",
+            "Take texture-match references of the characters on screen: every texture their draws read, kept for the "
+            "seed (open a new character in the gallery or in battle first)"))
+        g_tex_ref_take.Arm();
+    {
+        const std::string last = g_tex_ref_take.Last();
+        if (!last.empty()) ImGui::TextWrapped("%s", last.c_str());
     }
     NCheckbox("A9", "Skip the engine tick: no [Present] lists, no present pass (perf A/B only -- mods stop updating)",
         &g_present_toggles.skip_engine_tick);

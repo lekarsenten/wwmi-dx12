@@ -212,6 +212,51 @@ void InheritGameBindings(PortApi::DrawListScope& scope, reshade::api::command_li
 }
 
 #ifdef WWMI_DEBUG
+static void NoteCbNotPushed(
+    reshade::api::command_list* cmd_list, char stage, unsigned reg, const RegBind& rb, const RootCbvBind* cb)
+{
+    const char* why = rb.param >= 64 ? "not in the root signature"
+        : rb.is_table                ? "bound through a descriptor table"
+        : !cb                        ? "no root CBV set"
+        : !cb->res || !cb->va        ? "no buffer recorded for it"
+        : (cb->va & 255)             ? "its address is not 256-byte aligned"
+                                     : "the recorded address is not the root argument";
+    uint64_t ps = 0;
+    cmd_list->get_private_data(s_iid_ps_hash, &ps);
+    if (DiagOnce("CBPUSH-SKIP", (int)(uint32_t)(ps ^ (ps >> 32)) * 64 + (stage == 'p' ? 32 : 0) + (int)reg))
+        logger::write("CBPUSH-SKIP f=%u ps=%016llx %cs-cb%u: %s -- sections see no game buffer there", g_frame_id,
+            (unsigned long long)ps, stage, reg, why);
+}
+#endif
+
+uint16_t PushGameConstantBuffers(reshade::api::command_list* cmd_list, char stage, uint16_t skip)
+{
+    const uint64_t pso = g_command_lists.Gfx(cmd_list).gfx_pso;
+    const CmdGfxRoot& g = g_command_lists.GfxRoot(cmd_list);
+    uint16_t pushed = 0;
+    std::array<uint32_t, 16> declared_by_reg;
+    if (!g_pipelines.CbufferBytes(pso, stage, declared_by_reg)) return pushed;
+    for (unsigned reg = 0; reg < MigotoPort::kMaxCB; ++reg) {
+        if ((skip >> reg) & 1u) continue;
+        const uint32_t declared = declared_by_reg[reg];
+        if (!declared) continue;
+        const RegBind rb = GameRegister(g, stage, 'b', reg);
+        const RootCbvBind* cb = rb.param < 64 && !rb.is_table && g.kind[rb.param] == CmdGfxRoot::kCbv
+            ? &g_command_lists.Cbv(cmd_list).binds[rb.param]
+            : nullptr;
+        if (!cb || !cb->res || !cb->va || (cb->va & 255) || cb->va != g.value[rb.param]) {
+#ifdef WWMI_DEBUG
+            NoteCbNotPushed(cmd_list, stage, reg, rb, cb);
+#endif
+            continue;
+        }
+        PortApi::PushGameConstantBuffer(stage, reg, cb->res, cb->va, declared);
+        pushed |= (uint16_t)(1u << reg);
+    }
+    return pushed;
+}
+
+#ifdef WWMI_DEBUG
 static void NoteOverrideUnstamp(reshade::api::command_list* cmd_list, unsigned reg, const HeapKey& key,
     ID3D12Resource* was, ID3D11ShaderResourceView* now)
 {

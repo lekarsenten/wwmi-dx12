@@ -371,6 +371,7 @@ bool UploadBufferResource(const wchar_t* fq_name, const void* data, size_t bytes
 void* AcquireBufferObject(const wchar_t* fq_name);
 
 void SetParseObserver(void (*after_parse)(void* user), void* user);
+void SetReloadGate(bool (*may_reload)(void* user), void* user);
 void RequestReload();
 double LastParseMs();
 

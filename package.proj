@@ -16,7 +16,6 @@
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\Bc7Half.cso" To="wwmi_dx12\Bc7Half.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.lodcache" To="wwmi_dx12\cache\seed-$(WwmiVersion).lodcache" />
     <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.texlook" To="wwmi_dx12\cache\seed-$(WwmiVersion).texlook" />
-    <WwmiPackageFile Include="$(WwmiRoot)shaderpairs\wwmi_dx12_seed.shaderpairs" To="wwmi_dx12\cache\wwmi_dx12_seed.shaderpairs" />
     <WwmiPackageFile Include="$(WwmiRoot)LICENSE" To="wwmi_dx12\LICENSE" />
     <WwmiPackageFile Include="$(WwmiRoot)THIRD-PARTY-NOTICES.md" To="wwmi_dx12\THIRD-PARTY-NOTICES.md" />
     <WwmiPackageFile Include="$(WwmiRoot)third_party\3Dmigoto\COPYING.txt" To="wwmi_dx12\licenses\3Dmigoto-COPYING.txt" />

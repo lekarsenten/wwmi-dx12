@@ -1,6 +1,7 @@
 // The [ShaderOverride*] dispatch and the hash alias table it looks through. See shader_alias.h.
 #include "../addon_common.h"
 #include "shader_alias.h"
+#include "shader_pairs_seed.h"
 #include "../addon/addon.h"
 #include "../draw/draw_toggles.h"
 #include "../hooks/command_list_registry.h"
@@ -30,29 +31,13 @@ bool ShaderOverrideMatches(uint64_t shader_hash, std::wstring* first_section)
     return true;
 }
 
-struct ShaderHashAlias {
-    uint64_t dx12;
-    uint64_t dx11;
-    const char* what;
-};
-static const ShaderHashAlias kShaderAliases[] = {
-    { 0x4e91ecddc203a6cfULL, 0x9bf4420c82102011ULL, "ShapeKeyLoaderCS" },
-    { 0xc1a7f1fec51b482fULL, 0x7a8396180d416117ULL, "ShapeKeyMultiplierCS" },
-    { 0xba57f3dd0e35591cULL, 0x30ab50e715dce218ULL, "a character's second-form trigger: the body PS in that state" },
-    { 0xa013d25c6b61f7c4ULL, 0x409aa7c153800294ULL, "the UI image PS: loading-screen art, team-screen backgrounds" },
-    { 0x669ef75d0dd9b0f0ULL, 0xa871010e6667ca6bULL, "the UI card PS: trophy cards, gallery tiles" },
-    { 0x3087c5ba897c6647ULL, 0xa9bb5ca5cb1eed12ULL, "a team-screen UI PS that reads its background at t3" },
-    { 0xa7a8abe869e5e8cbULL, 0xeae976f7a348fab4ULL, "the team-screen portrait PS" },
-    { 0x3a84ba8bf73f6f6eULL, 0xeae976f7a348fab4ULL, "a team-screen portrait effect PS" },
-    { 0x745a80c0cda0ce92ULL, 0xeae976f7a348fab4ULL, "a second team-screen portrait effect PS" },
-};
-
 namespace {
 
 struct AliasEntry {
     uint64_t dx11 = 0;
-    const char* what = nullptr; // a built-in alias's description; null for a pair from a .shaderpairs file
-    uint32_t mesh = 0; // a file's pair: the character's vb0 hash on DX11, 0 when the line names none
+    std::string note; // the line's comment: what the shader is
+    uint32_t mesh = 0; // the character's vb0 hash on DX11, 0 when the line names none
+    bool built_in = false; // from the build's own rows, not a .shaderpairs file
 };
 
 struct ShaderPairLine {
@@ -61,6 +46,7 @@ struct ShaderPairLine {
     uint64_t dx12 = 0;
     uint64_t dx11 = 0;
     uint32_t mesh = 0;
+    std::string note;
 };
 
 bool HexToken(const std::string& t, size_t digits, uint64_t* out)
@@ -71,11 +57,17 @@ bool HexToken(const std::string& t, size_t digits, uint64_t* out)
     return end && !*end;
 }
 
-// "<dx12 hash> <dx11 hash> [<mesh hash>]", anything after them ignored; '#' or ';' starts a comment.
+// "<dx12 hash> <dx11 hash> [<mesh hash>]", anything after them ignored; '#' or ';' starts the comment, the note.
 ShaderPairLine ParseShaderPairLine(const std::string& line)
 {
     ShaderPairLine r;
-    std::istringstream ss(line.substr(0, line.find_first_of("#;")));
+    const size_t comment = line.find_first_of("#;");
+    if (comment != std::string::npos) {
+        const size_t from = line.find_first_not_of(" \t", comment + 1);
+        const size_t to = line.find_last_not_of(" \t\r");
+        if (from != std::string::npos && to >= from) r.note = line.substr(from, to - from + 1);
+    }
+    std::istringstream ss(line.substr(0, comment));
     std::string tok[3];
     int n = 0;
     while (n < 3 && ss >> tok[n]) ++n;
@@ -88,16 +80,13 @@ ShaderPairLine ParseShaderPairLine(const std::string& line)
     return r;
 }
 
-void LoadShaderPairs(std::unordered_map<uint64_t, AliasEntry>& m)
+void LoadShaderPairFiles(std::unordered_map<uint64_t, AliasEntry>& m)
 {
     if (g_addon.data_dir.empty()) return;
-    const std::wstring dir = g_addon.data_dir + L"\\cache";
+    const std::wstring dir = g_addon.data_dir + L"\\pairs";
     WIN32_FIND_DATAW fd;
     const HANDLE find = FindFirstFileW((dir + L"\\*.shaderpairs").c_str(), &fd);
-    if (find == INVALID_HANDLE_VALUE) {
-        logger::write("SHADERPAIRS: no *.shaderpairs in %S", dir.c_str());
-        return;
-    }
+    if (find == INVALID_HANDLE_VALUE) return;
     unsigned files = 0;
     unsigned pairs = 0;
     do {
@@ -115,7 +104,7 @@ void LoadShaderPairs(std::unordered_map<uint64_t, AliasEntry>& m)
                 logger::write("SHADERPAIRS: %S line %u is not 'dx12 dx11 [mesh]' -- skipped", fd.cFileName, n);
                 continue;
             }
-            const auto [it, added] = m.emplace(pl.dx12, AliasEntry{ pl.dx11, nullptr, pl.mesh });
+            const auto [it, added] = m.emplace(pl.dx12, AliasEntry{ pl.dx11, pl.note, pl.mesh });
             if (added)
                 ++pairs;
             else if (it->second.dx11 != pl.dx11)
@@ -129,12 +118,31 @@ void LoadShaderPairs(std::unordered_map<uint64_t, AliasEntry>& m)
     logger::write("SHADERPAIRS: %u pair(s) from %u file(s) in %S", pairs, files, dir.c_str());
 }
 
+// The build's own rows (shader_pairs_seed.h): each pairs a shader no file has paired.
+void LoadBuiltInShaderPairs(std::unordered_map<uint64_t, AliasEntry>& m)
+{
+    unsigned rows = 0;
+    unsigned pairs = 0;
+    for (const char* line : kShaderPairsSeed) {
+        const ShaderPairLine pl = ParseShaderPairLine(line);
+        if (!pl.ok) continue;
+        ++rows;
+        const auto [it, added] = m.emplace(pl.dx12, AliasEntry{ pl.dx11, pl.note, pl.mesh, true });
+        if (added)
+            ++pairs;
+        else if (it->second.dx11 != pl.dx11)
+            logger::write("SHADERPAIRS: a file pairs %016llx with %016llx; the built-in pair with %016llx is not used",
+                (unsigned long long)pl.dx12, (unsigned long long)it->second.dx11, (unsigned long long)pl.dx11);
+    }
+    logger::write("SHADERPAIRS: %u of %u built-in pair(s) added, the rest already paired by a file", pairs, rows);
+}
+
 const std::unordered_map<uint64_t, AliasEntry>& AliasIndex()
 {
     static const std::unordered_map<uint64_t, AliasEntry> index = [] {
         std::unordered_map<uint64_t, AliasEntry> m;
-        for (const ShaderHashAlias& a : kShaderAliases) m.emplace(a.dx12, AliasEntry{ a.dx11, a.what, 0 });
-        LoadShaderPairs(m);
+        LoadShaderPairFiles(m);
+        LoadBuiltInShaderPairs(m);
         return m;
     }();
     return index;
@@ -178,9 +186,9 @@ static uint64_t PairedShaderHash(uint64_t h)
             fr = seen.insert(h).second;
         }
         if (fr) {
-            if (a.what)
+            if (!a.note.empty())
                 logger::write("SHADER-ALIAS: dx12 %016llx -> dx11 %016llx (%s)", (unsigned long long)h,
-                    (unsigned long long)a.dx11, a.what);
+                    (unsigned long long)a.dx11, a.note.c_str());
             else
                 logger::write("SHADER-ALIAS: dx12 %016llx -> dx11 %016llx (a game shader pair, mesh %08x)",
                     (unsigned long long)h, (unsigned long long)a.dx11, a.mesh);
@@ -227,16 +235,10 @@ std::string ShaderAliasCommand(const std::vector<std::string>& args)
     if (!args.empty()) return "ERR alias, alias <dx12> <dx11> or alias <dx12> off";
     std::string out;
     char b[192];
-    for (const ShaderHashAlias& a : kShaderAliases) {
-        std::snprintf(b, sizeof b, "%016llx -> %016llx built in: %s\n", (unsigned long long)a.dx12,
-            (unsigned long long)a.dx11, a.what);
-        out += b;
-    }
     for (const auto& [dx12, a] : AliasIndex()) {
-        if (a.what) continue;
-        std::snprintf(b, sizeof b, "%016llx -> %016llx from a .shaderpairs file, mesh %08x\n", (unsigned long long)dx12,
-            (unsigned long long)a.dx11, a.mesh);
-        out += b;
+        std::snprintf(b, sizeof b, "%016llx -> %016llx %s, mesh %08x", (unsigned long long)dx12,
+            (unsigned long long)a.dx11, a.built_in ? "built in" : "from a .shaderpairs file", a.mesh);
+        out += b + (a.note.empty() ? std::string() : ": " + a.note) + "\n";
     }
     std::shared_lock l(g_pipe_alias_mtx);
     for (const auto& [dx12, dx11] : g_pipe_alias) {

@@ -16,6 +16,7 @@
 #include "../textures/tex_crawl.h"
 #include "../textures/tex_lod.h"
 #include "../textures/tex_look.h"
+#include "../textures/tex_ref_take.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -235,6 +236,19 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
 }
 
 #ifdef WWMI_DEBUG
+void SectionTexturePublisher::NoteRefTextures(const DrawArgs& da)
+{
+    if (!g_tex_ref_take.Collecting()) return;
+    command_list* const cmd_list = da.cmd_list;
+    {
+        const auto& st = g_command_lists.Gfx(cmd_list);
+        if (!g_recognition.InSkinBand(st.vb[0].va) && !st.vb[6].res) return;
+    }
+    ForEachPsTexture(
+        cmd_list, false, g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p'), [](unsigned) { return true; },
+        [](const PsTexture& t) { g_tex_ref_take.Note(t.ri.res); });
+}
+
 TexDrawWatch g_tex_draw_watch;
 
 bool TexDrawWatch::Key::operator<(const Key& o) const
@@ -296,6 +310,10 @@ void TexDrawWatch::Record(command_list* cmd_list, uint64_t vs_hash, uint32_t cou
             ++d.draws;
         else
             d = s;
+        if (d.frames.empty() || d.frames.back().second + 1 < g_frame_id)
+            d.frames.emplace_back(g_frame_id, g_frame_id);
+        else if (d.frames.back().second < g_frame_id)
+            d.frames.back().second = g_frame_id;
     }
 }
 
@@ -325,10 +343,15 @@ std::string TexDrawWatch::Command(const std::vector<std::string>& args)
     std::string out;
     for (const auto& [k, s] : seen_) {
         char b[192];
-        std::snprintf(b, sizeof b, "ps=%016llx vs=%016llx t%u tex=%08x %ux%u fmt=%u draws=%u %s=%u\n",
+        std::snprintf(b, sizeof b, "ps=%016llx vs=%016llx t%u tex=%08x %ux%u fmt=%u draws=%u %s=%u frames=",
             (unsigned long long)k.ps, (unsigned long long)k.vs, k.reg, k.hash, s.width, s.height, s.format, s.draws,
             k.indexed ? "indices" : "vertices", s.count);
         out += b;
+        for (size_t i = 0; i < s.frames.size(); ++i) {
+            std::snprintf(b, sizeof b, i ? ",%u-%u" : "%u-%u", s.frames[i].first, s.frames[i].second);
+            out += b;
+        }
+        out += "\n";
     }
     if (seen_.empty())
         out = hash_ ? "nothing yet (a texture under 256x256 has no hash: try texdraws all)\n" : "nothing\n";

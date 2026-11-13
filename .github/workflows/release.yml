@@ -50,4 +50,4 @@ jobs:
         run: |
           $map = "build_addon/release/wwmi_dx12-$($env:GITHUB_REF_NAME.TrimStart('v')).map"
           Copy-Item build_addon/wwmi_dx12.map $map
-          gh release create $env:GITHUB_REF_NAME (Get-Item build_addon/release/*.zip).FullName $map --title $env:GITHUB_REF_NAME --generate-notes
+          gh release create $env:GITHUB_REF_NAME (Get-Item build_addon/release/*.zip).FullName $map --title $env:GITHUB_REF_NAME --generate-notes --latest

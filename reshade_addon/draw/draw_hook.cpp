@@ -14,6 +14,7 @@
 #include "draw_toggles.h"
 #include "../addon/addon.h"
 #include "../instrumentation/shader_capture.h"
+#include "../instrumentation/opacity_watch.h" // g_cb_rows
 #include "../present/frame_sync.h"
 #include "../migoto/frame_analysis_driver.h"
 #include "../migoto/port_api.h"
@@ -54,8 +55,10 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
 
     if (g_debug) g_shader_capture.DiffNote(cmd_list, vs_hash, index_count);
     g_section_textures.NoteMeshPlaces(args);
+    g_section_textures.NoteRefTextures(args);
     g_section_textures.CarryPsReads(args);
     g_tex_draw_watch.Note(args);
+    g_cb_rows.NoteDraw(cmd_list);
 
     if (index_count >= 256 && logger::enabled(3)) { // feeds only the SEEDHB trace line
         uint64_t hbvb0 = 0;

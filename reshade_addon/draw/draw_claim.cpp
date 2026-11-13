@@ -23,9 +23,13 @@
 #include "../mods/port_section.h"
 #include "../shapekeys/sk_toggles.h"
 #include "../mods/ib_hash.h"
+#include "../rabbitfx/decensor_rest.h"
 #include "../addon/addon.h"
 #include "../mods/mod_set.h"
 #include "../migoto/dx12_context_impl.h"
+#ifdef WWMI_DEBUG
+#include "../instrumentation/opacity_watch.h"
+#endif
 
 using namespace reshade::api;
 
@@ -219,7 +223,8 @@ std::string SmallMeshReport(uint32_t count)
 
 bool RunSmallMeshOverrides(const DrawArgs& da)
 {
-    if (da.index_count >= 256 || !g_recognition.SmallMeshAny()) return false;
+    const bool menu_shape = g_settings.decensor && da.index_count == kMenuBackdropIndices;
+    if (da.index_count >= 256 || (!menu_shape && !g_recognition.SmallMeshAny())) return false;
     ID3D12Resource* ibr = nullptr;
     ID3D12Resource* vbr = nullptr;
     uint64_t ibva = 0;
@@ -252,6 +257,11 @@ bool RunSmallMeshOverrides(const DrawArgs& da)
     SmallMeshSeen(da, vbr, vbva, vstride, vsize, got ? "hash" : "pending or not hashed", got);
 #endif
     if (!got) return false;
+    if (got == kMenuBackdropMesh) {
+        g_decensor_rest.MenuDrawn();
+        if (g_debug && DiagOnce("DECENSOR-REST", 0))
+            logger::write("DECENSOR rests while the game draws its character menu (backdrop mesh %08x)", got);
+    }
     thread_local uint32_t t_gen = 0;
     thread_local std::shared_ptr<const std::unordered_set<uint32_t>> t_hashes;
     if (g_recognition.SmallMeshGen() != t_gen) t_hashes = g_recognition.SmallMeshHashes(&t_gen);
@@ -284,7 +294,7 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
         const bool skip_any = g_recognition.SkipVbHashAny();
         const bool model_any = g_recognition.ModelHashAny();
         const bool hash_it = g_debug || g_draw_toggles.ibhash_suppress || skip_any || model_any;
-        if (hash_it && mc_slot < 0 && index_count >= 256) {
+        if ((hash_it || g_settings.decensor) && mc_slot < 0 && index_count >= 256) {
             uint64_t bvb0 = 0;
             bool vb6 = false;
             {
@@ -299,7 +309,18 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                     "SKIPONLY-BAND vs=%016llx first=%u count=%u vb0=%llx outside the skin band %llx..%llx, no vb6 -- not hashed",
                     (unsigned long long)vs_hash, first_index, index_count, (unsigned long long)bvb0,
                     (unsigned long long)g_recognition.SkinBandLo(), (unsigned long long)g_recognition.SkinBandHi());
-            if (skinned) {
+            const uint64_t draw_pso = g_command_lists.Gfx(cmd_list).gfx_pso;
+            if (g_settings.decensor && (g_recognition.InSkinBand(bvb0) || g_pipelines.ReadsStream6(draw_pso))) {
+                g_pipelines.NoteCharacterDraw(draw_pso);
+#ifdef WWMI_DEBUG
+                if (g_debug) {
+                    uint64_t skin_ps = 0;
+                    cmd_list->get_private_data(s_iid_ps_hash, &skin_ps);
+                    g_opacity_watch.NoteDraw(cmd_list, skin_ps, -1, (int)index_count);
+                }
+#endif
+            }
+            if (hash_it && skinned) {
                 ID3D12Resource* ibr = nullptr;
                 ID3D12Resource* vbr = nullptr;
                 uint64_t ibva = 0;
@@ -503,7 +524,7 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                     claim_ib_va = gs.ib.va;
                     claim_ib_bytes = gs.ib.size;
                 }
-                char_ibset = g_recognition.IbAnchorNoteAndAsk(claim_ib_va, claim_ib_bytes, md, ci);
+                char_ibset = g_recognition.IbAnchorNoteAndAsk(claim_ib_va, claim_ib_bytes, md, ci, is_mod_char);
                 if (char_ibset && !is_mod_char && !char_vb)
                     g_draw_stats.ib_anchor_claims.fetch_add(1, std::memory_order_relaxed);
             }
@@ -547,6 +568,13 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
             if ((is_mod_char || char_vb || char_ibset) && (g_draw_toggles.wcl_draw || Mods().GeomEnabled(md))) {
                 dc.mc = &Comps().At(mc_slot);
                 if (g_settings.decensor) g_pipelines.NoteCharacterDraw(g_command_lists.Gfx(cmd_list).gfx_pso);
+#ifdef WWMI_DEBUG
+                if (g_debug && g_settings.decensor) {
+                    uint64_t claim_ps = 0;
+                    cmd_list->get_private_data(s_iid_ps_hash, &claim_ps);
+                    g_opacity_watch.NoteDraw(cmd_list, claim_ps, md, ci);
+                }
+#endif
                 RemovalPin::Mark(d3d12_cl, "game: claimed character draw"); // DRED breadcrumb context
                 dc.rep_vs = vs_hash;
                 dc.mc_b4 = (cur.res && cur.va);

@@ -31,6 +31,8 @@
 
 #include <atomic> // COPY-REFUSED/COPY-OK counters in CopyResource
 #include <mutex>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace MigotoPort {
@@ -115,8 +117,55 @@ void SetCbs(char stage, UINT start, UINT num, ID3D11Buffer* const* bufs)
         if (slot < kMaxCB) {
             BindSlot(st.cb[si][slot], bufs ? bufs[i] : nullptr);
             st.cb_gen[si][slot] = ++g_cb_write_gen;
+            st.cb_window[si][slot] = {};
         }
     }
+}
+
+void RefuseCbs1(char stage, UINT slot, UINT first, UINT count, const char* why)
+{
+    static std::mutex m;
+    static std::set<std::string> said;
+    char key[160];
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "%cs-cb%u: a window of %u constants at constant %u", stage, slot,
+        count, first);
+    {
+        std::lock_guard<std::mutex> l(m);
+        if (!said.insert(key).second) return;
+    }
+    logger::write("PORT-CB1 %s refused (%s); the slot keeps its binding", key, why);
+}
+
+bool SetCbs1(char stage, UINT start, UINT num, ID3D11Buffer* const* bufs, const UINT* first, const UINT* count)
+{
+    if (!first && !count) {
+        SetCbs(stage, start, num, bufs);
+        return true;
+    }
+    if (!first || !count) {
+        RefuseCbs1(stage, start, first ? first[0] : 0, count ? count[0] : 0,
+            "D3D11 takes both the offset and the size arrays, or neither");
+        return false;
+    }
+    for (UINT i = 0; i < num; ++i)
+        if (first[i] % 16 || count[i] % 16 || count[i] > 4096) {
+            RefuseCbs1(stage, start + i, first[i], count[i],
+                "D3D11 takes multiples of 16 constants, at most 4096 of them");
+            return false;
+        }
+    PipeState& st = State();
+    const int si = StageIndex(stage);
+    if (si < 0) return false;
+    for (UINT i = 0; i < num; ++i) {
+        const UINT slot = start + i;
+        if (slot < kMaxCB) {
+            ID3D11Buffer* b = bufs ? bufs[i] : nullptr;
+            BindSlot(st.cb[si][slot], b);
+            st.cb_gen[si][slot] = ++g_cb_write_gen;
+            st.cb_window[si][slot] = b ? CbWindow{ true, first[i], count[i] } : CbWindow{};
+        }
+    }
+    return true;
 }
 
 void SetSamplers(char stage, UINT start, UINT num, ID3D11SamplerState* const* ss)
@@ -155,6 +204,7 @@ bool ShimBufferForCompute(
     ID3D11Buffer* b = nullptr;
     UINT off = 0;
     UINT stride = 0;
+    const CbWindow* win = nullptr;
     D3D12_RESOURCE_STATES to = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (kind == 'v' && slot < kMaxVB) {
         b = st.vb[slot];
@@ -163,6 +213,7 @@ bool ShimBufferForCompute(
         to |= D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
     } else if (kind == 'c' && slot < kMaxCB) {
         b = st.cb[0][slot];
+        win = &st.cb_window[0][slot];
         to |= D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
     } else if (kind == 'i') {
         b = st.ib;
@@ -186,6 +237,16 @@ bool ShimBufferForCompute(
     if (!wr || !wr->dx12 || !VaAndSize(b, off, &va, &sz)) {
         *why = "no VA";
         return false;
+    }
+    if (win) {
+        UINT64 skip = 0;
+        UINT64 bytes = sz;
+        if (!ClipToCbWindow(*win, &skip, &bytes)) {
+            *why = "bound window holds none of the buffer";
+            return false;
+        }
+        va += skip;
+        sz = (UINT)bytes;
     }
     const D3D12_GPU_VIRTUAL_ADDRESS base = wr->dx12->GetGPUVirtualAddress();
     const UINT64 width = wr->dx12->GetDesc().Width;
@@ -256,9 +317,22 @@ void STDMETHODCALLTYPE Dx12Context::CSSetShaderResources(UINT s, UINT n, ID3D11S
     SetSrvs('c', s, n, v);
 }
 
-void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers(UINT s, UINT n, ID3D11Buffer* const* b)
+static void SayVsWindowEmpty(UINT slot)
 {
-    SetCbs('v', s, n, b);
+    static std::mutex m;
+    static bool said[kMaxCB] = {};
+    {
+        std::lock_guard<std::mutex> l(m);
+        if (said[slot]) return;
+        said[slot] = true;
+    }
+    logger::write("PORT-CB1 vs-cb%u: the bound window holds none of its buffer; the game's draw keeps the "
+                  "binding it had in that register",
+        slot);
+}
+
+static void PublishVsCbRoots(UINT s, UINT n)
+{
     const Dx12Bridge& br = GetDx12Bridge();
     if (!br.cl || !br.vs_cb_root) return;
     PipeState& st = State();
@@ -270,6 +344,14 @@ void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers(UINT s, UINT n, ID3D11B
         D3D12_GPU_VIRTUAL_ADDRESS va = 0;
         UINT sz = 0;
         if (VaAndSize(st.cb[0][slot], 0, &va, &sz)) {
+            UINT64 skip = 0;
+            UINT64 bytes = sz;
+            if (!ClipToCbWindow(st.cb_window[0][slot], &skip, &bytes)) {
+                SayVsWindowEmpty(slot);
+                continue;
+            }
+            va += skip;
+            sz = (UINT)bytes;
             WrapResource* w = AsWrapResource(st.cb[0][slot]);
             const D3D12_GPU_VIRTUAL_ADDRESS snap = (w && w->dx12 && OwnedBuffer(w->dx12))
                 ? StaticCbSnapshot(br.cl, w->dx12, va - w->dx12->GetGPUVirtualAddress(), sz)
@@ -278,6 +360,12 @@ void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers(UINT s, UINT n, ID3D11B
             br.cl->SetGraphicsRootConstantBufferView((UINT)root, snap ? snap : va);
         }
     }
+}
+
+void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers(UINT s, UINT n, ID3D11Buffer* const* b)
+{
+    SetCbs('v', s, n, b);
+    PublishVsCbRoots(s, n);
 }
 void STDMETHODCALLTYPE Dx12Context::HSSetConstantBuffers(UINT s, UINT n, ID3D11Buffer* const* b)
 {
@@ -298,6 +386,37 @@ void STDMETHODCALLTYPE Dx12Context::PSSetConstantBuffers(UINT s, UINT n, ID3D11B
 void STDMETHODCALLTYPE Dx12Context::CSSetConstantBuffers(UINT s, UINT n, ID3D11Buffer* const* b)
 {
     SetCbs('c', s, n, b);
+}
+
+void STDMETHODCALLTYPE Dx12Context::VSSetConstantBuffers1(
+    UINT s, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* count)
+{
+    if (SetCbs1('v', s, n, b, first, count)) PublishVsCbRoots(s, n);
+}
+void STDMETHODCALLTYPE Dx12Context::HSSetConstantBuffers1(
+    UINT s, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* count)
+{
+    SetCbs1('h', s, n, b, first, count);
+}
+void STDMETHODCALLTYPE Dx12Context::DSSetConstantBuffers1(
+    UINT s, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* count)
+{
+    SetCbs1('d', s, n, b, first, count);
+}
+void STDMETHODCALLTYPE Dx12Context::GSSetConstantBuffers1(
+    UINT s, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* count)
+{
+    SetCbs1('g', s, n, b, first, count);
+}
+void STDMETHODCALLTYPE Dx12Context::PSSetConstantBuffers1(
+    UINT s, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* count)
+{
+    SetCbs1('p', s, n, b, first, count);
+}
+void STDMETHODCALLTYPE Dx12Context::CSSetConstantBuffers1(
+    UINT s, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* count)
+{
+    SetCbs1('c', s, n, b, first, count);
 }
 
 void STDMETHODCALLTYPE Dx12Context::VSSetSamplers(UINT s, UINT n, ID3D11SamplerState* const* ss)
@@ -1493,48 +1612,52 @@ void STDMETHODCALLTYPE Dx12Context::GetDevice(ID3D11Device** ppDevice)
     (*ppDevice)->AddRef();
 }
 
-static void PortGetCbs1(UINT NumBuffers, UINT* pFirstConstant, UINT* pNumConstants)
+static void PortGetCbs1(char stage, UINT start, UINT num, UINT* first, UINT* count)
 {
-    for (UINT i = 0; i < NumBuffers; ++i) {
-        if (pFirstConstant) pFirstConstant[i] = 0;
-        if (pNumConstants) pNumConstants[i] = 0; // 0 = whole buffer, theirs' own convention
+    const PipeState& st = State();
+    const int si = StageIndex(stage);
+    for (UINT i = 0; i < num; ++i) {
+        const UINT slot = start + i;
+        const CbWindow w = (si >= 0 && slot < kMaxCB) ? st.cb_window[si][slot] : CbWindow{};
+        if (first) first[i] = w.first_constant;
+        if (count) count[i] = w.num_constants;
     }
 }
 void STDMETHODCALLTYPE Dx12Context::VSGetConstantBuffers1(
     UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     VSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
+    PortGetCbs1('v', StartSlot, NumBuffers, pFirstConstant, pNumConstants);
 }
 void STDMETHODCALLTYPE Dx12Context::HSGetConstantBuffers1(
     UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     HSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
+    PortGetCbs1('h', StartSlot, NumBuffers, pFirstConstant, pNumConstants);
 }
 void STDMETHODCALLTYPE Dx12Context::DSGetConstantBuffers1(
     UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     DSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
+    PortGetCbs1('d', StartSlot, NumBuffers, pFirstConstant, pNumConstants);
 }
 void STDMETHODCALLTYPE Dx12Context::GSGetConstantBuffers1(
     UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     GSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
+    PortGetCbs1('g', StartSlot, NumBuffers, pFirstConstant, pNumConstants);
 }
 void STDMETHODCALLTYPE Dx12Context::PSGetConstantBuffers1(
     UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     PSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
+    PortGetCbs1('p', StartSlot, NumBuffers, pFirstConstant, pNumConstants);
 }
 void STDMETHODCALLTYPE Dx12Context::CSGetConstantBuffers1(
     UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers, UINT* pFirstConstant, UINT* pNumConstants)
 {
     CSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    PortGetCbs1(NumBuffers, pFirstConstant, pNumConstants);
+    PortGetCbs1('c', StartSlot, NumBuffers, pFirstConstant, pNumConstants);
 }
 
 void STDMETHODCALLTYPE Dx12Context::IAGetInputLayout(ID3D11InputLayout** ppInputLayout)

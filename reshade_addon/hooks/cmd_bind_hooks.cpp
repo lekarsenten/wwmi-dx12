@@ -7,6 +7,7 @@
 #include "../hud/uid_hide.h"
 #include "../addon/addon.h"
 #include "../addon/settings.h"
+#include "../rabbitfx/decensor_rest.h"
 #include "resource_tracker.h"
 #include "../mods/component_table.h"
 #include "../mods/game_cb_reader.h"
@@ -30,7 +31,7 @@ void on_bind_pipeline(command_list* cmd_list, pipeline_stage type, pipeline pipe
             uint64_t v = g_settings.hide_uid
                 ? g_pipelines.UidVariant(cmd_list->get_device(), pipeline.handle, g_uid_hide.Target())
                 : 0;
-            if (!v && g_settings.decensor) v = g_pipelines.DecensorVariant(cmd_list->get_device(), pipeline.handle);
+            if (!v && DecensorOn()) v = g_pipelines.DecensorVariant(cmd_list->get_device(), pipeline.handle);
             if (v) {
                 reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())
                     ->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(v));

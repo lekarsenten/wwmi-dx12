@@ -6,6 +6,7 @@
 #include "layout_registry.h"
 #include "../core/fnv.h"
 #include "../draw/draw_toggles.h"
+#include "../instrumentation/diag_gate.h"
 #include "../hooks/command_list_registry.h"
 #include "../instrumentation/profiler.h"
 #include "../textures/tex_rules.h"
@@ -142,7 +143,8 @@ CharacterRecognition::CompSet CharacterRecognition::ModDeclaredComps(int mod_id)
     return it == declared.end() ? CompSet{} : it->second;
 }
 
-bool CharacterRecognition::IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx)
+bool CharacterRecognition::IbAnchorNoteAndAsk(
+    uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx, bool content_proven)
 {
     if (!ib_va || mod_id < 0 || comp_idx < 0 || mod_id >= (int)Mods().Count()) return false;
     const CompSet declared = ModDeclaredComps(mod_id);
@@ -157,7 +159,14 @@ bool CharacterRecognition::IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes,
         e.seen = CompSet{};
     }
     e.seen.set(comp_idx);
-    if (e.seen.covers(declared)) {
+    const bool shape_only = declared.count() < 2 && !content_proven;
+#ifdef WWMI_DEBUG
+    if (shape_only && e.seen.covers(declared) && DiagOnce("IBANCHOR-SHAPE", (int)(uint32_t)(ns_hash ^ (ns_hash >> 32))))
+        logger::write("IBANCHOR-SHAPE mod %d: index buffer %llx holds a draw the shape of its only component, but "
+                      "nothing in it proves it is the mod's mesh -- not anchored",
+            mod_id, (unsigned long long)ib_va);
+#endif
+    if (!shape_only && e.seen.covers(declared)) {
         IbAnchorRec& a = ib_anchor_[ib_va];
         a.bytes = ib_bytes;
         if (a.ns_hash != ns_hash) {

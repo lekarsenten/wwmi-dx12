@@ -109,18 +109,56 @@ function Get-WwmiVersion([string]$p) {
 }
 function Test-GameRunning { return [bool](Get-Process $proc -ErrorAction SilentlyContinue) }
 
+function Get-AddonFile {
+    $files = @([IO.Path]::Combine($dir, "wwmi_dx12.addon64"))
+    $addonPathDir = Resolve-Dir (Get-ReShadeAddonPath ([IO.Path]::Combine($dir, "ReShade.ini")))
+    if ($addonPathDir) { $files += [IO.Path]::Combine($addonPathDir, "wwmi_dx12.addon64") }
+    return $files | Where-Object { [IO.File]::Exists($_) } | Sort-Object { [IO.File]::GetLastWriteTimeUtc($_) } | Select-Object -Last 1
+}
 function Get-AddonVersion {
     try {
-        $files = @([IO.Path]::Combine($dir, "wwmi_dx12.addon64"))
-        $addonPathDir = Resolve-Dir (Get-ReShadeAddonPath ([IO.Path]::Combine($dir, "ReShade.ini")))
-        if ($addonPathDir) { $files += [IO.Path]::Combine($addonPathDir, "wwmi_dx12.addon64") }
-        $newest = $files | Where-Object { [IO.File]::Exists($_) } | Sort-Object { [IO.File]::GetLastWriteTimeUtc($_) } | Select-Object -Last 1
+        $newest = Get-AddonFile
         if (-not $newest) { return "not found" }
         $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($newest)
         if (-not $info.ProductVersion) { return "unknown" }
         if ($info.Comments) { return "$($info.ProductVersion) (build $($info.Comments))" }
         return $info.ProductVersion
     } catch { return "unknown" }
+}
+function Get-AddonRelease {
+    try {
+        $newest = Get-AddonFile
+        $v = $null
+        if ($newest -and [version]::TryParse([Diagnostics.FileVersionInfo]::GetVersionInfo($newest).ProductVersion, [ref]$v)) { return $v }
+    } catch {}
+    return $null
+}
+
+# Newer releases from GitHub, newest first, each with its release commit's message as the notes.
+function Start-UpdateCheck([version]$have) {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $shell = [PowerShell]::Create()
+        [void]$shell.AddScript({
+            param([version]$have)
+            $api = "https://api.github.com/repos/lekarsenten/wwmi-dx12"
+            $headers = @{ "User-Agent" = "wwmi-dx12-launcher"; "Accept" = "application/vnd.github+json" }
+            $releases = Invoke-RestMethod "$api/releases?per_page=100" -Headers $headers -TimeoutSec 15
+            $newer = @()
+            foreach ($r in $releases) {
+                $v = $null
+                if ($r.draft -or $r.prerelease -or -not [version]::TryParse(($r.tag_name -replace '^v', ''), [ref]$v) -or $v -le $have) { continue }
+                $notes = ""
+                try { $notes = (Invoke-RestMethod "$api/commits/$($r.tag_name)" -Headers $headers -TimeoutSec 15).commit.message } catch {}
+                $newer += [pscustomobject]@{ Version = $v; Notes = $notes }
+            }
+            $newer | Sort-Object Version -Descending
+        }).AddArgument($have)
+        return @{ Shell = $shell; Run = $shell.BeginInvoke() }
+    } catch { return $null }
+}
+function Receive-UpdateCheck($check) {
+    try { return @($check.Shell.EndInvoke($check.Run)) } catch { return @() }
 }
 
 Write-Host "WWMI-DX12 launcher" -ForegroundColor Cyan
@@ -284,6 +322,71 @@ function Write-Graphics {
     $note = if ($installed -contains $tier) { "(installed)" } else { "(not found in this game folder)" }
     Write-Host $note.PadRight(34)
 }
+$have = Get-AddonRelease
+$updateCheck = if ($have) { Start-UpdateCheck $have } else { $null }
+$update = @()
+$updateRow = -1
+$updateBright = $true
+$updateFlashAt = Get-Date
+$updateDots = 0
+function Write-UpdateLine {
+    if (-not $update.Count) {
+        $wait = if ($updateCheck) { "  Checking for updates" + ("." * $updateDots) } else { "" }
+        Write-Host -NoNewline $wait.PadRight(30)
+        return
+    }
+    $text = " Please update: wwmi-dx12 $($update[0].Version) is out (this add-on is $have). "
+    Write-Host -NoNewline "  "
+    if ($updateBright) { Write-Host -NoNewline $text -ForegroundColor Black -BackgroundColor Yellow }
+    else { Write-Host -NoNewline $text -ForegroundColor Yellow }
+}
+function Write-UpdateLineInPlace {
+    try {
+        $back = [Console]::CursorTop
+        [Console]::SetCursorPosition(0, $updateRow)
+        Write-UpdateLine
+        [Console]::SetCursorPosition(0, $back)
+    } catch { $script:updateRow = -1 }
+}
+function Get-Wrapped([string]$text, [string]$indent) {
+    $width = 100
+    try { $width = [Console]::WindowWidth - 1 } catch {}
+    $hang = if ($text.StartsWith("- ")) { $indent + "  " } else { $indent }
+    $line = $indent
+    $fresh = $true
+    foreach ($word in $text.Split(' ')) {
+        if (-not $fresh -and $line.Length + 1 + $word.Length -gt $width) {
+            $line
+            $line = $hang
+            $fresh = $true
+        }
+        $line += $(if ($fresh) { "" } else { " " }) + $word
+        $fresh = $false
+    }
+    $line
+}
+# The notes under the update line, cut to the rows left in the window: more would scroll it, and the lines
+# redrawn in place would move.
+function Show-Update {
+    $rows = @()
+    foreach ($u in $update) {
+        $lines = @(($u.Notes -replace "`r", "").Split("`n") | Where-Object { $_.Trim() })
+        if ($lines.Count -and $lines[0] -match '^wwmi-dx12 ') { $lines = @($lines | Select-Object -Skip 1) }
+        $rows += @{ Text = "" }
+        $rows += @{ Text = "  What's new in $($u.Version)"; Color = "Cyan" }
+        foreach ($l in $lines) { foreach ($w in @(Get-Wrapped $l.Trim() "    ")) { $rows += @{ Text = $w } } }
+    }
+    $room = 0
+    try { $room = [Console]::WindowTop + [Console]::WindowHeight - 1 - [Console]::CursorTop } catch {}
+    if ($rows.Count -gt $room) {
+        $rows = @($rows | Select-Object -First ([Math]::Max($room - 1, 0)))
+        if ($room -ge 1) { $rows += @{ Text = "    ... more: https://github.com/lekarsenten/wwmi-dx12/releases"; Color = "DarkGray" } }
+    }
+    foreach ($r in $rows) {
+        if ($r.Color) { Write-Host $r.Text -ForegroundColor $r.Color } else { Write-Host $r.Text }
+    }
+}
+
 Write-Host ""
 Write-Host "  Add-on         $(Get-AddonVersion)"
 Write-Host "  Game folder    $root"
@@ -297,7 +400,35 @@ Write-Host ""
 Write-Host "  Left / Right   choose the graphics files"
 Write-Host "  Esc            quit"
 Write-Host "  any other key  start the game"
+if ($updateCheck) {
+    Write-Host ""
+    try { $updateRow = [Console]::CursorTop } catch {}
+    Write-UpdateLine
+    Write-Host ""
+}
 while ($true) {
+    try { $ready = [Console]::KeyAvailable } catch { break }
+    if (-not $ready) {
+        if ($updateCheck -and $updateCheck.Run.IsCompleted) {
+            $update = @(Receive-UpdateCheck $updateCheck)
+            $updateCheck = $null
+            if ($updateRow -ge 0) { Write-UpdateLineInPlace }
+            if (-not $update.Count) { $updateRow = -1 }
+            elseif ($updateRow -ge 0) { Show-Update }
+        }
+        if ($updateRow -ge 0 -and (Get-Date) -ge $updateFlashAt) {
+            if ($update.Count) {
+                $updateBright = -not $updateBright
+                $updateFlashAt = (Get-Date).AddMilliseconds(1500)
+            } else {
+                $updateDots = ($updateDots + 1) % 4
+                $updateFlashAt = (Get-Date).AddMilliseconds(400)
+            }
+            Write-UpdateLineInPlace
+        }
+        Start-Sleep -Milliseconds 50
+        continue
+    }
     try { $key = [Console]::ReadKey($true) } catch { break }
     if ($key.Key -eq [ConsoleKey]::Escape) { exit 0 }
     $step = 0
@@ -312,6 +443,7 @@ while ($true) {
         [Console]::SetCursorPosition(0, $back)
     } catch { Write-Graphics }
 }
+if ($updateCheck) { try { [void]$updateCheck.Shell.BeginStop($null, $null) } catch {} }
 Write-Host ""
 
 function Hide-LauncherWindow {

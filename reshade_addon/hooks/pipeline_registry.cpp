@@ -6,6 +6,7 @@
 #include "../hud/uid_hide.h"
 #include "../core/dxil_cb.h" // DxilCbuffers -- the VS's declared cbuffer sizes, from the DXIL metadata
 #include "../addon/addon.h"
+#include "../addon/settings.h"
 #include "../core/fnv.h"
 #include "hooks_toggles.h"
 #include "../instrumentation/diag_gate.h"
@@ -101,6 +102,7 @@ PipelineRegistry::Slot* PipelineRegistry::SlotOf(uint64_t key, bool create)
             n->ucz.store(o.ucz.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->chr.store(o.chr.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->chrg.store(o.chrg.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n->vb6.store(o.vb6.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->key.store(k, std::memory_order_release);
         }
         tab_.store(g, std::memory_order_release);
@@ -157,17 +159,19 @@ void PipelineRegistry::SetDecensorVariant(uint64_t pso, uint64_t variant)
 
 void PipelineRegistry::NoteCharacterDraw(uint64_t pso)
 {
-    Slot* s = SlotOf(pso, false);
-    if (!s) return;
+    if (Slot* s = SlotOf(pso, false)) MarkCharacterPs(s, "drew a character -- decensored from its next bind");
+}
+
+void PipelineRegistry::MarkCharacterPs(Slot* s, const char* why)
+{
     const uint64_t ps = s->ps.load(std::memory_order_acquire);
     if (!ps || s->chr.load(std::memory_order_acquire)) return;
     std::lock_guard l(char_ps_mutex_);
     if (char_ps_.insert(ps).second) {
         char_ps_gen_.fetch_add(1, std::memory_order_acq_rel);
         if (g_debug)
-            logger::write(
-                "DECENSOR-CHAR ps=%016llx: drew a character -- decensored from its next bind (%zu character pixel shader(s))",
-                (unsigned long long)ps, char_ps_.size());
+            logger::write("DECENSOR-CHAR ps=%016llx: %s (%zu character pixel shader(s))", (unsigned long long)ps, why,
+                char_ps_.size());
     }
     s->chr.store(true, std::memory_order_release);
     s->chrg.store(char_ps_gen_.load(std::memory_order_acquire), std::memory_order_release);
@@ -196,6 +200,12 @@ void PipelineRegistry::SetUidVariant(uint64_t pso, uint32_t target, uint64_t var
             s->uc.store(variant ? variant : 1, std::memory_order_release);
 }
 
+bool PipelineRegistry::ReadsStream6(uint64_t pso)
+{
+    const Slot* s = SlotOf(pso, false);
+    return s && s->vb6.load(std::memory_order_acquire);
+}
+
 uint64_t PipelineRegistry::PsReadMask(uint64_t pso)
 {
     const Slot* s = SlotOf(pso, false);
@@ -218,6 +228,28 @@ bool PipelineRegistry::VsCbufferBytes(uint64_t pso, unsigned reg, uint32_t& byte
     auto it = vs_cbs_.find(pso);
     if (it == vs_cbs_.end()) return false;
     bytes = it->second[reg];
+    return true;
+}
+
+bool PipelineRegistry::PsCbufferBytes(uint64_t pso, unsigned reg, uint32_t& bytes)
+{
+    bytes = 0;
+    if (reg >= 16) return false;
+    std::lock_guard lock(regs_mutex_);
+    auto it = ps_cbs_.find(pso);
+    if (it == ps_cbs_.end()) return false;
+    bytes = it->second[reg];
+    return true;
+}
+
+bool PipelineRegistry::CbufferBytes(uint64_t pso, char stage, std::array<uint32_t, 16>& bytes)
+{
+    bytes = {};
+    std::lock_guard lock(regs_mutex_);
+    const auto& m = stage == 'p' ? ps_cbs_ : vs_cbs_;
+    auto it = m.find(pso);
+    if (it == m.end()) return false;
+    bytes = it->second;
     return true;
 }
 
@@ -277,8 +309,8 @@ bool on_create_pipeline(device*, pipeline_layout, uint32_t subobject_count, cons
     return replaced;
 }
 
-void PipelineRegistry::Register(
-    device*, pipeline_layout layout, uint32_t subobject_count, const pipeline_subobject* subobjects, pipeline pipeline)
+void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t subobject_count,
+    const pipeline_subobject* subobjects, pipeline pipeline)
 {
     HookTimer timed(init_n_, init_us_, &init_max_us_);
     uint64_t vs_hash = 0;
@@ -291,6 +323,7 @@ void PipelineRegistry::Register(
     size_t ps_size = 0;
     const void* cs_code = nullptr;
     size_t cs_size = 0;
+    bool reads_vb6 = false;
     for (uint32_t i = 0; i < subobject_count; ++i) {
         if (subobjects[i].type == pipeline_subobject_type::vertex_shader) {
             auto shader = static_cast<const shader_desc*>(subobjects[i].data);
@@ -324,9 +357,11 @@ void PipelineRegistry::Register(
             auto elems = static_cast<const input_element*>(subobjects[i].data);
             if (elems && subobjects[i].count) {
                 std::vector<MigotoPort::InputElement> in(subobjects[i].count);
-                for (uint32_t k = 0; k < subobjects[i].count; ++k)
+                for (uint32_t k = 0; k < subobjects[i].count; ++k) {
                     in[k] = { elems[k].semantic, elems[k].semantic_index, (unsigned)elems[k].format,
                         elems[k].buffer_binding, elems[k].offset, elems[k].instance_step_rate };
+                    if (elems[k].buffer_binding == 6) reads_vb6 = true;
+                }
                 MigotoPort::RecordInputLayout(pipeline.handle, in.data(), subobjects[i].count);
             }
         }
@@ -402,6 +437,7 @@ void PipelineRegistry::Register(
             s->ucz.store(0, std::memory_order_release);
             s->chr.store(false, std::memory_order_release);
             s->chrg.store(0, std::memory_order_release);
+            s->vb6.store(reads_vb6, std::memory_order_release);
             if (vs_hash) s->vc.store(vs_hash, std::memory_order_release);
             if (cs_hash) s->vc.store(cs_hash, std::memory_order_release);
             if (ps_hash) s->ps.store(ps_hash, std::memory_order_release);
@@ -448,8 +484,26 @@ void PipelineRegistry::Register(
             }
         }
     }
+    {
+        std::vector<DxilCbuf> cbs;
+        const bool ok = ps_code && DxilCbuffers(ps_code, ps_size, cbs, nullptr);
+        std::array<uint32_t, 16> by_reg{};
+        if (ok)
+            for (const DxilCbuf& c : cbs)
+                if (c.space == 0 && c.reg < 16) by_reg[c.reg] = c.bytes;
+        std::lock_guard lock(regs_mutex_);
+        if (ok)
+            ps_cbs_[pipeline.handle] = by_reg;
+        else
+            ps_cbs_.erase(pipeline.handle);
+    }
 
     if (vs_hash && ps_hash) g_pso_clones.Store(pipeline.handle, layout, subobject_count, subobjects);
+    if (vs_hash && ps_hash && g_rfx_patch.DecensorCached(ps_hash))
+        if (Slot* s = SlotOf(pipeline.handle, false)) {
+            MarkCharacterPs(s, "decensored in an earlier session -- decensored from its creation");
+            if (g_settings.decensor) DecensorVariant(dev, pipeline.handle);
+        }
 
     // Shader-replacement bytes (allocated in on_create_pipeline) are now safe to free -- the pipeline is built.
     if (!s_replace_keep.empty()) s_replace_keep.clear();
@@ -472,11 +526,13 @@ void PipelineRegistry::Forget(device* device, pipeline pipeline)
             s->ucz.store(0);
             s->chr.store(false);
             s->chrg.store(0);
+            s->vb6.store(false);
         }
         std::lock_guard lock(regs_mutex_);
         ps_regs_.erase(pipeline.handle);
         vs_regs_.erase(pipeline.handle);
         vs_cbs_.erase(pipeline.handle);
+        ps_cbs_.erase(pipeline.handle);
         cull_.erase(pipeline.handle);
     }
     g_command_lists.ForgetPipeline(pipeline.handle);

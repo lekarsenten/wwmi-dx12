@@ -19,7 +19,7 @@ bool ShaderOverrideMatches(uint64_t shader_hash, std::wstring* first_section);
 bool RunShaderOverrides(
     uint64_t shader_hash, const PortApi::DrawInfo* draw = nullptr, reshade::api::command_list* cmd_list = nullptr);
 #ifdef WWMI_DEBUG
-// The debug pipe's `alias`: lists every alias, or sets / removes one looked up ahead of the built-in table.
+// The debug pipe's `alias`: lists every alias, or sets / removes one looked up ahead of the .shaderpairs files.
 std::string ShaderAliasCommand(const std::vector<std::string>& args);
 // The mesh a .shaderpairs line paired this shader on (a component section's `hash =`); 0 when it names none.
 uint32_t ShaderPairMesh(uint64_t dx12);

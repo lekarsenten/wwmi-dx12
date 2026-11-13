@@ -173,7 +173,7 @@ bool TexLook::KeepRef(uint32_t target, Ref&& r)
     return true;
 }
 
-void TexLook::Offer(uint32_t source, uint32_t target, LookSig&& sig)
+bool TexLook::Offer(uint32_t source, uint32_t target, LookSig&& sig)
 {
     Ref r;
     r.sig = std::move(sig);
@@ -194,6 +194,7 @@ void TexLook::Offer(uint32_t source, uint32_t target, LookSig&& sig)
     else if (g_debug && kept)
         logger::trace("TexLook: %08x %ux%u is now the reference of %08x%s", source, w, h, target,
             source == target ? " (itself)" : ", a proven lower mip of it");
+    return kept;
 }
 
 void TexLook::Match(uint32_t hash, const LookSig& sig)
@@ -252,6 +253,14 @@ void TexLook::OnCut(uint32_t hash, const TexLookCut& cut, bool is_target)
         Offer(hash, high, std::move(sig));
     else
         Match(hash, sig);
+}
+
+bool TexLook::TakeRef(uint32_t hash, uint32_t target, const TexLookCut& cut)
+{
+    LookSig sig;
+    if (!g_settings.texlod_cache || !hash || !target || g_tex_lod.Degenerate(hash) || !SigOf(cut, sig)) return false;
+    decoded_.fetch_add(1, std::memory_order_relaxed);
+    return Offer(hash, target, std::move(sig));
 }
 
 // The references (all a seed gives) and, from our own file, the verdicts. Caller holds mtx_.

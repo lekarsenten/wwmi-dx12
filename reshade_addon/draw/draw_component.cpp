@@ -23,6 +23,7 @@
 #include "../addon/settings.h"
 #include "draw_parts.h"
 #include "draw_toggles.h"
+#include "../rabbitfx/decensor_rest.h"
 #include "../rabbitfx/rfx_patch.h"
 #include "../rabbitfx/rfx_toggles.h"
 #include "../shapekeys/shapekey_chain.h"
@@ -62,7 +63,7 @@ static void PublishDrawShaders(reshade::api::command_list* cmd_list, uint64_t vs
     unsigned ps_max = 0;
     bool has_glow = false;
     if (g_rfx_patch.Variant(
-            cmd_list->get_device(), g_command_lists.Gfx(cmd_list).gfx_pso, &ps_max, &has_glow, g_settings.decensor))
+            cmd_list->get_device(), g_command_lists.Gfx(cmd_list).gfx_pso, &ps_max, &has_glow, DecensorOn()))
         PortApi::LinkShaderRegexGroup(ps, kRfxNamespace, kRfxRegexGroup);
 }
 
@@ -165,11 +166,17 @@ struct PortRestore {
     ID3D12PipelineState* pso = nullptr;
 };
 struct PushCbGuard {
+    uint16_t vs = 0; // the vs-cbN pushed from the game's draw, but the skeleton and object ones
+    uint16_t ps = 0; // the ps-cbN pushed from the game's draw
     ~PushCbGuard()
     {
         PortApi::PushGameConstantBuffer('v', 4, nullptr, 0, 0);
         PortApi::PushGameConstantBuffer('v', 3, nullptr, 0, 0);
         PortApi::PushGameConstantBuffer('v', 2, nullptr, 0, 0);
+        for (unsigned reg = 0; reg < 16; ++reg) {
+            if (vs & (1u << reg)) PortApi::PushGameConstantBuffer('v', reg, nullptr, 0, 0);
+            if (ps & (1u << reg)) PortApi::PushGameConstantBuffer('p', reg, nullptr, 0, 0);
+        }
         if (g_draw_toggles.push_game_vb) PortApi::PushGameVertexBuffer(0, nullptr, 0, 0, 0, 0);
     }
 };
@@ -595,6 +602,9 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
     {
         PROF(PROF_CS_Push);
         PushGameBindings(run);
+        constexpr uint16_t kSkeletonAndObjectCbs = (1u << 2) | (1u << 3) | (1u << 4);
+        scopes.push_guard->vs = PushGameConstantBuffers(cmd_list, 'v', kSkeletonAndObjectCbs);
+        scopes.push_guard->ps = PushGameConstantBuffers(cmd_list, 'p', 0);
         SwapShadowBoneCb(run);
         {
             auto const& gs = g_command_lists.Gfx(cmd_list);

@@ -236,7 +236,10 @@ void PushGameConstantBufferRecord(
     MigotoPort::WrapBuffer* w = slots->Get({ si, slot });
     if (!res) {
         // Forget the record, and only the record: a slot the ini has since bound keeps its buffer.
-        if (st.cb[si][slot] == (ID3D11Buffer*)w) MigotoPort::BindSlot(st.cb[si][slot], (ID3D11Buffer*)nullptr);
+        if (st.cb[si][slot] == (ID3D11Buffer*)w) {
+            MigotoPort::BindSlot(st.cb[si][slot], (ID3D11Buffer*)nullptr);
+            st.cb_window[si][slot] = {};
+        }
         return;
     }
     if (w->dx12 != res) w->heap_type = (D3D12_HEAP_TYPE)0; // foreign, as the VB wrapper above
@@ -246,6 +249,7 @@ void PushGameConstantBufferRecord(
     w->desc = GameConstantBufferDesc(dx11_byte_width);
     RegisterGameBuffer(w, GameConstantBufferHash(dx11_byte_width));
     MigotoPort::BindSlot(st.cb[si][slot], (ID3D11Buffer*)w);
+    st.cb_window[si][slot] = {};
 }
 
 void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res, unsigned long long gpu_va,
@@ -315,7 +319,8 @@ void PushGameConstantBuffer(char stage, unsigned slot, ID3D12Resource* res, unsi
             logger::write("PORT-RECOG %c%c-cb%u hash=%08x -> %zu [TextureOverride] match(es), "
                           "filter_index=%.4f %s",
                 "vhdgpc"[si], 's', slot, hash, matches.size(), filter,
-                matches.empty() ? "*** NO MATCH: `if vs-cb4 == 3381.7777` will be FALSE ***" : "(recognised)");
+                matches.empty() ? "(no section names its hash: a filter_index test on this slot is false)"
+                                : "(recognised)");
         }
     }
     SetViaTarget(tgt, (ID3D11Resource*)w, nullptr);

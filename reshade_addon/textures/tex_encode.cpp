@@ -379,9 +379,11 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
                 if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_COPY_DEST,
                         nullptr, IID_PPV_ARGS(&s.scratch))))
                     s.scratch.Reset();
-                if (s.scratch)
+                if (s.scratch) {
+                    DevName(s.scratch.Get(), L"wwmi encode scratch");
                     s.blocks = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, (UINT64)pitch * (s.rows / scale),
                         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                }
             }
             UINT srv_slot = 0;
             D3D12_CPU_DESCRIPTOR_HANDLE cpu =

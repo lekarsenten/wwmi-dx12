@@ -35,7 +35,6 @@ void ShaderCapture::Note(uint64_t hash, const void* code, size_t code_size, cons
     if (!code || code_size == 0 || code_size > 10u * 1024u * 1024u) return;
     std::lock_guard lock(cache_mutex_);
     if (cache_.count(hash)) return; // already cached
-    if (cache_.size() >= 4096) return; // cap (every pipeline's shaders are cached)
     Cached cs;
     cs.stage[0] = stage[0];
     cs.stage[1] = stage[1];

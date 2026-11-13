@@ -21,6 +21,8 @@ public:
     void CarryPsReads(const DrawArgs& da);
     // Where a game character draw binds each texture: recorded while crawling, linked from a seed.
     void NoteMeshPlaces(const DrawArgs& da);
+    // A21: the textures a game character draw reads, while a reference take collects them.
+    WWMI_DEBUG_FN void NoteRefTextures(const DrawArgs& da) WWMI_DEBUG_BODY();
     // The draw's textures published for the section; the registers pushed, as a mask.
     uint16_t Publish(reshade::api::command_list* cmd_list, int dm, int comp, uint32_t rtv_count);
 
@@ -83,6 +85,7 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t format = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> frames; // the runs of consecutive frames it was drawn in
     };
     void Record(reshade::api::command_list* cmd_list, uint64_t vs_hash, uint32_t count, bool indexed);
     std::mutex mutex_;

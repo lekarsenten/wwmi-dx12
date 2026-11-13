@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <memory>
 #include <vector>
 #include "component_table.h"
@@ -41,6 +42,20 @@ private:
 };
 
 extern SetLife<ModSet> g_mod_sets;
+
+class ReloadGate {
+public:
+    static bool MayReload(void* self);
+    void Published(uint64_t stamp) { published_ = stamp; }
+
+private:
+    const char* Waiting() const;
+    uint64_t published_ = 0;
+    bool holding_ = false;
+    std::chrono::steady_clock::time_point since_{};
+};
+
+extern ReloadGate g_reload_gate;
 
 void InitModSets();
 void BuildModSet(void* user);

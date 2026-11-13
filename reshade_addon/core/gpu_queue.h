@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <d3d12.h>
 
 inline HRESULT CreateGpuQueue(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type, const wchar_t* queue_name,
@@ -19,8 +20,23 @@ inline HRESULT CreateGpuQueue(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type, c
 
 inline DWORD WaitForFence(ID3D12Fence* fence, UINT64 value, HANDLE event, DWORD ms)
 {
-    if (fence->GetCompletedValue() >= value) return WAIT_OBJECT_0;
+    UINT64 done = fence->GetCompletedValue();
+    if (done == UINT64_MAX) return WAIT_FAILED;
+    if (done >= value) return WAIT_OBJECT_0;
     if (!event) return WAIT_FAILED;
-    fence->SetEventOnCompletion(value, event);
-    return WaitForSingleObject(event, ms);
+    if (FAILED(fence->SetEventOnCompletion(value, event))) return WAIT_FAILED;
+    const ULONGLONG start = GetTickCount64();
+    for (;;) {
+        DWORD left = INFINITE;
+        if (ms != INFINITE) {
+            const ULONGLONG spent = GetTickCount64() - start;
+            left = spent >= ms ? 0 : ms - (DWORD)spent;
+        }
+        const DWORD r = WaitForSingleObject(event, left);
+        if (r != WAIT_OBJECT_0) return r;
+        done = fence->GetCompletedValue();
+        if (done == UINT64_MAX) return WAIT_FAILED;
+        if (done >= value) return WAIT_OBJECT_0;
+        if (left == 0) return WAIT_TIMEOUT;
+    }
 }

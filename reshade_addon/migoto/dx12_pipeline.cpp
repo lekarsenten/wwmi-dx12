@@ -606,7 +606,10 @@ void WriteNullDescriptor(char kind, D3D12_CPU_DESCRIPTOR_HANDLE dst, unsigned ch
     }
 }
 
-bool CbvWindow(ID3D11Buffer* cb, D3D12_GPU_VIRTUAL_ADDRESS* out_va, UINT64* out_size, bool* out_windowed)
+// shader_bytes: what the shader about to read it declares there. A game buffer's view covers that too, as far as the
+// game's resource goes, unless the ini bound a window of its own.
+bool CbvWindow(ID3D11Buffer* cb, const CbWindow& bound, UINT64 shader_bytes, D3D12_GPU_VIRTUAL_ADDRESS* out_va,
+    UINT64* out_size, bool* out_windowed)
 {
     WrapResource* wr = AsWrapResource(cb);
     if (!wr || !wr->dx12) return false;
@@ -622,9 +625,13 @@ bool CbvWindow(ID3D11Buffer* cb, D3D12_GPU_VIRTUAL_ADDRESS* out_va, UINT64* out_
         const UINT64 remaining = rd.Width - (wr->gpu_va - base);
         D3D11_BUFFER_DESC bd{};
         ((ID3D11Buffer*)cb)->GetDesc(&bd);
-        const UINT64 want = bd.ByteWidth ? bd.ByteWidth : remaining;
+        UINT64 want = bd.ByteWidth ? bd.ByteWidth : remaining;
+        if (!bound.set && shader_bytes > want) want = shader_bytes;
         size = (want < remaining) ? want : remaining;
     }
+    UINT64 skip = 0;
+    if (!ClipToCbWindow(bound, &skip, &size)) return false;
+    va += skip;
     const UINT64 kMaxCbv = 65536; // D3D12's hard CBV limit
     if (size > kMaxCbv) size = kMaxCbv;
 
@@ -634,11 +641,11 @@ bool CbvWindow(ID3D11Buffer* cb, D3D12_GPU_VIRTUAL_ADDRESS* out_va, UINT64* out_
     return true;
 }
 
-void WriteCbvDescriptor(ID3D11Buffer* cb, D3D12_CPU_DESCRIPTOR_HANDLE dst)
+void WriteCbvDescriptor(ID3D11Buffer* cb, const CbWindow& bound, UINT64 shader_bytes, D3D12_CPU_DESCRIPTOR_HANDLE dst)
 {
     D3D12_GPU_VIRTUAL_ADDRESS va = 0;
     UINT64 size = 0;
-    if (!CbvWindow(cb, &va, &size, nullptr)) {
+    if (!CbvWindow(cb, bound, shader_bytes, &va, &size, nullptr)) {
         WriteNullDescriptor('b', dst, 0, 0);
         return;
     }
@@ -1544,6 +1551,12 @@ static bool HasDescriptor(const WrapView* wv, char kind, UINT reg)
 
 // The game's descriptor for a vs/ps register the section did not set since the draw scope opened (GameBindings); a
 // published game texture is the game's binding whenever it was published.
+static UINT64 ShaderCbBytes(const PipeState& st, int si, UINT reg)
+{
+    const ShaderCode* sc = si >= 0 ? AsShaderCode(st.shader[si]) : nullptr;
+    return sc && reg < std::size(sc->cb_size) ? sc->cb_size[reg] : 0;
+}
+
 bool InheritGameBinding(bool compute, const RootBind& b, bool game_view, D3D12_CPU_DESCRIPTOR_HANDLE dst)
 {
     const Dx12Bridge* br = BridgeScope();
@@ -1554,8 +1567,7 @@ bool InheritGameBinding(bool compute, const RootBind& b, bool game_view, D3D12_C
     const int32_t since = b.kind == 't' ? (int32_t)(st.srv_gen[si][b.reg] - br->game.srv_gen)
                                         : (int32_t)(st.cb_gen[si][b.reg] - br->game.cb_gen);
     if (since > 0 && !game_view) return false;
-    const ShaderCode* sc = AsShaderCode(st.shader[si]);
-    const unsigned cb_bytes = b.kind == 'b' && sc && b.reg < std::size(sc->cb_size) ? sc->cb_size[b.reg] : 0;
+    const unsigned cb_bytes = b.kind == 'b' ? (unsigned)ShaderCbBytes(st, si, b.reg) : 0;
     return br->game.descriptor(br->game.user, b.stage, b.kind, b.reg, cb_bytes, dst);
 }
 
@@ -1611,7 +1623,7 @@ bool BindDescriptors(ID3D12GraphicsCommandList* cl, const RootSigEntry& rse, boo
             if (cb) {
                 WrapResource* wr = AsWrapResource(cb);
                 Transition(cl, wr, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-                WriteCbvDescriptor(cb, dst);
+                WriteCbvDescriptor(cb, st.cb_window[si][b.reg], ShaderCbBytes(st, si, b.reg), dst);
             } else if (!InheritGameBinding(compute, b, false, dst)) {
                 WriteNullDescriptor('b', dst, b.sit, b.dim);
             }
@@ -1691,7 +1703,7 @@ void TraceDispatch(const RootSigEntry& rse, UINT x, UINT y, UINT z)
             D3D12_GPU_VIRTUAL_ADDRESS va = 0;
             UINT64 size = 0;
             bool windowed = false;
-            if (cb && CbvWindow(cb, &va, &size, &windowed)) {
+            if (cb && CbvWindow(cb, st.cb_window[si][b.reg], ShaderCbBytes(st, si, b.reg), &va, &size, &windowed)) {
                 _snwprintf_s(line, _TRUNCATE, L"  LEAF   %cb%u = res %p va %016llX size %llu %s", b.stage, b.reg,
                     (void*)cb, (unsigned long long)va, (unsigned long long)size,
                     windowed ? L"(window into game ring)" : L"(whole buffer)");
