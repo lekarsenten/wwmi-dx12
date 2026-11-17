@@ -64,6 +64,14 @@ public:
      * @param comp_idx That mod's component with this range.
      */
     void IbAnchorNoteOther(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx);
+    /**
+     * Tells whether an index buffer drawn with ranges a mod declares has only just come on screen, so it is not
+     * yet decided whether it is that mod's mesh.
+     *
+     * @param ib_va The index buffer's GPU address.
+     * @return True during its first frames on screen.
+     */
+    bool IbIsNew(uint64_t ib_va);
     void IbAnchorForget(uint64_t va, uint64_t bytes);
     bool IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint64_t* ib_base_va);
     bool IbAnchorJustLearned(uint64_t index_va); // this is the first frame its draws are claimed
@@ -126,6 +134,7 @@ private:
     };
     struct IbEvidence {
         uint32_t frame = 0;
+        uint32_t first_frame = 0; // the frame the buffer came on screen in (again, after kIbGoneFrames away)
         std::unordered_map<uint64_t, CompSet> seen; // by the mod's ns_hash: its components drawn this frame
     };
     void IbAnchorNote(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx, bool content_proven,
@@ -137,6 +146,8 @@ private:
         uint64_t bytes = 0;
     };
     static constexpr size_t kIbAnchorCap = 256; // a character is one entry; a sweep past this is a leak guard
+    static constexpr uint32_t kIbGoneFrames = 30; // not drawn for this long: the buffer is new when drawn again
+    static constexpr uint32_t kIbNewFrames = 3; // how long a buffer counts as new
     static constexpr uint32_t kIbAnchorStale = 1800; // ~30 s unconfirmed -- the buffer is not on screen any more
     struct PerSet;
     CompSet ModDeclaredComps(int mod_id);

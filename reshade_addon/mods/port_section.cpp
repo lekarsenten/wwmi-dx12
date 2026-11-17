@@ -77,6 +77,7 @@ bool PortRunSection(const std::wstring& fq_section, PortHooks& hk, uint32_t inde
         if (!_s.exchange(true)) logger::write("PORTDRAW stage %d: %s", (n), (msg)); \
     } while (0)
     PORT_STAGE(1, "entered PortRunSection");
+    hk.hidden_draws = 0;
     PortApi::ClearBoundLoading();
 
     struct Ctx {
@@ -185,6 +186,8 @@ bool PortRunSection(const std::wstring& fq_section, PortHooks& hk, uint32_t inde
             if (c->di) c->hk->srv_gen0 = c->di->srv_gen_at_entry;
             if (c->vb0_unmet || c->ib_unmet)
                 ++c->suppressed;
+            else if (c->hk->hide_draw && c->hk->hide_draw())
+                ++c->hk->hidden_draws;
             else if (c->hk->drawindexed)
                 c->hk->drawindexed(d.index_count, d.start_index, (uint32_t)d.base_vertex);
         },

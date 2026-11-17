@@ -6,6 +6,10 @@ struct AddonSettings {
     bool hide_uid = false; // A5: the UID cut out of the UI text (hud/uid_hide.h)
     bool hide_outline = false;
     bool tex_deferred = true; // mod textures load off the engine lock, vanilla until in (A12)
+    // ini tex_hide_loading: with A12 on, a mod that comes on screen is not drawn (nor is the game's model it
+    // replaces) until its textures are loaded, instead of showing with the game's textures for a moment. The
+    // game's draws of a mesh not yet known as a mod's are left out for its first frames as well.
+    bool tex_hide_loading = true;
     bool texlod_resemblance = true; // A13 / ini lod_resemblance: look-alike LOD matches applied (always learned)
     bool texlod_cache =
         true; // A14 / ini lod_cache: LOD matches learned, kept and used; off: none read, learned or written

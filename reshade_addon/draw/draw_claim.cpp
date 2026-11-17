@@ -547,6 +547,18 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                 }
                 if (char_ibset && !is_mod_char && !char_vb)
                     g_draw_stats.ib_anchor_claims.fetch_add(1, std::memory_order_relaxed);
+                // A mesh that has just come on screen, drawn with a range a mod declares, but not yet known as
+                // the mod's (that takes a whole frame of its draws): the game's draw is left out for these few
+                // frames, so the game's model does not flash before the mod shows.
+                const bool undecided = !is_mod_char && !char_vb && !char_ibset;
+                if (undecided && g_settings.tex_hide_loading && (g_draw_toggles.wcl_draw || Mods().GeomEnabled(md)) &&
+                    g_recognition.IbIsNew(claim_ib_va)) {
+                    if (g_debug && DiagOnce("NEWMESH-HIDE", CompKey(md, ci)))
+                        logger::write("NEWMESH-HIDE mod=%d comp=%d: the game's draw is left out while the new mesh "
+                                      "is not yet known as the mod's (frame %u)",
+                            md, ci, g_frame_id);
+                    return true;
+                }
             }
             if (g_debug && !is_mod_char && !char_vb && !char_ibset &&
                 DiagOnce(ib_got ? "RTCLAIM-MISMATCH" : "RTCLAIM", CompKey(md, ci)))

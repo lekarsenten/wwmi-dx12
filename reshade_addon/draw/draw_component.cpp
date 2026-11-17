@@ -22,6 +22,7 @@
 #include "../mods/wwmi_mod.h"
 #include "../migoto/dx12_bridge.h"
 #include "../addon/settings.h"
+#include "../textures/tex_defer.h"
 #include "draw_parts.h"
 #include "draw_toggles.h"
 #include "../rabbitfx/decensor_rest.h"
@@ -604,6 +605,7 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
         if (!once.exchange(true))
             logger::write("PORTDRAW first component dispatch: mod=%d comp=%d fq='%ls'", dm, wc->index, fq.c_str());
     }
+    run.hk.hide_draw = [dm] { return g_tex_defer.HidesDraw(dm); };
     _cs_prep.End();
     SectionScopes scopes;
     EnterSectionScopes(run, scopes);
@@ -672,7 +674,9 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
         ran = PortRunSection(fq, run.hk, da.index_count, da.first_index, da.first_instance,
             g_command_lists.Gfx(cmd_list).gfx_pso, skip_orig);
         t_trace_binds = false;
-        if (ran) {
+        // A section whose draws were kept back while the mod's textures load says nothing about what the mod
+        // hides: the game's ray-tracing geometry stays as it is.
+        if (ran && !run.hk.hidden_draws) {
             const IndexBind& game_ib = g_command_lists.Gfx(cmd_list).ib;
             RtNoteComponentDraw(dm, game_ib.res, game_ib.va, game_ib.size, da.first_index, da.index_count, skip_orig, drawn.data(),
                 (uint32_t)drawn.size());
@@ -680,5 +684,7 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
     }
     for (unsigned r = 0; r < kSectionTexRegs; ++r)
         if (sect_tex & (1u << r)) PortApi::UnpushGameTexture('p', r);
-    return FinishSection(run, ran, skip_orig, sk_inst);
+    // The mod has just come on screen: until it shows, the game's model it stands for stays hidden too.
+    const bool hide_game_draw = ran && !skip_orig && g_tex_defer.HidesGameDraw(dm);
+    return FinishSection(run, ran, skip_orig || hide_game_draw, sk_inst);
 }

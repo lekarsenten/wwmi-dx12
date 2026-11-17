@@ -188,6 +188,14 @@ bool CharacterRecognition::IbAnchorNoteAndAsk(
     return it->second.learned < g_frame_id;
 }
 
+bool CharacterRecognition::IbIsNew(uint64_t ib_va)
+{
+    std::lock_guard l(ib_anchor_mutex_);
+    const auto found = ib_ev_.find(ib_va);
+    if (found == ib_ev_.end()) return false;
+    return g_frame_id - found->second.first_frame < kIbNewFrames;
+}
+
 void CharacterRecognition::IbAnchorNoteOther(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx)
 {
     if (!ib_va || mod_id < 0 || comp_idx < 0 || mod_id >= (int)Mods().Count()) return;
@@ -216,6 +224,7 @@ void CharacterRecognition::IbAnchorNote(uint64_t ib_va, uint64_t ib_bytes, int m
     if (!ns_hash) return;
     IbEvidence& e = ib_ev_[ib_va];
     if (e.frame != g_frame_id) {
+        if (e.frame == 0 || g_frame_id - e.frame > kIbGoneFrames) e.first_frame = g_frame_id;
         e.frame = g_frame_id;
         e.seen.clear();
     }

@@ -21,6 +21,10 @@ struct PortHooks {
     std::function<void(const std::wstring&, const std::wstring&)> resource_ref;
     std::function<void(const std::wstring&, const std::wstring&)> run_cmd;
     std::function<void(uint32_t, uint32_t, uint32_t)> drawindexed;
+    // Asked before each drawindexed: true = the draw is not issued (the mod is hidden while its textures load).
+    std::function<bool()> hide_draw;
+    // Filled by PortRunSection: how many of the section's draws hide_draw kept back.
+    unsigned hidden_draws = 0;
     // Filled by PortRunSection before each drawindexed: DrawInfo::srv_gen_at_entry of this section run.
     uint32_t srv_gen0 = 0;
     // Per ps-tN: the write generation a texture section's `this =` left there; 0 = none wrote it.

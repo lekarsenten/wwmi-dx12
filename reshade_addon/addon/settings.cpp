@@ -22,6 +22,7 @@ void AddonSettings::Load(const std::wstring& path)
     hide_outline = Int(L"hide_outline", 0) != 0;
 #endif
     tex_deferred = Int(L"tex_background", 1) != 0;
+    tex_hide_loading = Int(L"tex_hide_loading", 1) != 0;
     texlod_resemblance = Int(L"lod_resemblance", 1) != 0;
     texlod_cache = Int(L"lod_cache", 1) != 0;
     const int budget_step = Int(L"tex_mod_budget", 1);
