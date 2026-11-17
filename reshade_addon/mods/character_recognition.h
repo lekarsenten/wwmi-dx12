@@ -53,6 +53,17 @@ public:
     // INDEX-BUFFER ANCHOR: an index buffer carrying a mod's complete declared component set is that mod's.
     bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx,
         bool content_proven); // ib_bytes: the IB's extent
+    /**
+     * Counts a draw as evidence for a mod that declares the draw's range but is not the mod the draw was given
+     * to (several mods may declare one range). When that completes the mod's component set, the index buffer
+     * becomes the mod's, unless it is another mod's already.
+     *
+     * @param ib_va    The index buffer's GPU address.
+     * @param ib_bytes The index buffer's extent.
+     * @param mod_id   The other mod that declares the range.
+     * @param comp_idx That mod's component with this range.
+     */
+    void IbAnchorNoteOther(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx);
     void IbAnchorForget(uint64_t va, uint64_t bytes);
     bool IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint64_t* ib_base_va);
     bool IbAnchorJustLearned(uint64_t index_va); // this is the first frame its draws are claimed
@@ -115,9 +126,10 @@ private:
     };
     struct IbEvidence {
         uint32_t frame = 0;
-        uint64_t ns_hash = 0;
-        CompSet seen;
+        std::unordered_map<uint64_t, CompSet> seen; // by the mod's ns_hash: its components drawn this frame
     };
+    void IbAnchorNote(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx, bool content_proven,
+        bool draw_is_this_mods);
     struct IbAnchorRec {
         uint64_t ns_hash = 0;
         uint32_t learned = 0;
@@ -128,6 +140,7 @@ private:
     static constexpr uint32_t kIbAnchorStale = 1800; // ~30 s unconfirmed -- the buffer is not on screen any more
     struct PerSet;
     CompSet ModDeclaredComps(int mod_id);
+    CompSet RequiredComps(int mod_id); // the declared components the game really draws (see the .cpp)
 
     std::mutex char_mesh_mutex_;
     std::unordered_map<uint64_t, CharVbOrigin> char_mesh_vb0_;

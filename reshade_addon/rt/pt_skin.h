@@ -24,6 +24,8 @@ public:
         uint64_t uv_first = 0;
         uint32_t uv_elems = 0; // R16G16_FLOAT elements vb2 really holds -- may cover fewer vertices than vb0
         uint32_t vcount = 0;
+        ID3D12Resource* color = nullptr; // the mod's vb3: one 4-byte color per vertex, from element color_first
+        uint64_t color_first = 0;
     };
     bool Run(ID3D12GraphicsCommandList* cl, uint64_t gfx_pso, uint64_t list_gen, uint32_t index_count,
         uint32_t first_index, int mod, int comp, uint64_t game_bones_va, FetchViews* fetch = nullptr,

@@ -125,6 +125,12 @@ static int PickSharedRangeSlot(command_list* cmd_list, uint32_t first_index, uin
     if (vbva && g_recognition.CharMeshOrigin(vbva, &origin) && origin.ns_hash)
         for (int s : cands)
             if (Mods().At(Comps().At(s).mod_id).ns_hash == origin.ns_hash) return s;
+    // The index buffer is already known as one mod's mesh: the range is that mod's.
+    int anchored_mod = -1;
+    uint64_t anchored_base = 0;
+    if (ibva && g_recognition.IbAnchorResolve(ibva, idxb, &anchored_mod, &anchored_base) && anchored_base == ibva)
+        for (int s : cands)
+            if (Comps().At(s).mod_id == anchored_mod) return s;
     if (!ibr || !vbr || !vstride) return dflt;
     const uint32_t iboff = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
     const uint32_t vboff = (uint32_t)(vbva - vbr->GetGPUVirtualAddress());
@@ -483,6 +489,8 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
             bool has_ib_ref = false;
             uint32_t ib_expect = 0; // RTCLAIM: the ini's hash= and what we computed for it
             uint32_t ib_got = 0;
+            uint64_t ib_view_bytes = 0; // RTCLAIM: the size of the game's index buffer view
+            uint32_t ib_declared_bytes = 0; // RTCLAIM: the index bytes the mod's components reach
             if (!char_vb) {
                 const WwmiMod::Component* wc2 = Mods().Comp(md, ci);
                 has_ib_ref = (wc2 && wc2->ib_hash);
@@ -500,6 +508,7 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                         ibr = st.ib.res;
                         ibva = st.ib.va;
                         if (st.ib.index_bytes) idxb = st.ib.index_bytes;
+                        ib_view_bytes = st.ib.size;
                         vbr = st.vb[0].res;
                         vbva = st.vb[0].va;
                         vstride = st.vb[0].stride;
@@ -507,7 +516,8 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                     if (ibr && vbr && max_end && vstride) {
                         uint32_t iboff = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
                         uint32_t vboff = (uint32_t)(vbva - vbr->GetGPUVirtualAddress());
-                        ib_got = IbHash::Lookup(ibr, iboff, max_end * idxb, idxb, vbr, vboff, vstride);
+                        ib_declared_bytes = max_end * idxb;
+                        ib_got = IbHash::Lookup(ibr, iboff, ib_declared_bytes, idxb, vbr, vboff, vstride);
                         char_ib = (ib_got == wc2->ib_hash);
                     }
                 }
@@ -525,19 +535,37 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                     claim_ib_bytes = gs.ib.size;
                 }
                 char_ibset = g_recognition.IbAnchorNoteAndAsk(claim_ib_va, claim_ib_bytes, md, ci, is_mod_char);
+                // Several mods may declare this range (a mod for the whole mesh and one for a part of it start
+                // alike). The draw counts for each of them, so the one whose mesh this is can complete its set.
+                const std::vector<int>* same_range = Comps().SharedSlots(first_index, index_count);
+                if (same_range && !char_ibset) {
+                    for (const int slot : *same_range) {
+                        const MergedComp& other = Comps().At(slot);
+                        if (other.mod_id == md) continue;
+                        g_recognition.IbAnchorNoteOther(claim_ib_va, claim_ib_bytes, other.mod_id, other.comp_idx);
+                    }
+                }
                 if (char_ibset && !is_mod_char && !char_vb)
                     g_draw_stats.ib_anchor_claims.fetch_add(1, std::memory_order_relaxed);
             }
-            if (g_debug && !is_mod_char && !char_vb && !char_ibset && DiagOnce("RTCLAIM", CompKey(md, ci)))
+            if (g_debug && !is_mod_char && !char_vb && !char_ibset &&
+                DiagOnce(ib_got ? "RTCLAIM-MISMATCH" : "RTCLAIM", CompKey(md, ci)))
                 logger::write(
                     "RTCLAIM mod=%d comp=%d first=%u count=%u NOT IDENTIFIED: "
                     "char_vb=0 (vb0=%llx stride=%u inSkinPool=%d -- never learned) | char_ib=0 (ini hash=%08x computed=%08x%s) | "
-                    "char_tex %s | vb6=%llx",
+                    "char_tex %s | vb6=%llx | index view %llu bytes, declared %u | base vertex %d",
                     md, ci, first_index, index_count, (unsigned long long)vb0, all_vb_str[0],
                     (int)g_recognition.InSkinBand(vb0), ib_expect, ib_got,
                     !has_ib_ref ? ", no hash= in the ini" : (ib_got == 0 ? ", NOT COMPUTED YET" : ", MISMATCH"),
                     has_ib_ref ? "skipped (the mod carries hash=)" : "probed and missed",
-                    (unsigned long long)all_vb_va[6]);
+                    (unsigned long long)all_vb_va[6], (unsigned long long)ib_view_bytes, ib_declared_bytes,
+                    (int)da.vertex_offset);
+            if (has_ib_ref && ib_got && !char_ib && !char_ibset) {
+                // The mesh may have more vertices than the mod's indices reach (DX11 hashes the whole buffer).
+                // A draw its index buffer already names needs no search: under ray tracing its vertices are the
+                // skinned ones, which never match.
+                IbHash::SearchVertexCount(g_command_lists.Gfx(cmd_list).vb[0].va, ib_expect);
+            }
             if (is_mod_char) {
                 const uint32_t sh = HashBoneCB(cur.res, cur.va);
                 if (vb0) g_recognition.NoteCharMeshVb0(vb0, CharVbOrigin{ g_frame_id, Mods().At(md).ns_hash }); // by THIS mod, now

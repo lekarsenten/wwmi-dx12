@@ -163,6 +163,32 @@ void ModRegistry::Build()
             end = (std::max)(end, mc.first_index + mc.match_count);
         }
     }
+    // Mods that declare the same mesh hash must hash the same extent of it, or only one of them can match. The
+    // hash is taken over the vertices the indices reach, so indices declared past the mesh's real end (a component
+    // the game's mesh does not have) spoil it; the shortest declared extent is used for all of them.
+    std::unordered_map<uint32_t, uint32_t> shortest_end;
+    for (const auto& per_mod : index_end_) {
+        for (const auto& entry : per_mod) {
+            const auto found = shortest_end.find(entry.first);
+            if (found == shortest_end.end()) {
+                shortest_end[entry.first] = entry.second;
+            } else if (entry.second < found->second) {
+                found->second = entry.second;
+            }
+        }
+    }
+    for (size_t mod_id = 0; mod_id < index_end_.size(); ++mod_id) {
+        for (auto& entry : index_end_[mod_id]) {
+            if (entry.first == 0u) continue; // no hash= in the ini: nothing shared
+            const uint32_t shortest = shortest_end[entry.first];
+            if (shortest != entry.second) {
+                logger::write("WwmiGeom: hash=%08x: mod %zu declares indices up to %u, another mod only up to %u -- "
+                              "the mesh is hashed up to %u for both",
+                    entry.first, mod_id, entry.second, shortest, shortest);
+                entry.second = shortest;
+            }
+        }
+    }
     for (MergedComp& mc : Comps().All()) mc.with.clear();
     for (size_t a = 0; a < Comps().Count(); ++a) {
         const MergedComp& ma = Comps().At(a);

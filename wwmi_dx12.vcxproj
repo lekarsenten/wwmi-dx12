@@ -179,6 +179,17 @@ exit /b 0</Command>
   <ItemGroup Label="RT stub" Condition="'$(WwmiRT)' == '0'">
     <ClCompile Include="reshade_addon\rt\rt_stub.cpp" />
   </ItemGroup>
+  <ItemGroup Label="RT portable" Condition="'$(WwmiRT)' == 'portable'">
+    <ClCompile Include="reshade_addon\rt\rt_portable.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_scene.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_hide.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_pal_record.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_skin_sections.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_skin_gpu.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_skin_draw.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_vertex_fetch.cpp" />
+    <ClCompile Include="reshade_addon\rt\rt_dumps.cpp" />
+  </ItemGroup>
   <ItemGroup Label="Debug" Condition="'$(Configuration)' == 'Debug'">
     <ClCompile Include="reshade_addon\instrumentation\chain_trace.cpp" />
     <ClCompile Include="reshade_addon\instrumentation\shader_capture.cpp" />
@@ -252,6 +263,8 @@ exit /b 0</Command>
     <WwmiShader Include="$(WwmiRoot)reshade_addon\shaders\BufCopy.hlsl" />
     <WwmiShader Include="$(WwmiRoot)reshade_addon\shaders\Bc7Half.hlsl" />
     <WwmiShader Include="$(WwmiRoot)shaders_src\IbVbHash.hlsl" />
+    <WwmiShader Include="$(WwmiRoot)shaders_src\RtPtSkin.hlsl" Condition="'$(WwmiRT)' == 'portable'" />
+    <WwmiShader Include="$(WwmiRoot)shaders_src\RtPalCopy.hlsl" Condition="'$(WwmiRT)' == 'portable'" />
   </ItemGroup>
   <Target Name="WwmiShaders" BeforeTargets="ClCompile"
           Inputs="@(WwmiShader);$(MSBuildProjectFullPath)"

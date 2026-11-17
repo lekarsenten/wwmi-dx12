@@ -13,6 +13,7 @@
 #include "../core/log.h"
 #include "../core/d3d12_barrier.h"
 #include <map>
+#include <set>
 #include <wrl.h>
 #include <vector>
 #include <mutex>
@@ -82,6 +83,17 @@ uint32_t g_rate_jobs = 0;
 uint32_t g_rate_slow = 0;
 uint64_t g_rate_bytes = 0;
 double g_rate_max_ms = 0.0;
+
+// The vertex count search (SearchVertexCount): the vertex data of a buffer whose hash missed, copied back so the
+// CPU can look for the vertex count at which the ini's hash matches. A mod may declare fewer indices than the
+// mesh has, and the vertices only the undeclared part uses are then missing from the count the indices give.
+constexpr uint32_t kProbeBytes = 8u << 20;
+ComPtr<ID3D12Resource> g_probe_rb; // READBACK, kProbeBytes
+std::map<uint64_t, uint32_t> g_probe_wanted; // vb_va -> the ini's hash, until its job is recorded
+std::set<uint64_t> g_probe_done; // vb_va searched once already, until its memory is written over
+std::map<uint64_t, uint32_t> g_probe_found; // vb_va -> the ini's hash the search matched; later hashes keep it
+uint32_t g_probe_bytes = 0; // bytes copied for the in-flight job; 0 = no probe
+uint32_t g_probe_expected = 0; // the ini's hash for the in-flight job
 
 double QpcMs(const LARGE_INTEGER& a, const LARGE_INTEGER& b)
 {
@@ -288,12 +300,26 @@ uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes,
     return 0;
 }
 
+void SearchVertexCount(uint64_t vb_va, uint32_t expected)
+{
+    {
+        std::shared_lock l(g_mtx);
+        if (g_probe_done.count(vb_va)) return;
+    }
+    std::unique_lock l(g_mtx);
+    if (!g_probe_done.insert(vb_va).second) return;
+    g_probe_wanted[vb_va] = expected;
+    // The cached miss is dropped so that the next Lookup hashes the buffer again, this time with the copy.
+    if (g_cache.erase(vb_va)) g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+
 void ForgetRange(uint64_t va, uint64_t bytes)
 {
     if (!va || !bytes) return;
     {
         std::shared_lock l(g_mtx);
         bool hit = g_cache.lower_bound(va) != g_cache.lower_bound(va + bytes) ||
+            g_probe_done.lower_bound(va) != g_probe_done.lower_bound(va + bytes) ||
             (g_inflight && g_inflight_job.vb_va >= va && g_inflight_job.vb_va < va + bytes);
         for (size_t i = 0; i < g_pending.size() && !hit; ++i)
             hit = g_pending[i].vb_va >= va && g_pending[i].vb_va < va + bytes;
@@ -305,6 +331,9 @@ void ForgetRange(uint64_t va, uint64_t bytes)
     {
         std::unique_lock l(g_mtx);
         g_cache.erase(g_cache.lower_bound(va), g_cache.lower_bound(va + bytes));
+        g_probe_done.erase(g_probe_done.lower_bound(va), g_probe_done.lower_bound(va + bytes));
+        g_probe_wanted.erase(g_probe_wanted.lower_bound(va), g_probe_wanted.lower_bound(va + bytes));
+        g_probe_found.erase(g_probe_found.lower_bound(va), g_probe_found.lower_bound(va + bytes));
         g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
         if (g_inflight && g_inflight_job.vb_va >= va && g_inflight_job.vb_va < va + bytes) g_inflight_stale = true;
         for (size_t i = 0; i < g_pending.size();) {
@@ -331,6 +360,44 @@ void ForgetRange(uint64_t va, uint64_t bytes)
     }
 }
 
+/**
+ * Searches the copied vertex data for the vertex count at which the ini's hash matches. Only counts from the
+ * one the indices gave up to a quarter more are tried: the vertices past that belong to the next mesh.
+ *
+ * @param job       The job that was hashed.
+ * @param computed  The hash the GPU computed.
+ * @param vb_bytes  The vertex bytes the GPU hashed.
+ * @param max_index The largest vertex index the GPU found in the job's index range.
+ * @return True when the ini's hash matches at some vertex count.
+ */
+static bool FindVertexCount(const Job& job, uint32_t computed, uint32_t vb_bytes, uint32_t max_index)
+{
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range = { 0, g_probe_bytes };
+    if (FAILED(g_probe_rb->Map(0, &read_range, &mapped)) || !mapped) return false;
+    const uint8_t* bytes = static_cast<const uint8_t*>(mapped);
+    const uint32_t stride = job.vb_stride;
+    const uint32_t hashed_count = vb_bytes / stride;
+    uint32_t last_count = hashed_count + hashed_count / 4u + 4096u;
+    if (last_count > g_probe_bytes / stride) last_count = g_probe_bytes / stride;
+    uint32_t crc = 0;
+    uint32_t match_count = 0;
+    for (uint32_t count = 1; count <= last_count && !match_count; ++count) {
+        crc = PortApi::Crc32c(crc, bytes + (size_t)(count - 1) * stride, stride);
+        if (count >= hashed_count && chain_desc(crc, count * stride) == g_probe_expected) match_count = count;
+    }
+    const D3D12_RANGE nothing_written = { 0, 0 };
+    g_probe_rb->Unmap(0, &nothing_written);
+    if (g_debug) {
+        logger::write(
+            "IBHASH-SEARCH vb_va=%llx: ini hash %08x, computed %08x over %u vertices (max index %u in %u indices); "
+            "the ini hash matches at %u vertices (0 = at none up to %u)",
+            (unsigned long long)job.vb_va, g_probe_expected, computed, hashed_count, max_index,
+            job.ib_bytes / job.idx_size, match_count, last_count);
+    }
+    return match_count != 0;
+}
+
 void DrainQueue()
 {
     if (g_inflight) {
@@ -340,9 +407,12 @@ void DrainQueue()
         D3D12_RANGE rr = { 0, kOutBytes };
         uint32_t data_crc = 0;
         uint32_t vbBytes = 0;
+        uint32_t max_index = 0;
+        bool found_by_search = false;
         if (SUCCEEDED(g_rb->Map(0, &rr, &p)) && p) {
             const uint32_t* o = reinterpret_cast<const uint32_t*>(p);
             vbBytes = o[0]; // clamped to the view by the shader
+            max_index = o[1];
             data_crc = o[2];
             CombineOp combine;
             for (uint32_t k = 1; k < kThreads; ++k) data_crc = combine(data_crc, o[2 + k * 2], o[3 + k * 2]);
@@ -385,6 +455,10 @@ void DrainQueue()
                 g_rate_max_ms = 0.0;
             }
         }
+        if (g_probe_bytes) {
+            found_by_search = vbBytes && FindVertexCount(g_inflight_job, full, vbBytes, max_index);
+            g_probe_bytes = 0;
+        }
         logger::trace("IBHASH vb_va=%llx ibBytes=%u idx=%u stride=%u vbBytes=%u dataCrc=%08x FULL(vbHash)=%08x",
             (unsigned long long)g_inflight_job.vb_va, g_inflight_job.ib_bytes, g_inflight_job.idx_size,
             g_inflight_job.vb_stride, vbBytes, data_crc, full);
@@ -392,6 +466,10 @@ void DrainQueue()
         {
             std::unique_lock l(g_mtx);
             if (vbBytes && !g_inflight_stale) {
+                // A buffer the search matched keeps the ini's hash when it is hashed again over more indices.
+                if (found_by_search) g_probe_found[g_inflight_job.vb_va] = g_probe_expected;
+                auto found = g_probe_found.find(g_inflight_job.vb_va);
+                if (found != g_probe_found.end()) full = found->second;
                 StoreLocked(g_inflight_job.vb_va,
                     Cached{ full, g_inflight_job.ib_bytes }); // 0 bytes: not run, the next draw requeues
             }
@@ -410,6 +488,38 @@ static D3D12_RESOURCE_STATES SrvStateOf(ID3D12Resource* res)
     if (s == MigotoPort::kResStateUnknown || s == (uint32_t)D3D12_RESOURCE_STATE_COMMON || s == kTrackedCommon)
         return D3D12_RESOURCE_STATE_COMMON;
     return (D3D12_RESOURCE_STATES)s;
+}
+
+/**
+ * Copies a job's vertex data into the search readback when SearchVertexCount asked for this buffer.
+ *
+ * @param cl      The list the job's dispatch was recorded into.
+ * @param job     The job being recorded.
+ * @param vb_now  The state the vertex buffer is in at this point of the list; it is left in that state.
+ * @param vb_ext  The bytes from the job's vertex buffer offset to the end of the resource.
+ */
+static void RecordProbeCopy(ID3D12GraphicsCommandList* cl, const Job& job, D3D12_RESOURCE_STATES vb_now,
+    uint64_t vb_ext)
+{
+    {
+        std::unique_lock l(g_mtx);
+        auto wanted = g_probe_wanted.find(job.vb_va);
+        if (wanted == g_probe_wanted.end()) return;
+        g_probe_expected = wanted->second;
+        g_probe_wanted.erase(wanted);
+    }
+    if (!g_probe_rb) {
+        g_probe_rb = WwmiMakeBuffer(g_addon.d3d12_device, kProbeBytes, D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (!g_probe_rb) return;
+    const uint32_t bytes = vb_ext < kProbeBytes ? (uint32_t)vb_ext : kProbeBytes;
+    const bool needs_barrier =
+        vb_now != D3D12_RESOURCE_STATE_COMMON && !(vb_now & D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (needs_barrier) TransitionBarrier(cl, job.vb, vb_now, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cl->CopyBufferRegion(g_probe_rb.Get(), 0, job.vb, job.vb_off, bytes);
+    if (needs_barrier) TransitionBarrier(cl, job.vb, D3D12_RESOURCE_STATE_COPY_SOURCE, vb_now);
+    g_probe_bytes = bytes;
 }
 
 bool Record(ID3D12GraphicsCommandList* cl)
@@ -477,6 +587,13 @@ bool Record(ID3D12GraphicsCommandList* cl)
     cl->Dispatch(1, 1, 1);
     HotPath::GpuBracketEnd(cl, hp);
     g_gpu_timer.End(cl, gt);
+    g_probe_bytes = 0;
+    {
+        // One resource may hold both the indices and the vertices; it then follows the index buffer's barrier.
+        const bool moved = j.vb == j.ib ? ib_tr : vb_tr;
+        const D3D12_RESOURCE_STATES vb_now = moved ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : vb_st;
+        RecordProbeCopy(cl, j, vb_now, vbW - j.vb_off);
+    }
     if (ib_tr) TransitionBarrier(cl, j.ib, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ib_st);
     if (vb_tr) TransitionBarrier(cl, j.vb, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, vb_st);
     CopyAsSource(cl, g_out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

@@ -11,6 +11,7 @@
     <WwmiDeployTimeoutSec Condition="'$(WwmiDeployTimeoutSec)' == ''">120</WwmiDeployTimeoutSec>
 
     <WwmiRT Condition="'$(WwmiRT)' == ''">$(WWMI_RT)</WwmiRT>
+    <WwmiRT Condition="'$(WwmiRT)' == '' and !Exists('$(WwmiRoot)reshade_addon\rt\rt_draw.cpp') and Exists('$(WwmiRoot)reshade_addon\rt\rt_portable.cpp')">portable</WwmiRT>
     <WwmiRT Condition="'$(WwmiRT)' == '' and !Exists('$(WwmiRoot)reshade_addon\rt\rt_draw.cpp')">0</WwmiRT>
     <WwmiRT Condition="'$(WwmiRT)' == ''">1</WwmiRT>
   </PropertyGroup>

@@ -143,30 +143,98 @@ CharacterRecognition::CompSet CharacterRecognition::ModDeclaredComps(int mod_id)
     return it == declared.end() ? CompSet{} : it->second;
 }
 
+/**
+ * The components of a mod that the game must draw before an index buffer is taken as the mod's mesh.
+ *
+ * A component that starts past the mesh extent the mod shares with the other mods on the same hash is left out:
+ * the game does not draw it (a hair add-on may declare one more component than the body mod and the game).
+ *
+ * @param mod_id The mod.
+ * @return The mod's declared components without those.
+ */
+CharacterRecognition::CompSet CharacterRecognition::RequiredComps(int mod_id)
+{
+    const CompSet declared = ModDeclaredComps(mod_id);
+    CompSet required;
+    for (size_t word = 0; word < declared.w.size(); ++word) {
+        for (int bit = 0; bit < 64; ++bit) {
+            if ((declared.w[word] & (1ull << bit)) == 0) continue;
+            const int comp_idx = (int)(word * 64 + bit);
+            const WwmiMod::Component* comp = Mods().Comp(mod_id, comp_idx);
+            const bool past_shared_extent = comp && comp->ib_hash &&
+                comp->match_first_index >= Mods().IndexEnd(mod_id, comp->ib_hash);
+            if (!past_shared_extent) required.set(comp_idx);
+        }
+    }
+    return required;
+}
+
 bool CharacterRecognition::IbAnchorNoteAndAsk(
     uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx, bool content_proven)
 {
     if (!ib_va || mod_id < 0 || comp_idx < 0 || mod_id >= (int)Mods().Count()) return false;
-    const CompSet declared = ModDeclaredComps(mod_id);
-    if (declared.empty()) return false;
     const uint64_t ns_hash = Mods().At(mod_id).ns_hash;
     if (!ns_hash) return false;
     std::lock_guard l(ib_anchor_mutex_);
+    IbAnchorNote(ib_va, ib_bytes, mod_id, comp_idx, content_proven, true);
+    if (ib_anchor_.size() > kIbAnchorCap)
+        for (auto it = ib_anchor_.begin(); it != ib_anchor_.end();)
+            if (g_frame_id - it->second.confirmed > kIbAnchorStale)
+                it = ib_anchor_.erase(it);
+            else
+                ++it;
+    auto it = ib_anchor_.find(ib_va);
+    if (it == ib_anchor_.end() || it->second.ns_hash != ns_hash) return false;
+    return it->second.learned < g_frame_id;
+}
+
+void CharacterRecognition::IbAnchorNoteOther(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx)
+{
+    if (!ib_va || mod_id < 0 || comp_idx < 0 || mod_id >= (int)Mods().Count()) return;
+    std::lock_guard l(ib_anchor_mutex_);
+    IbAnchorNote(ib_va, ib_bytes, mod_id, comp_idx, false, false);
+}
+
+/**
+ * Records that one of a mod's components was drawn from an index buffer this frame, and makes the buffer the
+ * mod's once all its required components were. Call with ib_anchor_mutex_ held.
+ *
+ * @param ib_va             The index buffer's GPU address.
+ * @param ib_bytes          The index buffer's extent.
+ * @param mod_id            The mod.
+ * @param comp_idx          The mod's component that was drawn.
+ * @param content_proven    The draw's content already proved it is the mod's mesh.
+ * @param draw_is_this_mods The draw was given to this mod. False for another mod that declares the same range:
+ *                          it never takes a buffer that is some mod's in this or the previous frame.
+ */
+void CharacterRecognition::IbAnchorNote(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx,
+    bool content_proven, bool draw_is_this_mods)
+{
+    const CompSet declared = RequiredComps(mod_id);
+    if (declared.empty()) return;
+    const uint64_t ns_hash = Mods().At(mod_id).ns_hash;
+    if (!ns_hash) return;
     IbEvidence& e = ib_ev_[ib_va];
-    if (e.frame != g_frame_id || e.ns_hash != ns_hash) {
+    if (e.frame != g_frame_id) {
         e.frame = g_frame_id;
-        e.ns_hash = ns_hash;
-        e.seen = CompSet{};
+        e.seen.clear();
     }
-    e.seen.set(comp_idx);
+    CompSet& seen = e.seen[ns_hash];
+    seen.set(comp_idx);
+    if (!draw_is_this_mods) {
+        auto held = ib_anchor_.find(ib_va);
+        const bool held_by_another = held != ib_anchor_.end() && held->second.ns_hash != ns_hash &&
+            g_frame_id - held->second.confirmed <= 1;
+        if (held_by_another) return;
+    }
     const bool shape_only = declared.count() < 2 && !content_proven;
 #ifdef WWMI_DEBUG
-    if (shape_only && e.seen.covers(declared) && DiagOnce("IBANCHOR-SHAPE", (int)(uint32_t)(ns_hash ^ (ns_hash >> 32))))
+    if (shape_only && seen.covers(declared) && DiagOnce("IBANCHOR-SHAPE", (int)(uint32_t)(ns_hash ^ (ns_hash >> 32))))
         logger::write("IBANCHOR-SHAPE mod %d: index buffer %llx holds a draw the shape of its only component, but "
                       "nothing in it proves it is the mod's mesh -- not anchored",
             mod_id, (unsigned long long)ib_va);
 #endif
-    if (!shape_only && e.seen.covers(declared)) {
+    if (!shape_only && seen.covers(declared)) {
         IbAnchorRec& a = ib_anchor_[ib_va];
         a.bytes = ib_bytes;
         if (a.ns_hash != ns_hash) {
@@ -180,15 +248,6 @@ bool CharacterRecognition::IbAnchorNoteAndAsk(
         }
         a.confirmed = g_frame_id;
     }
-    if (ib_anchor_.size() > kIbAnchorCap)
-        for (auto it = ib_anchor_.begin(); it != ib_anchor_.end();)
-            if (g_frame_id - it->second.confirmed > kIbAnchorStale)
-                it = ib_anchor_.erase(it);
-            else
-                ++it;
-    auto it = ib_anchor_.find(ib_va);
-    if (it == ib_anchor_.end() || it->second.ns_hash != ns_hash) return false;
-    return it->second.learned < g_frame_id;
 }
 
 bool CharacterRecognition::IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint64_t* ib_base_va)

@@ -281,6 +281,8 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
             g_ps_stamps.StampInPlace(sect_ps);
         }
     }
+    // RTFETCH: its slots ride the shadow bind; make one when nothing else did.
+    if (vf_restore.fetch && !tbind.applied) tbind = g_rfx_bind.Apply(cmd_list, d3d12_cl, {}, /*guard_bindless*/ false);
     g_rfx_bind.SetExtraSlots(nullptr, 0); // RTFETCH's slots belonged to this draw's shadow bind only
     {
         auto* odev = reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native());
@@ -444,7 +446,8 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         }
         const int gt = g_gpu_timer.Begin(d3d12_cl, GT_SectionDraw);
         void* const hp = HotPath::GpuBracketBegin(d3d12_cl, GT_SectionDraw);
-        d3d12_cl->DrawIndexedInstanced(c, 1, s2, 0, first_instance);
+        // PTSKIN: a mod that could not be skinned yet is not drawn; its bind-pose buffers do not fit this draw.
+        if (!vf_restore.skip) d3d12_cl->DrawIndexedInstanced(c, 1, s2, 0, first_instance);
         ++t_x23_injected;
         HotPath::GpuBracketEnd(d3d12_cl, hp);
         g_gpu_timer.End(d3d12_cl, gt);

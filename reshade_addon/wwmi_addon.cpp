@@ -30,6 +30,7 @@
 #include "instrumentation/hot_path.h"
 #include "instrumentation/game_draw_record.h"
 #include "draw/draw_hook.h"
+#include "rt/rt_hooks.h" // RtOnDestroyDevice
 #include "draw/draw_sectex.h"
 #include "present/present_log.h"
 #include "addon/addon.h"
@@ -67,6 +68,7 @@ static void on_destroy_swapchain(swapchain*, bool resize)
 static void on_destroy_device(device*)
 {
     g_watchdogs.Stop();
+    RtOnDestroyDevice(); // the RT module's pipelines and buffers live on this device
     g_rfx_patch.Stop(); // it creates PSOs on this device
     g_descriptors.UnwatchAll();
     g_tex_look_worker.Stop();
@@ -498,6 +500,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     if (g_settings.dx12_debug_layer) EnableDebugLayer();
     ::logger::write("Config: debug=%d (diagnostics %s, log level %d)", (int)g_debug, g_debug ? "ON" : "off",
         g_debug ? g_log_verbosity : 0);
+    if (g_settings.rt_experimental)
+        ::logger::write("Config: rt_experimental=1 -- the mods stay on if the game ray traces (no RT module)");
 
     ApplyEngineCvars();
 

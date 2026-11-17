@@ -275,6 +275,43 @@ bool ResolveBound(command_list* cmd_list, char stage, TargetClass kind, uint32_t
     return true;
 }
 
+/**
+ * Makes a root record follow the root signature the game binds: a new signature starts with no arguments.
+ *
+ * @param root   The record, graphics or compute.
+ * @param layout The root signature the game bound, or bound an argument to.
+ */
+static void FollowRootSignature(CmdGfxRoot& root, uint64_t layout)
+{
+    if (!layout || root.layout == layout) return;
+    std::fill(std::begin(root.kind), std::end(root.kind), CmdGfxRoot::kNone);
+    root.constant_count = 0;
+    root.layout = layout;
+}
+
+/**
+ * Notes a root CBV, SRV or UAV the game set, so it can be put back after our own work on its list.
+ *
+ * @param root         The record, graphics or compute.
+ * @param layout_param The root parameter.
+ * @param update       What the game set.
+ */
+static void NoteRootDescriptor(CmdGfxRoot& root, uint32_t layout_param, const descriptor_table_update& update)
+{
+    if (update.type == descriptor_type::buffer_shader_resource_view ||
+        update.type == descriptor_type::buffer_unordered_access_view) {
+        root.kind[layout_param] =
+            update.type == descriptor_type::buffer_shader_resource_view ? CmdGfxRoot::kSrv : CmdGfxRoot::kUav;
+        root.value[layout_param] = *static_cast<const uint64_t*>(update.descriptors);
+    } else if (update.type == descriptor_type::constant_buffer) {
+        const auto* range = static_cast<const buffer_range*>(update.descriptors);
+        root.kind[layout_param] = CmdGfxRoot::kCbv;
+        root.value[layout_param] = range->buffer.handle
+            ? reinterpret_cast<ID3D12Resource*>(range->buffer.handle)->GetGPUVirtualAddress() + range->offset
+            : 0;
+    }
+}
+
 void on_push_descriptors(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t layout_param,
     const descriptor_table_update& update)
 {
@@ -288,19 +325,11 @@ void on_push_descriptors(command_list* cmd_list, shader_stage stages, pipeline_l
         g_command_lists.CmpLayout(cmd_list) = layout.handle;
     }
     if ((uint32_t)(stages & shader_stage::all_compute) == 0) {
-        CmdGfxRoot& g = g_command_lists.GfxRoot(cmd_list);
-        if (update.type == descriptor_type::buffer_shader_resource_view ||
-            update.type == descriptor_type::buffer_unordered_access_view) {
-            g.kind[layout_param] =
-                update.type == descriptor_type::buffer_shader_resource_view ? CmdGfxRoot::kSrv : CmdGfxRoot::kUav;
-            g.value[layout_param] = *static_cast<const uint64_t*>(update.descriptors);
-        } else if (update.type == descriptor_type::constant_buffer) {
-            const auto* range = static_cast<const buffer_range*>(update.descriptors);
-            g.kind[layout_param] = CmdGfxRoot::kCbv;
-            g.value[layout_param] = range->buffer.handle
-                ? reinterpret_cast<ID3D12Resource*>(range->buffer.handle)->GetGPUVirtualAddress() + range->offset
-                : 0;
-        }
+        NoteRootDescriptor(g_command_lists.GfxRoot(cmd_list), layout_param, update);
+    } else {
+        CmdGfxRoot& compute_root = g_command_lists.CmpRoot(cmd_list);
+        FollowRootSignature(compute_root, layout.handle);
+        NoteRootDescriptor(compute_root, layout_param, update);
     }
 
     if (update.type == descriptor_type::shader_resource_view || update.type == descriptor_type::unordered_access_view) {
@@ -331,11 +360,13 @@ void on_push_descriptors(command_list* cmd_list, shader_stage stages, pipeline_l
     }
 }
 
-void on_push_constants(command_list* cmd_list, shader_stage stages, pipeline_layout, uint32_t layout_param,
+void on_push_constants(command_list* cmd_list, shader_stage stages, pipeline_layout layout, uint32_t layout_param,
     uint32_t first, uint32_t count, const void* values)
 {
-    if (g_addon.disabled || (uint32_t)(stages & shader_stage::all_compute) != 0 || layout_param >= 64) return;
-    CmdGfxRoot& g = g_command_lists.GfxRoot(cmd_list);
+    if (g_addon.disabled || layout_param >= 64) return;
+    const bool to_compute = (uint32_t)(stages & shader_stage::all_compute) != 0;
+    CmdGfxRoot& g = to_compute ? g_command_lists.CmpRoot(cmd_list) : g_command_lists.GfxRoot(cmd_list);
+    if (to_compute) FollowRootSignature(g, layout.handle);
     const uint32_t* v = static_cast<const uint32_t*>(values);
     for (uint32_t i = 0; i < count && first + i < 64; ++i) {
         uint32_t k = 0;
@@ -406,12 +437,17 @@ void on_bind_descriptor_tables(command_list* cmd_list, shader_stage stages, pipe
         g.constant_count = 0;
         g.layout = layout.handle;
     }
+    CmdGfxRoot& compute_root = g_command_lists.CmpRoot(cmd_list);
+    if (to_compute) FollowRootSignature(compute_root, layout.handle);
     for (uint32_t i = 0; i < n; ++i) {
         RootParam& rp = state.root[first + i];
         rp.table = tables[i];
         if (!to_compute) {
             g.kind[first + i] = CmdGfxRoot::kTable;
             g.value[first + i] = tables[i].handle;
+        } else {
+            compute_root.kind[first + i] = CmdGfxRoot::kTable;
+            compute_root.value[first + i] = tables[i].handle;
         }
         NoteGameHeap(cmd_list, tables[i].handle);
         if (!to_compute) continue;

@@ -20,4 +20,15 @@ bool Record(ID3D12GraphicsCommandList* cl); // records the next queued hash into
 void Submitted(ID3D12Fence* fence, uint64_t value); // the fence that completes the list Record wrote into
 void LogInflight(const char* why);
 
+/**
+ * Asks for a second look at a vertex buffer whose hash does not match the mod's ini although the draw fits one
+ * of the mod's components. The buffer is hashed again and the vertex counts just above the one its indices give
+ * are tried too; when the ini's hash matches at one of them, Lookup returns the ini's hash from then on. Each
+ * vertex buffer is searched once, until its memory is written over.
+ *
+ * @param vb_va    The vertex buffer view's GPU address, as Lookup keys it.
+ * @param expected The ini's hash.
+ */
+void SearchVertexCount(uint64_t vb_va, uint32_t expected);
+
 }

@@ -15,6 +15,11 @@ struct AddonSettings {
     unsigned tex_vram_cap_mb = 0; // C13: the video memory budget taken as at most this; 0 = Windows'
     bool dx12_debug_layer = false; // takes effect on the next launch
     bool dred = false;
+    // ini rt_experimental: keep the mods on while the game ray traces, without an RT module. Ray-traced shadows and
+    // reflections then still show the game's own models.
+    bool rt_experimental = false;
+    // ini ptskin_test (debug): 1 = no motion (the previous frame's positions are this frame's).
+    int ptskin_test = 0;
     bool debug = false;
     int log_level = 0;
     std::wstring ini_path; // wwmi_dx12.ini, read at startup and written back by the overlay

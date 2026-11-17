@@ -11,6 +11,8 @@ void AddonSettings::Load(const std::wstring& path)
 {
     ini_path = path;
     dred = Int(L"dred", 0) != 0;
+    rt_experimental = Int(L"rt_experimental", 0) != 0;
+    ptskin_test = Int(L"ptskin_test", 0);
     debug = Int(L"debug", 0) != 0;
     log_level = Int(L"log_level", g_log_verbosity);
     dx12_debug_layer = Int(L"dx12_debug_layer", 0) != 0;

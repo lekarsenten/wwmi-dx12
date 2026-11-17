@@ -50,6 +50,16 @@ struct CbRing {
         made.store(true, std::memory_order_release);
         return true;
     }
+    // The device is being destroyed: the buffers are released, and Ensure makes new ones on the next device.
+    void Reset()
+    {
+        std::lock_guard<std::mutex> l(mtx);
+        cur = Buf{};
+        next = 0;
+        retired.clear();
+        dev = nullptr;
+        made.store(false, std::memory_order_release);
+    }
     uint8_t* Take(uint64_t* out_va, ID3D12Resource** out_res = nullptr)
     {
         std::lock_guard<std::mutex> l(mtx);

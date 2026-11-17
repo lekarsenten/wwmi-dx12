@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -36,6 +37,8 @@ public:
     void ForgetRange(uint64_t va, uint64_t bytes);
     // Bumped whenever Note records a ring it did not have: a shader judged before then is judged again.
     uint32_t Gen() const;
+    // How many rings are recorded, and how many of them each mod owns (debug summary).
+    void CountPerMod(std::map<int, size_t>* per_mod, size_t* total) const;
 
 private:
     struct Ring {

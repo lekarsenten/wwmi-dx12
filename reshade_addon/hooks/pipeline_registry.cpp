@@ -16,6 +16,7 @@
 #include "../migoto/dx12_input_layout.h"
 #include "../migoto/port_api.h"
 #include "../mods/wwmi_runtime.h"
+#include "../rt/rt_hooks.h" // RtNoteComputeShader
 
 PipelineRegistry g_pipelines;
 
@@ -379,6 +380,8 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
     if (vs_code) g_shader_capture.Note(vs_hash, vs_code, vs_size, "vs");
     if (ps_code) g_shader_capture.Note(ps_hash, ps_code, ps_size, "ps");
     if (cs_code) g_shader_capture.Note(cs_hash, cs_code, cs_size, "cs");
+    if (cs_code) RtNoteComputeShader(cs_hash, cs_code, cs_size);
+    if (vs_code) RtNoteGraphicsPipeline(pipeline.handle, vs_hash, vs_code, vs_size);
     if (g_debug && vs_hash) { // log every distinct VS input layout (capped) -- incl. the depth VS
         static std::set<uint64_t> s_il_seen;
         bool fresh;

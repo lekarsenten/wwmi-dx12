@@ -142,6 +142,7 @@ struct CmdBlock {
     uint64_t gfx_layout = 0; // active graphics root signature for this list
     uint64_t cmp_layout = 0; // ... and the compute one
     CmdGfxRoot gfx_root;
+    CmdGfxRoot cmp_root; // the same for the compute root signature (rt_skin_gpu.cpp puts it back after PTSKIN)
     uint64_t gen = 1;
     uint64_t drew_gen = 0; // the recording (gen) a game draw was recorded in
     uint64_t frame_end_gen = 0; // the recording a back-buffer-sized texture went to COMMON in: the game's frame end
@@ -168,6 +169,7 @@ public:
     uint64_t& GfxLayout(const void* cmd_list);
     uint64_t& CmpLayout(const void* cmd_list);
     CmdGfxRoot& GfxRoot(const void* cmd_list);
+    CmdGfxRoot& CmpRoot(const void* cmd_list);
     // 0 for a null list: the port then keeps its old carry-over instead of guessing a recording.
     uint64_t Gen(const void* cmd_list);
     // A game draw in the list's current recording: its submission is game work a step can follow (present_hook.cpp).

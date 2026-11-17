@@ -14,6 +14,7 @@
 #include "../mods/shader_alias.h"
 #include "../hooks/pipeline_registry.h"
 #include "../rt/rt_draw.h"
+#include "../rt/rt_hooks.h" // RtNoteComponentDraw
 #include "draw_context.h"
 #include "draw_inject.h"
 #include "draw_sectex.h"
@@ -282,11 +283,17 @@ static void PushGameBindings(ComponentRun& run)
         if (!g_pipelines.VsCbufferBytes(draw_pso, reg, decl)) return kDx11SkeletonCbByteWidth;
         return decl == kBoneCBBytes ? kDx11SkeletonCbByteWidth : decl;
     };
-    const RtPalResult pal = g_rt_draw.PalPublish(draw_pso, dm, wc, dc.b4_cb.va);
-    if (pal.published) {
-        t_b4_root = -1;
-        run.rtpal_no_merge = pal.no_merge;
-    }
+    // On a ray-tracing pass-through draw the game's vs-b4 and vs-b3 are not skeletons (vs-b4 holds the material
+    // constants), so nothing published as vs-cb4 / vs-cb3 may reach the game's root slots: not the palette that
+    // PalPublish hands to the mod, and not the mod's merged skeleton.
+    const int claimed_b4_root = t_b4_root;
+    t_b4_root = -1;
+    const RtPalResult pal = g_rt_draw.PalPublish(cmd_list, ctx.args.d3d12_cl, dm, wc, ctx.args.vertex_offset);
+    if (pal.tried)
+        t_b3_root = -1;
+    else
+        t_b4_root = claimed_b4_root;
+    if (pal.published) run.rtpal_no_merge = pal.no_merge;
     constexpr unsigned kNotSkeletonWidth = 256;
     if (!pal.published)
         PortApi::PushGameConstantBuffer('v', 4, dc.b4_cb.res, dc.b4_cb.va, pal.tried ? kNotSkeletonWidth : cb_width(4));
@@ -301,7 +308,7 @@ static void PushGameBindings(ComponentRun& run)
                 kNotSkeletonWidth);
         w3 = kNotSkeletonWidth;
     }
-    PortApi::PushGameConstantBuffer('v', 3, dc.b3_cb.res, dc.b3_cb.va, w3);
+    if (!pal.previous_published) PortApi::PushGameConstantBuffer('v', 3, dc.b3_cb.res, dc.b3_cb.va, w3);
     {
         const RootCbvBind obj = ObjectCbOf(cmd_list);
         if (obj.res && obj.va) PortApi::PushGameConstantBuffer('v', 2, obj.res, obj.va, kDx11ObjectCbByteWidth);
@@ -587,7 +594,11 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
     ComponentRun run(ctx, dm, wc);
     run.hk.handling_skip = [&skip_orig] { skip_orig = true; };
     InstallRfxHooks(run);
-    run.hk.drawindexed = [&run](uint32_t c, uint32_t s2, uint32_t b2) { SectionDrawIndexed(run, c, s2, b2); };
+    std::vector<RtDrawnRange> drawn; // for the RT module: what the section drew
+    run.hk.drawindexed = [&run, &drawn](uint32_t c, uint32_t s2, uint32_t b2) {
+        drawn.push_back(RtDrawnRange{ c, s2 });
+        SectionDrawIndexed(run, c, s2, b2);
+    };
     {
         static std::atomic<bool> once{ false };
         if (!once.exchange(true))
@@ -661,6 +672,11 @@ bool DrawComponent(DrawContext& ctx, int dm, const WwmiMod::Component* wc)
         ran = PortRunSection(fq, run.hk, da.index_count, da.first_index, da.first_instance,
             g_command_lists.Gfx(cmd_list).gfx_pso, skip_orig);
         t_trace_binds = false;
+        if (ran) {
+            const IndexBind& game_ib = g_command_lists.Gfx(cmd_list).ib;
+            RtNoteComponentDraw(dm, game_ib.res, game_ib.va, game_ib.size, da.first_index, da.index_count, skip_orig, drawn.data(),
+                (uint32_t)drawn.size());
+        }
     }
     for (unsigned r = 0; r < kSectionTexRegs; ++r)
         if (sect_tex & (1u << r)) PortApi::UnpushGameTexture('p', r);

@@ -141,6 +141,15 @@ CmdGfxRoot& CommandListRegistry::GfxRoot(const void* cmd_list)
     return overflow_root;
 }
 
+CmdGfxRoot& CommandListRegistry::CmpRoot(const void* cmd_list)
+{
+    CmdBlock* b = Block(cmd_list);
+    if (b) return b->cmp_root;
+    static CmdGfxRoot overflow_cmp_root;
+    overflow_cmp_root = CmdGfxRoot{};
+    return overflow_cmp_root;
+}
+
 uint64_t CommandListRegistry::Gen(const void* cmd_list)
 {
     CmdBlock* b = Block(cmd_list);
@@ -211,6 +220,7 @@ void on_reset_command_list(command_list* cmd_list)
         ++b->gen; // a new recording (CommandListRegistry::Gen): independent of the clear A/B below
         for (HeapBind& hb : b->heaps) hb.fresh = false;
         b->gfx_root = CmdGfxRoot{};
+        b->cmp_root = CmdGfxRoot{};
         b->mod_pins.Reset(g_mod_sets);
     }
     if (!g_hooks_toggles.cmd_reset_clears) return;
