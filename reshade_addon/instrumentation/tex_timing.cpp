@@ -147,6 +147,7 @@ void Arm(double seconds)
 
 void Stop()
 {
+    PortApi::EngineScope engine;
     std::lock_guard l(g_mtx);
     if (!g_armed.load()) return;
     g_armed.store(false);
@@ -157,6 +158,7 @@ void Stop()
 void Tick()
 {
     if (!Armed()) return;
+    PortApi::EngineScope engine;
     std::lock_guard l(g_mtx);
     if (Now() < g_window_ms) return;
     g_armed.store(false);

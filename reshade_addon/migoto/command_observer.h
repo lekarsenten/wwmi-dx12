@@ -55,6 +55,11 @@ public:
     // `run = CommandList...`: the hook runs the target list itself and returns true, or returns false to leave it to theirs.
     void SetRunExplicitHook(bool (*fn)(CommandListCommand* inner, ::CommandListState* state));
     bool RunExplicit(CommandListCommand* inner, ::CommandListState* state);
+    // `$var = ...`: `classify` tags a variable as its assignment is wrapped (-1 = not watched); `assigned` hears of a
+    // tagged one once the assignment has written it, and may write it again.
+    void SetAssignHook(int (*classify)(const std::wstring& name), void (*assigned)(int tag, float* var));
+    int AssignTag(const std::wstring& name);
+    void Assigned(int tag, float* var);
 
     void Wrap(CommandList* list);
     void WrapAll(std::vector<CommandList*>& lists);
@@ -74,6 +79,8 @@ public:
 
 private:
     bool (*run_explicit_hook_)(CommandListCommand*, ::CommandListState*) = nullptr;
+    int (*assign_classify_)(const std::wstring&) = nullptr;
+    void (*assigned_)(int, float*) = nullptr;
     std::atomic<size_t> wrapped_quiet_{ 0 };
     std::mutex cost_mutex_;
     std::deque<CmdCost> costs_;

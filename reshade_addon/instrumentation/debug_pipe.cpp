@@ -8,7 +8,10 @@
 #include "../draw/draw_sectex.h" // g_tex_draw_watch
 #include "../mods/shader_alias.h" // ShaderAliasCommand
 #include "../mods/mod_set.h"
+#include "../hud/outline_hide.h"
 #include "opacity_watch.h"
+#include "../textures/tex_dhash_table.h"
+#include "../textures/tex_identity.h"
 #include "../textures/tex_pipe_alias.h"
 #include "../textures/tex_ref_take.h"
 #include "../textures/tex_slot_log.h"
@@ -107,8 +110,11 @@ const char* const kHelp =
     "texdraws <texhash>   watches draws, indexed or not, for that texture at ps-t0..t8 (earlier finds cleared)\n"
     "texdraws all         every draw's ps-t0..t8 textures, for about two frames\n"
     "texdraws [off]       what was found: ps, vs, register, texture; off stops watching\n"
-    "texrefs take         texture-match references of every texture game character draws read over two frames (A21)\n"
-    "texrefs              what the last take did\n"
+    "texrefs take         texture-match references of every texture game character draws read, and of every drawn "
+    "texture a section names, over two frames (A21)\n"
+    "texrefs              what the last take did; the named textures too flat or of a size signatures skip\n"
+    "dhash <texhash>      each loaded texture with that hash: the dHash kept per mip size (A23), linear / sRGB view\n"
+    "texsave <texhash>    the loaded texture with that hash, mip 0, as a .dds in the dump folder's pipe\\, drawn or not\n"
     "texalias             every game texture hash taken as a mod target from the pipe\n"
     "texalias <game> <rule>  a game texture with that hash swaps as that mod target; texalias <game> off removes it\n"
     "alias                every DX12 -> DX11 shader-hash alias [ShaderOverride] sections see\n"
@@ -121,7 +127,9 @@ const char* const kHelp =
     "they change; cbrows: the latest; cbrows off\n"
     "opacity [frames]     claimed draws of decensored shaders within that many frames (120): their fade switch and "
     "fixed opacity as read from the game's material CB (needs A2 debug and A4 decensor); unmodded skinned draws are "
-    "mod -1 with their index count as the component\n";
+    "mod -1 with their index count as the component\n"
+    "outline              A6: outline pixel shaders found, vertex shaders patched or not and why, stand-ins built, "
+    "binds with and without one, game draws dropped\n";
 
 std::string ListShaders()
 {
@@ -159,6 +167,32 @@ std::string DumpShader(const std::string& text)
     return Narrow(path) + " (" + std::to_string(wrote) + " bytes)";
 }
 
+std::string DHashCommand(const std::string& arg)
+{
+    char* end = nullptr;
+    const uint32_t want = (uint32_t)std::strtoul(arg.c_str(), &end, 16);
+    if (!end || *end || !want) return "ERR not a texture hash: " + arg;
+    std::vector<uint64_t> res;
+    g_tex_identity.ForEachHash([&](uint64_t r, uint32_t h) {
+        if (h == want) res.push_back(r);
+    });
+    std::string out;
+    char line[160];
+    for (uint64_t r : res) {
+        std::snprintf(line, sizeof line, "res %llx:", (unsigned long long)r);
+        out += line;
+        const std::vector<TexDHashTable::Kept> kept = g_tex_dhash.KeptFor(r);
+        if (kept.empty()) out += " no dHash kept";
+        for (const TexDHashTable::Kept& k : kept) {
+            std::snprintf(line, sizeof line, " %ux%u %016llx / %016llx;", k.w, k.h, (unsigned long long)k.linear,
+                (unsigned long long)k.srgb);
+            out += line;
+        }
+        out += "\n";
+    }
+    return out + std::to_string(res.size()) + " loaded texture(s) with hash " + arg;
+}
+
 std::string Execute(const std::string& line)
 {
     ModSetRef set_ref;
@@ -192,7 +226,9 @@ std::string Execute(const std::string& line)
         logger::write("PIPE: run %s", w[1].c_str());
         return PortApi::RunSectionThenPost(section.c_str(), nullptr) ? "ran " + w[1] : "ERR " + w[1] + " did not run";
     }
+    if (c == "dhash" && w.size() == 2) return DHashCommand(w[1]);
     if (c == "shaders" && w.size() == 1) return ListShaders();
+    if (c == "outline" && w.size() == 1) return g_outline_hide.Report();
     if (c == "shader" && w.size() == 2) return DumpShader(w[1]);
     if (c == "smallmesh" && w.size() <= 2)
         return SmallMeshReport(w.size() == 2 ? (uint32_t)std::strtoul(w[1].c_str(), nullptr, 10) : 0u);
@@ -200,6 +236,7 @@ std::string Execute(const std::string& line)
         return g_tex_draw_watch.Command(std::vector<std::string>(w.begin() + 1, w.end()));
     if (c == "texrefs" && w.size() <= 2)
         return g_tex_ref_take.Command(std::vector<std::string>(w.begin() + 1, w.end()));
+    if (c == "texsave" && w.size() == 2) return g_tex_ref_take.Save((uint32_t)std::strtoul(w[1].c_str(), nullptr, 16));
     if (c == "texalias" && w.size() <= 3)
         return g_tex_pipe_alias.Command(std::vector<std::string>(w.begin() + 1, w.end()));
     if (c == "alias" && w.size() <= 3) return ShaderAliasCommand(std::vector<std::string>(w.begin() + 1, w.end()));

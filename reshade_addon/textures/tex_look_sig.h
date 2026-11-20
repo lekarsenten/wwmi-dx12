@@ -1,21 +1,41 @@
 #pragma once
-// A texture's look: five patches of its mip0 (centre, four corners inset 1/8, side 1/16) box-averaged to one
-// density, their histograms, and SSIM per patch between two of them. Pure functions, depending on core/ only.
+// A texture's look: five patches of its mip0 (by default the centre and four corners inset 1/8; side 1/16, in whole
+// 4x4 blocks) box-averaged to one density, their histograms, and SSIM per patch between two of them. Pure functions,
+// depending on core/ only.
+#include <array>
 #include <cstdint>
 #include <vector>
-
-// The BC blocks under a mip0's five patches, cut on the upload thread: all a signature reads.
-struct TexLookCut {
-    uint32_t fmt = 0;
-    uint32_t w = 0;
-    uint32_t h = 0;
-    std::vector<uint8_t> blocks; // patch by patch, block row by block row
-};
-TexLookCut TexLookCutOf(const uint8_t* bc, size_t bc_size, uint32_t w, uint32_t h, uint32_t fmt);
 
 namespace texlook {
 
 constexpr int kPatches = 5;
+
+// A patch's top-left texel in mip0, on a 4x4 block.
+struct Spot {
+    uint32_t x = 0;
+    uint32_t y = 0;
+    bool operator==(const Spot& o) const { return x == o.x && y == o.y; }
+};
+using Spots = std::array<Spot, kPatches>;
+
+} // namespace texlook
+
+// The BC blocks a signature reads, cut on the upload thread: the patches at `spots`, or the whole mip0.
+struct TexLookCut {
+    uint32_t fmt = 0;
+    uint32_t w = 0;
+    uint32_t h = 0;
+    bool whole = false; // blocks: the whole mip0, block row by block row
+    std::vector<texlook::Spot> spots; // else: these patches, each block row by block row
+    std::vector<uint8_t> blocks;
+};
+// The patches at `spots` (none: the default five); the whole mip0 when they would hold as many blocks.
+TexLookCut TexLookCutOf(const uint8_t* bc, size_t bc_size, uint32_t w, uint32_t h, uint32_t fmt,
+    const std::vector<texlook::Spot>& spots = {});
+TexLookCut TexLookWholeOf(const uint8_t* bc, size_t bc_size, uint32_t w, uint32_t h, uint32_t fmt);
+
+namespace texlook {
+
 constexpr uint32_t kRefSide = 512; // a patch holds at most kRefSide/16 cells a side
 constexpr uint32_t kMaxCells = kRefSide / 16;
 constexpr float kHistMax = 0.08f;
@@ -30,6 +50,7 @@ struct LookSig {
     uint32_t h = 0;
     uint32_t pw = 0;
     uint32_t ph = 0;
+    Spots at{}; // where its patches are in that mip
     std::vector<uint8_t> px; // kPatches x ph x pw x nch
 };
 
@@ -59,8 +80,18 @@ struct Score {
 };
 
 bool Eligible(uint32_t w, uint32_t h, uint32_t fmt);
+// Both sides a power of two: such a texture compares with any of its aspect, another one only at its own size and
+// patch spots.
+bool PowerOfTwo(uint32_t w, uint32_t h);
+uint8_t CodecOf(uint32_t fmt); // 0: a format signatures skip
+uint64_t ShapeOf(uint8_t codec, uint32_t w, uint32_t h);
 uint32_t CellsOf(uint32_t w, uint32_t h);
-bool SigOf(const TexLookCut& cut, LookSig& s);
+Spots DefaultSpots(uint32_t w, uint32_t h);
+bool SpotsFit(uint32_t w, uint32_t h, const Spots& at); // every patch on a block and inside the texture
+bool SigOf(const TexLookCut& cut, const Spots& at, LookSig& s);
+// A texture not a power of two a side: the five patches that do not overlap with the most structure (the highest
+// channel std of their cells), on a grid of half a patch. `cut` is whole.
+bool BusiestSpots(const TexLookCut& cut, Spots& at);
 // The signature at a coarser (or its own) cell density: each cell the mean of the cells it covers.
 LookView ViewOf(const LookSig& s, uint32_t pw, uint32_t ph);
 // `cv` is `cand` at its own density.

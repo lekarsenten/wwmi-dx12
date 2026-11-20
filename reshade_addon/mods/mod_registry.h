@@ -47,8 +47,6 @@ public:
     int IdOfNs(const std::wstring& ns) const;
     int IdOfNsHash(uint64_t ns_hash) const;
     unsigned ParseGen() const { return parse_gen_; }
-    // A loaded mod asks what the game bound in ps-tN.
-    bool PsSlotQueries() const { return ps_slot_queries_.load(std::memory_order_relaxed); }
     const WwmiMod::Component* Comp(int mod_id, int idx) const;
     uint32_t IndexEnd(int mod_id, uint32_t ib_hash) const;
     // WWMI enable-flag compliance: is this mod's geometry meant to be applied right now?
@@ -67,5 +65,4 @@ private:
     unsigned parse_gen_ = 0;
     int discovered_ = 0;
     std::vector<std::unordered_map<uint32_t, uint32_t>> index_end_; // per mod: ib hash -> the last index it declares
-    std::atomic<bool> ps_slot_queries_{ false };
 };

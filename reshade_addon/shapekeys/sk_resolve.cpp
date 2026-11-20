@@ -468,6 +468,18 @@ void ShapekeyResolver::ResolveCb0(command_list* cmd_list, uint64_t cs_hash, uint
             }
             store_.SnapshotCb0(
                 cmd_list, owner_ns, inst, auth_cb, auth_va, cbsz, (unsigned long long)cs_hash, group_count_y);
+            if (g_sk_toggles.game_batches) {
+                uint32_t row0[4] = {};
+                uint32_t row65[4] = {};
+                if (g_game_cbs.Snapshot(auth_cb, auth_va, (uint8_t*)row0, sizeof row0) == sizeof row0 &&
+                    g_game_cbs.Snapshot(auth_cb, auth_va + 65u * 16u, (uint8_t*)row65, sizeof row65) == sizeof row65)
+                    store_.SetGameBatch(owner_ns, inst, (unsigned long long)cs_hash, group_count_y,
+                        GameBatchOf(row0, row65));
+                else if (LogBudget("SKBATCH-UNREAD", owner_ns, 1))
+                    logger::write("SKBATCH ns='%ls': the game's shape-key cb0 cannot be read on the CPU -- A22 "
+                                  "leaves this mod's batch numbers as its ini has them",
+                        owner_ns.c_str());
+            }
         } else {
             cb0_res = nullptr;
             cb0_va = 0;

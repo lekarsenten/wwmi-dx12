@@ -15,10 +15,13 @@ void VramMeter::Open()
         adapter_ = nullptr;
     }
     for_ = g_addon.d3d12_device;
+    card_ = 0;
     IDXGIFactory4* fac = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac))) && fac) {
         IDXGIAdapter1* a1 = nullptr;
         if (SUCCEEDED(fac->EnumAdapterByLuid(g_addon.d3d12_device->GetAdapterLuid(), IID_PPV_ARGS(&a1))) && a1) {
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(a1->GetDesc1(&desc))) card_ = desc.DedicatedVideoMemory;
             a1->QueryInterface(IID_PPV_ARGS(&adapter_));
             a1->Release();
         }
@@ -40,6 +43,7 @@ bool VramMeter::Read(VramReading* out)
     if (FAILED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi))) return false;
     out->budget = vi.Budget;
     out->used = vi.CurrentUsage;
+    out->card = card_;
     if (SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vi))) {
         out->shared_budget = vi.Budget;
         out->shared_used = vi.CurrentUsage;

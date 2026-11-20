@@ -3,6 +3,7 @@ DirectX11\CommandList.h
 DirectX11\cursor.cpp
 DirectX11\cursor.h
 DirectX11\D3D11Wrapper.h
+DirectX11\DHash64Gpu.h
 HLSLDecompiler\DecompileHLSL.h
 DirectX11\DLLMainHook.h
 DirectX11\DrawCallInfo.h

@@ -39,6 +39,7 @@
 #include "../mods/component_table.h"
 #include "../mods/game_cb_reader.h"
 #include "sk_toggles.h"
+#include "sk_batch_fix.h"
 
 using namespace reshade::api;
 
@@ -49,6 +50,7 @@ struct SkNsState {
 
     std::unordered_map<unsigned, std::unordered_map<unsigned long long, std::unordered_map<unsigned, SkBufferBinding>>>
         snap;
+    std::unordered_map<unsigned long long, std::unordered_map<unsigned, GameBatch>> batch; // by queuing cs, then tgy
 
     bool valid = false;
 };
@@ -86,6 +88,10 @@ public:
     // Copy the dispatch's cb0 on the game's own command list, keyed by the queuing dispatch.
     void SnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns, ID3D12Resource* inst,
         ID3D12Resource* src, uint64_t va, unsigned size, unsigned long long cs_hash, unsigned tgy);
+    // What the game's cb0 said of the batch the queuing dispatch ran, read on the CPU at that dispatch (A22).
+    void SetGameBatch(const std::wstring& ns, ID3D12Resource* inst, unsigned long long cs, unsigned tgy,
+        const GameBatch& b);
+    bool GetGameBatch(const std::wstring& ns, ID3D12Resource* inst, unsigned long long cs, unsigned tgy, GameBatch* out);
     // Publish a whole-state snapshot for the owner's instance. The register file only; its cb0 copies stay.
     void SetState(const std::wstring& ns, ID3D12Resource* inst, const SkComputeState& st);
     // The instance's last published register file; false when it has none.

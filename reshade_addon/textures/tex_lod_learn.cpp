@@ -167,7 +167,8 @@ void TexLodCache::Feeds(uint32_t lower, uint32_t big, uint32_t big_rule, uint32_
 #endif
 }
 
-void TexLodCache::TargetsReady(bool (*is_target)(uint32_t hash, void* user), void* user)
+void TexLodCache::TargetsReady(
+    bool (*is_target)(uint32_t hash, void* user), bool (*is_named)(uint32_t hash, void* user), void* user)
 {
     std::lock_guard l(mutex_);
     if (!g_settings.texlod_cache) return;
@@ -193,7 +194,8 @@ void TexLodCache::TargetsReady(bool (*is_target)(uint32_t hash, void* user), voi
             continue;
         }
         const size_t was = links.size();
-        links.erase(std::remove_if(links.begin(), links.end(), [&](const Link& k) { return !is_target(k.high, user); }),
+        links.erase(std::remove_if(links.begin(), links.end(),
+                        [&](const Link& k) { return !is_target(k.high, user) && !(is_named && is_named(k.high, user)); }),
             links.end());
         if (links.empty()) {
             dropped.push_back(it->first);

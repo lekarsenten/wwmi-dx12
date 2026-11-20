@@ -4,6 +4,7 @@
 struct AddonSettings {
     bool decensor = false;
     bool hide_uid = false; // A5: the UID cut out of the UI text (hud/uid_hide.h)
+    bool hide_char_outlines = false; // A6: the characters' outline pass not drawn (hud/outline_hide.h)
     bool hide_outline = false;
     bool tex_deferred = true; // mod textures load off the engine lock, vanilla until in (A12)
     bool texlod_resemblance = true; // A13 / ini lod_resemblance: look-alike LOD matches applied (always learned)

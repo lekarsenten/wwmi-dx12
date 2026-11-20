@@ -16,6 +16,7 @@
 #include "../textures/tex_gc.h" // the video memory reading under A19
 #include "../hooks/stamp_ledger.h" // SetAddonDisabled (A1)
 #include "../migoto/port_toggles.h" // g_buffers_in_vram
+#include "../shapekeys/sk_toggles.h" // g_sk_toggles.game_batches (A22)
 #include "../migoto/port_api.h"
 #include "../core/log.h"
 #include <cstdio>
@@ -385,8 +386,13 @@ bool OverlayPanel::DrawMaster()
         }
     }
     if (NCheckbox("A4", "Decensor", &g_settings.decensor)) g_settings.Save(L"decensor", g_settings.decensor);
-    if (NCheckbox("A5", "Hide UID (your player number: bottom right, Esc menu, Friends list)", &g_settings.hide_uid))
+    if (NCheckbox("A5",
+            "Hide UID (your player number: bottom right, Esc menu, Friends list) and the coordinates and time "
+            "(bottom left)",
+            &g_settings.hide_uid))
         g_settings.Save(L"hide_uid", g_settings.hide_uid);
+    if (NCheckbox("A6", "Hide character outlines", &g_settings.hide_char_outlines))
+        g_settings.Save(L"hide_char_outlines", g_settings.hide_char_outlines);
 #ifdef WWMI_DEBUG
     if (NCheckbox("A8", "Hide mod outlines", &g_settings.hide_outline))
         g_settings.Save(L"hide_outline", g_settings.hide_outline);
@@ -428,10 +434,11 @@ bool OverlayPanel::DrawMaster()
     {
         const TexGc::Reading& r = g_tex_gc.Now();
         if (r.valid) {
-            ImGui::TextDisabled("  Video memory: %.1f of %.1f GB in use", (double)r.used / 1073741824.0,
-                (double)r.budget / 1073741824.0);
-            ImGui::TextDisabled("  Mod textures: %.1f of %.1f GB allowed", (double)r.mods / 1073741824.0,
-                (double)r.room / 1073741824.0);
+            std::string budget_line;
+            std::string parts_line;
+            TexGc::Lines(r, budget_line, parts_line);
+            ImGui::Text("  VRAM, GiB: %s", budget_line.c_str());
+            ImGui::Text("    %s", parts_line.c_str());
             if (g_tex_gc.Tight())
                 ImGui::TextColored({ 1, 1, 0, 1 },
                     TexCollects(g_settings.tex_mod_budget)
@@ -454,9 +461,21 @@ bool OverlayPanel::DrawMaster()
         "  on = faster drawing of modded characters.\n"
         "  off = kept in system memory, for cards short on video memory; costs frame rate with large mods.\n"
         "  Applies at the next launch.");
+    if (NCheckbox("A22", "Shape keys of mods made on DX11: use this game's batch sizes", &g_sk_toggles.game_batches))
+        g_settings.Save(L"shapekey_game_batches", g_sk_toggles.game_batches);
+    ImGui::TextDisabled(
+        "  on = faces of mods with batched shape keys move as on DX11 (eyes, mouth, expressions).\n"
+        "  off = the numbers in the mod's ini, as before.");
+    if (NCheckbox("A23", "Mods that pick the game's textures by how they look (WWMI 1.2.2 texture filters)",
+            &g_tex_toggles.dhash_filters))
+        g_settings.Save(L"texture_filters", g_tex_toggles.dhash_filters);
+    ImGui::TextDisabled(
+        "  on = mods made with WWMI's new texture method get their textures, as on DX11.\n"
+        "  off = those mods keep the game's textures. Textures already loaded are recognised again only after "
+        "they reload.");
     ImGui::Text("Active mods: %d", Mods().DiscoveredCount());
     {
-        if (NButton("A11", "Clear caches at next launch (patched shaders, texture matches)") &&
+        if (NButton("A11", "Clear caches at next launch (patched shaders, texture matches learned in play)") &&
             !g_settings.ini_path.empty()) {
             g_settings.Save(L"clear_cache", true);
             clear_requested_ = true;
@@ -467,13 +486,14 @@ bool OverlayPanel::DrawMaster()
     {
         bool crawl = g_tex_crawl.On();
         if (NCheckbox("A15",
-                "Gallery crawl: record every character texture's mips and where each character draw binds it; saved 10 s after the last new texture (at least once a minute), when switched off and at exit",
+                "Gallery crawl: record every character texture's mips and where each character draw binds it, and take a texture-match reference of each new texture character draws read or a mod section names (A21 without the button); saved 10 s after the last new texture (at least once a minute), when switched off and at exit",
                 &crawl))
             g_tex_crawl.Set(crawl);
     }
     if (NButton("A21",
-            "Take texture-match references of the characters on screen: every texture their draws read, kept for the "
-            "seed (open a new character in the gallery or in battle first)"))
+            "Take texture-match references of what is on screen: every texture character draws read and every drawn "
+            "texture a mod section names, kept for the seed (open a new character in the gallery or in battle, or a "
+            "UI screen, first)"))
         g_tex_ref_take.Arm();
     {
         const std::string last = g_tex_ref_take.Last();
@@ -486,7 +506,7 @@ bool OverlayPanel::DrawMaster()
         VerboseArm(600);
     if (logger::unlimited()) ImGui::TextColored({ 1, 1, 0, 1 }, "verbose log ON");
 #endif
-    if (NButton("B1", "Reload mods (re-reads every mod ini)")) {
+    if (NButton("B1", "Reload mods (F10; re-reads every mod ini)")) {
         PortApi::RequestReload();
         logger::write("B1: reload requested -- the inis are parsed again at the next frame boundary");
     }

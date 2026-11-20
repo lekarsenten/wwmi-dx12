@@ -31,7 +31,7 @@
 acdbc2eb5667920a 9229defdb21bc702 4705b82b
 b7a5e04c8976e36c ed4fe222718a4497 9bb8b247
 b826509beb913abd 021a95efb2428e47 4705b82b
-ba57f3dd0e35591c 30ab50e715dce218  # a character's second-form trigger: the body PS in that state
+12024730d153ee73 30ab50e715dce218  # a character's second-form trigger: the body PS in that state (game 3.8; was ba57f3dd0e35591c)
 bbc26190cc602dcd e04f4df80ee6b0ab 4705b82b
 c1a7f1fec51b482f 7a8396180d416117  # ShapeKeyMultiplierCS
 c25a524f85c96991 988584455271f23c 4705b82b
@@ -42,3 +42,22 @@ ebdf841d5bee27e2 f8c96a270bf847dd 4705b82b
 ef83c8375370ab33 44dd4e301b7419f1 4705b82b
 f8ec8c027ed14424 a9bb5ca5cb1eed12  # a team-screen UI PS that reads its background at t3
 fa77531d20592b16 1415ac69b4f9f64f 4705b82b
+21d7ac2f65b68e7a a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+22dc88df42e703e7 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+2d66bc51a519f387 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+2fae9a2afa0d02be a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+36118a4ac771e820 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+491348905efb8c6e a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+55113c4cade48902 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+58b0996a3e115b88 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+619e871148c0b354 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+6e39485d831f3ecd a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+81ff3eab85997d99 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+96deb25eef3e0e19 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+b3160574d7dc05ef a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+be6164a31a213cdc a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+c3785b119458f608 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+dab4964c78a19d4b a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+e34699d7161dfe64 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+eaaca655056002d6 a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11
+eb9733e0e9ef377a a4a939baec7ca47d 79d7f632  # a character G-buffer VS, paired by a live alias test (textures right), not against DX11

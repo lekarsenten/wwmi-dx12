@@ -28,7 +28,9 @@ public:
     using Records = std::unordered_map<uint32_t, Rec>;
 
     void Init(const std::wstring& cache_dir = std::wstring());
-    void TargetsReady(bool (*is_target)(uint32_t hash, void* user), void* user);
+    // A look-alike link stays while its target is a rule or a hash a section names.
+    void TargetsReady(
+        bool (*is_target)(uint32_t hash, void* user), bool (*is_named)(uint32_t hash, void* user), void* user);
     void OnExit();
     void FlushIfQuiet(unsigned quiet_ms);
     void SetResemblance(bool on);
@@ -74,7 +76,7 @@ private:
     std::wstring CachePath() const;
     bool WriteRecords(const std::wstring& path, bool (*keep)(const Link& k, void* user), void* user);
     void RewriteCache();
-    void ImportSeed(const std::wstring& path, const wchar_t* name);
+    void ImportSeed(const std::wstring& path);
     void LoadAll();
     // learning
     void Proven(uint32_t low);
@@ -95,6 +97,7 @@ private:
     std::wstring cache_dir_; // OURS, outside the mod tree -- the only place we read or write
     std::vector<std::pair<std::wstring, std::wstring>>
         imported_; // seed taken -> its DISABLED_ name, after the next write
+    std::wstring shipped_taken_; // texture_matches\lods.lodcache taken; marked so after the next write
     Records records_; // low -> every target it belongs to
     std::unordered_map<uint32_t, uint32_t> refuted_;
     std::set<uint32_t> degenerate_; // identical to the mips of two targets or more: never swapped

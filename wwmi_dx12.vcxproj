@@ -134,12 +134,15 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\textures\tex_readback.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_lineage.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_look_worker.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_dhash.cpp" />
+    <ClCompile Include="reshade_addon\textures\tex_dhash_table.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_hooks.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_lod_table.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_lod_file.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_lod_learn.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_look_ssim.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_look_index.cpp" />
+    <ClCompile Include="reshade_addon\textures\shipped_matches.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\pso_clone.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\pso_variant.cpp" />
     <ClCompile Include="reshade_addon\rabbitfx\rfx_patch.cpp" />
@@ -157,6 +160,7 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\instrumentation\gpu_timer.cpp" />
     <ClCompile Include="reshade_addon\instrumentation\perf_monitor.cpp" />
     <ClCompile Include="reshade_addon\textures\tex_crawl.cpp" />
+    <ClCompile Include="reshade_addon\hud\outline_hide.cpp" />
     <ClCompile Include="reshade_addon\hud\uid_hide.cpp" />
     <ClCompile Include="reshade_addon\mods\component_table.cpp" />
     <ClCompile Include="reshade_addon\mods\game_cb_reader.cpp" />
@@ -169,6 +173,7 @@ exit /b 0</Command>
     <ClCompile Include="reshade_addon\shapekeys\sk_resolve.cpp" />
     <ClCompile Include="reshade_addon\shapekeys\sk_queue.cpp" />
     <ClCompile Include="reshade_addon\shapekeys\sk_store.cpp" />
+    <ClCompile Include="reshade_addon\shapekeys\sk_batch_fix.cpp" />
     <ClCompile Include="reshade_addon\shapekeys\sk_replay.cpp" />
     <ClCompile Include="reshade_addon\shapekeys\sk_submit_order.cpp" />
     <ClCompile Include="reshade_addon\mods\wwmi_mod.cpp" />

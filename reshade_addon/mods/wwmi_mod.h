@@ -50,7 +50,6 @@ struct Mod {
     std::wstring forward_map_file;
     int object_guid = 0;
     uint32_t mesh_vertex_count = 0;
-    bool queries_ps_slots = false;
 };
 
 struct NsEntries {

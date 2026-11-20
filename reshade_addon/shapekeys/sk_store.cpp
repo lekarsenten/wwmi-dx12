@@ -235,6 +235,28 @@ bool ShapekeyStore::GetSnap(const std::wstring& ns, ID3D12Resource* inst, unsign
     return true;
 }
 
+void ShapekeyStore::SetGameBatch(
+    const std::wstring& ns, ID3D12Resource* inst, unsigned long long cs, unsigned tgy, const GameBatch& b)
+{
+    std::lock_guard<std::mutex> lk(mutex_);
+    SkNsState* e = EmplaceLocked(ns, inst);
+    if (e) e->batch[cs][tgy] = b;
+}
+
+bool ShapekeyStore::GetGameBatch(
+    const std::wstring& ns, ID3D12Resource* inst, unsigned long long cs, unsigned tgy, GameBatch* out)
+{
+    std::lock_guard<std::mutex> lk(mutex_);
+    SkNsState* e = FindLocked(ns, inst);
+    if (!e) return false;
+    auto ci = e->batch.find(cs);
+    if (ci == e->batch.end()) return false;
+    auto it = ci->second.find(tgy);
+    if (it == ci->second.end()) return false;
+    *out = it->second;
+    return true;
+}
+
 void ShapekeyStore::SnapshotCb0(reshade::api::command_list* cmd_list, const std::wstring& ns, ID3D12Resource* inst,
     ID3D12Resource* src, uint64_t va, unsigned size, unsigned long long cs_hash, unsigned tgy)
 {

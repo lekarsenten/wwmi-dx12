@@ -32,6 +32,14 @@ public:
     void NoteCharacterDraw(uint64_t pso);
     // Its input layout reads vertex stream 6, a character mesh's; lock-free.
     bool ReadsStream6(uint64_t pso);
+    // It draws a character's outline (OutlineHide), lock-free; SetOutline marks it, when its pixel shader is still
+    // `ps_hash`.
+    bool IsOutline(uint64_t pso);
+    void SetOutline(uint64_t pso, uint64_t ps_hash);
+    // A6: the pipeline bound in an outline pipeline's place (OutlineHide::QueueStandIn), lock-free; 0 = none (yet),
+    // or it could not be built. The first ask queues the build.
+    uint64_t OutlineStandIn(reshade::api::device* dev, uint64_t pso);
+    void SetOutlineStandIn(uint64_t pso, uint64_t stand_in);
     // The PSO's UID-cut variant for a back buffer of `target` (UidHide::Target), lock-free; 0 = none (yet), or the
     // PSO does not draw UI text. The first ask for a target queues the build.
     uint64_t UidVariant(reshade::api::device* dev, uint64_t pso, uint32_t target);
@@ -48,9 +56,10 @@ public:
     bool CullMode(uint64_t pso, reshade::api::cull_mode* out);
     PipelineHookStats TakeStats();
 
-    // The creation hooks' work: the PSO's shaders registered and read, its record made; and unmade.
+    // The creation hooks' work: the PSO's shaders registered and read, its record made; and unmade. A pipeline the
+    // add-on builds in the place of `stand_in_for` is registered under that pipeline's vertex shader hash.
     void Register(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count,
-        const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline);
+        const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline, uint64_t stand_in_for = 0);
     void Forget(reshade::api::device* device, reshade::api::pipeline pipeline);
 
 private:
@@ -67,6 +76,8 @@ private:
         std::atomic<bool> chr{ false }; // its PS was seen on a character draw, as of character-shader generation chrg
         std::atomic<uint32_t> chrg{ 0 };
         std::atomic<bool> vb6{ false }; // its input layout reads vertex stream 6
+        std::atomic<bool> outline{ false }; // it draws a character's outline
+        std::atomic<uint64_t> stand_in{ 0 }; // as dc, the pipeline bound in an outline pipeline's place
     };
     struct Tab {
         uint32_t cap;

@@ -21,6 +21,8 @@ uint32_t TexIdentityHash(uint32_t data_hash, uint32_t w, uint32_t h, uint32_t mi
 // D15: a degenerate LOD low written as a .dds under the dump folder, once per hash.
 void DumpIfDegenerate(
     uint32_t hash, const std::vector<uint8_t>& tight, const TexAssetLayout& L, uint32_t fmt, uint32_t sub, uint32_t of);
+// One mip as a .dds a viewer opens (typeless formats written as UNORM); false if the file cannot be written.
+bool TexWriteDds(const wchar_t* path, const std::vector<uint8_t>& tight, const TexAssetLayout& L, uint32_t fmt);
 
 // A texture's identity from its mip0 as it uploads: the 3dmigoto hash, into the identity table, with everything
 // that follows from knowing it (lineage edges parked on it, its held mips, the look-alike search).

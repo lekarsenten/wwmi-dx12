@@ -23,6 +23,9 @@ engine with the game in **DirectX 12**, on the WWMI folder and mods you already 
   all draw, as on DX11
 - **UI mods** - loading screens, team-screen backgrounds and portraits, skills-tab art, icons, cards and
   menus, with their hotkeys, timers and screen flags
+- **Texture filters** - mods made with WWMI 1.2.2's texture method, which pick the game's textures by how
+  they look (`[Filter]` sections with `match_dhash`), get their textures as on DX11 (window option, on by
+  default)
 - **Mods made for DX11 shaders** - mods that name the game's DX11 pixel shaders work for the characters
   the built-in shader list covers; a `wwmi_dx12\pairs\*.shaderpairs` file adds more
 - **Copies of a character** - two copies of one modded character at once (an idle pose, an ult's clone) each
@@ -116,13 +119,17 @@ with a `wwmi-dx12` window showing "Active mods" above 0.
 | Debug log / level | writes `<Win64>\wwmi_dx12_addon.log`; off by default, saved to `wwmi_dx12.ini` |
 | Decensor | saved to `wwmi_dx12.ini` |
 | Hide UID | hides your player number (bottom right, Esc menu, Friends list); off by default, saved to `wwmi_dx12.ini` |
+| Hide character outlines | the game's outline around characters, modded ones too, not drawn; off by default, saved to `wwmi_dx12.ini` |
 | Load mod textures in the background | on (default): no stutter, textures pop in a moment later. Off: textures from the first frame, after a short pause |
 | Mod texture budget | Auto (default): mod textures stay within the video memory the game leaves free; when it runs short, those not on screen go to a lower size, then out, and come back when shown again. A size (1024, 512, 256 or 128 MB) also caps each mod, for cards with little video memory. Original never changes a texture. Saved to `wwmi_dx12.ini` |
 | Mod textures follow the game's distance sizes | experimental, off by default: where the game draws a character's own texture at a lower size, as it does further from the camera, the mod's texture goes down as many sizes, and back up with the game's. Saves video memory. Needs Auto or a size above. Saved to `wwmi_dx12.ini` |
 | Use look-alike texture matches | on by default (see Texture matches); saved to `wwmi_dx12.ini` |
 | Use texture match cache | on by default; off: no texture matches are learned, read or saved (see Texture matches) |
 | Mod buffers in video memory | on by default (faster); saved to `wwmi_dx12.ini` |
-| Clear caches at next launch | rebuilds saved shader patches and texture matches; try it if mods look wrong after an update |
+| Shape keys of mods made on DX11: use this game's batch sizes | on by default: faces of mods with batched shape keys (eyes, mouth, expressions) move as on DX11; off: the numbers in the mod's ini. Saved to `wwmi_dx12.ini` |
+| Mods that pick the game's textures by how they look | on by default: mods made with WWMI 1.2.2's texture filters get their textures; off: those mods keep the game's textures. Saved to `wwmi_dx12.ini` |
+| Clear caches at next launch | rebuilds saved shader patches and the texture matches learned in play; the shipped matches are taken in again. Try it if mods look wrong after an update |
+| Reload mods (F10) | reads every mod's ini again, after adding or changing a mod |
 | Performance monitor | what the add-on costs in processor and graphics card time, live |
 | Save a 10-second performance report | writes `<Win64>\wwmi_dx12_perf_<date>_<time>.txt`; send it with a slowdown report |
 
@@ -140,8 +147,8 @@ to the one the mod was made for:
   a texture drawn in the same place is matched to it.
 
 Matches are kept in `<Win64>\wwmi_dx12\cache` (`lod_tex_cache.lodcache`, `tex_look.bin`). The package
-brings seeds of what was already learned (`wwmi_dx12\cache\seed-<version>.lodcache` and
-`seed-<version>.texlook`), taken in at the first start like a shared file.
+brings what was already learned in `<Win64>\wwmi_dx12\texture_matches` (`lods.lodcache` and
+`looks.texlook`), taken in at the first start and again after **Clear caches at next launch**.
 
 - **Sharing** - any other `.lodcache` file put in that folder is taken in at the next start, then renamed
   `DISABLED_<date>_<name>`. Only proven matches are taken; where one disagrees with yours, yours stays, or

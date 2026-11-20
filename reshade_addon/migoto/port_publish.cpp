@@ -15,6 +15,8 @@
 #include "../core/log.h"
 #include "../core/buffer_view_fit.h"
 
+#include <atomic>
+#include <intrin.h>
 #include <map>
 #include <mutex>
 #include <string>
@@ -106,6 +108,27 @@ void RegisterGameBuffer(MigotoPort::WrapBuffer* w, unsigned hash)
     info.hash = hash;
     info.orig_hash = hash;
 }
+std::atomic<unsigned> g_call_serial{ 0 };
+thread_local unsigned t_call_number = 0;
+TextureDHashFn g_texture_dhash = nullptr;
+TextureDHashMipsFn g_texture_dhash_mips = nullptr;
+enum class FilterHistory : int { NotParsed, NeverLoaded, Loaded };
+std::atomic<FilterHistory> g_filter_history{ FilterHistory::NotParsed };
+bool g_filters_loaded = false;
+
+void TrackDHashMips(ResourceHandleInfo& info, ID3D12Resource* res)
+{
+    const UINT mips = info.desc2D.MipLevels ? info.desc2D.MipLevels : 1;
+    info.InitializeSubresourceTracking(mips, 1, false);
+    info.dhash = 0;
+    info.dhash_generation = 0;
+    if (!g_texture_dhash_mips || !res || info.desc2D.ArraySize != 1) return;
+    info.resource_generation = 1;
+    const unsigned known = g_texture_dhash_mips(res);
+    for (UINT m = 0; m < mips && m < 32; ++m)
+        if ((known >> m) & 1u) info.subresource_generations[m] = 1;
+}
+
 void RegisterGameTexture2D(MigotoPort::WrapTexture2D* w, unsigned content_hash)
 {
     ResourceHandleInfo& info = G->mResources[(ID3D11Resource*)w];
@@ -568,6 +591,7 @@ int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned con
     v->desc.Format = view_format ? (DXGI_FORMAT)view_format : EnsureNotTypeless(w->desc.Format);
     v->desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     v->desc.Texture2D.MipLevels = w->desc.MipLevels;
+    if (res && g_filters_loaded) TrackDHashMips(G->mResources[(ID3D11Resource*)w], res);
 
     ResourceCopyTarget tgt;
     tgt.type = ResourceCopyTargetType::SHADER_RESOURCE;
@@ -575,6 +599,67 @@ int PushGameTexture(char stage, unsigned slot, ID3D12Resource* res, unsigned con
     tgt.slot = slot;
     SetViaTarget(tgt, res ? (ID3D11Resource*)w : nullptr, res ? (ID3D11View*)v : nullptr);
     return result;
+}
+
+void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool known)
+{
+    if (!ini_hash) return;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return;
+    ShaderBindings& b = G->mShaderBindingsCache.try_emplace(ini_hash).first->second;
+    if (!known) {
+        lo = (1ull << 9) - 1;
+        hi = 0;
+    }
+    const uint64_t halves[2] = { lo, hi };
+    for (uint32_t k = 0; k < 2; ++k)
+        for (uint64_t left = halves[k]; left; left &= left - 1) {
+            unsigned long bit = 0;
+            _BitScanForward64(&bit, left);
+            ShaderResource& slot = b.resources[k * 64 + bit];
+            if (slot.type != ShaderResourceType::NONE) continue;
+            slot.type = ShaderResourceType::TYPED;
+            slot.dimension = D3D_SRV_DIMENSION_TEXTURE2D;
+            b.resource_slots.include(k * 64 + bit);
+        }
+}
+
+void NextDrawCall()
+{
+    t_call_number = g_call_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+unsigned CallNumber()
+{
+    return t_call_number;
+}
+
+void SetTextureDHash(TextureDHashFn fn, TextureDHashMipsFn mips)
+{
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    g_texture_dhash = fn;
+    g_texture_dhash_mips = mips;
+}
+
+void FiltersParsed()
+{
+    g_filters_loaded = false;
+    for (const auto& kv : resourceFilters)
+        if (!kv.second.is_empty) g_filters_loaded = true;
+    if (g_filters_loaded)
+        g_filter_history.store(FilterHistory::Loaded, std::memory_order_release);
+    else if (g_filter_history.load(std::memory_order_acquire) == FilterHistory::NotParsed)
+        g_filter_history.store(FilterHistory::NeverLoaded, std::memory_order_release);
+}
+
+bool TextureDHashesWanted()
+{
+    return g_filter_history.load(std::memory_order_acquire) != FilterHistory::NeverLoaded;
+}
+
+bool TextureDHash(ID3D12Resource* res, unsigned mip, unsigned view_format, uint64_t* out)
+{
+    return g_texture_dhash && res && g_texture_dhash(res, mip, view_format, out);
 }
 
 void UnpushGameTexture(char stage, unsigned slot)

@@ -105,7 +105,6 @@ void ModRegistry::Build()
             }
             if (gm.mod.dir.empty()) gm.mod.dir = dm.dir; // only if their SectionFolder had none
             WwmiMod::LoadResources(gm.mod, CurrentSet().held);
-            if (gm.mod.queries_ps_slots) ps_slot_queries_.store(true, std::memory_order_relaxed);
             if (!gm.mod.forward_map_file.empty()) {
                 std::wstring rel = gm.mod.forward_map_file;
                 for (auto& c : rel)

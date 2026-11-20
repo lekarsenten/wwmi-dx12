@@ -13,12 +13,14 @@
 #include <array>
 #include <chrono>
 #include <climits>
+#include <cstdio>
 #include <map>
 
 TexGc g_tex_gc;
 
 namespace {
 constexpr uint64_t kMb = 1ull << 20;
+constexpr uint64_t kGb = 1ull << 30;
 constexpr uint64_t kSampleMs = 250;
 constexpr uint64_t kGameWindowMs = 10000;
 constexpr uint64_t kRunGapMs = 250; // on screen: drawn this recently; a run of draws survives a gap this long
@@ -37,6 +39,16 @@ constexpr uint64_t kMaxRaiseBytes = 256 * kMb;
 double Mb(uint64_t b)
 {
     return (double)b / (double)kMb;
+}
+long long Tenths(uint64_t b)
+{
+    return (long long)((b * 10 + kGb / 2) / kGb);
+}
+std::string Gb(long long tenths)
+{
+    char s[32];
+    std::snprintf(s, sizeof(s), "%lld.%lld", tenths / 10, tenths % 10);
+    return s;
 }
 unsigned DrawnDown(
     int index, uint64_t since) // A20: how many mips down the game drew its own at its sharpest since then
@@ -104,6 +116,19 @@ void TexGc::Stop()
     mips_ = false;
 }
 
+void TexGc::Lines(const Reading& r, std::string& budget_line, std::string& parts_line)
+{
+    const long long budget = Tenths(r.budget);
+    const long long game = Tenths(r.game_now);
+    const long long mods = Tenths(r.mods);
+    const long long headroom = Tenths(r.headroom);
+    const long long vacant = budget - game - mods - headroom;
+    budget_line = r.card ? Gb(Tenths(r.card)) + " card; " : "";
+    budget_line += Gb(budget) + " total budget; ";
+    budget_line += vacant >= 0 ? Gb(vacant) + " vacant" : Gb(-vacant) + " over the headroom";
+    parts_line = "game and add-ons " + Gb(game) + " + mod textures " + Gb(mods) + " + headroom " + Gb(headroom);
+}
+
 void TexGc::Sample(uint64_t now, bool loading)
 {
     next_sample_ms_ = now + kSampleMs;
@@ -131,19 +156,22 @@ void TexGc::Sample(uint64_t now, bool loading)
         reading_.room = reading_.available > band ? reading_.available - band : 0;
         const uint64_t calm = budget > game + margin ? budget - game - margin : 0;
         reading_.raise_room = calm > band ? calm - band : 0;
+        reading_.headroom = margin + band;
+        reading_.card = v.card;
     }
     const bool was = tight_;
     tight_ = reading_.valid && (mods > reading_.available || (tight_ && mods > reading_.room));
     if (tight_ && !was) tight_ms_ = now;
-    if (reading_.valid && (first || tight_ != was))
-        logger::write(
-            "TEXGC: video memory %s -- budget %.0f MB, in use %.0f MB, the game's %.0f MB now and %.0f MB at most "
-            "over the last 10 s, mod textures %.0f of %.0f MB allowed (short above %.0f MB)",
+    if (reading_.valid && (first || tight_ != was)) {
+        std::string budget_line;
+        std::string parts_line;
+        Lines(reading_, budget_line, parts_line);
+        logger::write("TEXGC: VRAM %s, GiB -- %s; %s; the game and add-ons at most %.1f over the last 10 s",
             first        ? "at start"
                 : tight_ ? "short"
                          : "enough again",
-            Mb(reading_.budget), Mb(reading_.used), Mb(reading_.game_now), Mb(reading_.game), Mb(mods),
-            Mb(reading_.room), Mb(reading_.available));
+            budget_line.c_str(), parts_line.c_str(), (double)reading_.game / (double)kGb);
+    }
 
     raise_ready_ = false;
     far_due_ = g_settings.tex_distance && decided_loads_ != g_tex_defer.Loaded() && now >= collect_ms_ + kFarMs;

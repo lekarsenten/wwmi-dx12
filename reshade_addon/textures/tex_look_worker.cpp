@@ -60,7 +60,8 @@ void TexLookWorker::Queue(ID3D12Resource* dest, uint32_t crc, uint32_t w, uint32
         std::lock_guard l(mtx_);
         if (stop_) return;
     }
-    TexLookCut cut = TexLookCutOf(bc.data(), bc.size(), w, h, fmt); // the patches' blocks queued, not the whole mip
+    TexLookCut cut = TexLookCutOf(bc.data(), bc.size(), w, h, fmt,
+        g_tex_look.SpotsFor(crc, w, h, fmt, is_target)); // the patches' blocks queued, not the whole mip
     if (cut.blocks.empty()) return;
     {
         std::lock_guard l(mtx_);

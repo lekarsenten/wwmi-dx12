@@ -9,6 +9,7 @@ struct VramReading {
     uint64_t used = 0; // ... and what the process uses, game and add-on together
     uint64_t shared_budget = 0; // NON_LOCAL
     uint64_t shared_used = 0;
+    uint64_t card = 0; // the adapter's own memory
 };
 
 // The process's video memory, as Windows accounts it. Present thread.
@@ -24,5 +25,6 @@ private:
     ID3D12Device* for_ = nullptr;
     void* event_ = nullptr;
     unsigned long cookie_ = 0;
+    uint64_t card_ = 0;
 };
 extern VramMeter g_vram;

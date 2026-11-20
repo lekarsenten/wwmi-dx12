@@ -23,6 +23,8 @@ public:
     void NoteMeshPlaces(const DrawArgs& da);
     // A21: the textures a game character draw reads, while a reference take collects them.
     WWMI_DEBUG_FN void NoteRefTextures(const DrawArgs& da) WWMI_DEBUG_BODY();
+    // A21: the textures any draw reads that a section names, indexed or not.
+    WWMI_DEBUG_FN void NoteNamedRefTextures(reshade::api::command_list* cmd_list) WWMI_DEBUG_BODY();
     // The draw's textures published for the section; the registers pushed, as a mask.
     uint16_t Publish(reshade::api::command_list* cmd_list, int dm, int comp, uint32_t rtv_count);
 

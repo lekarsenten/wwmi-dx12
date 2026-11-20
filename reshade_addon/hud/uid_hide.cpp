@@ -24,6 +24,8 @@ constexpr UidPlace kPlaces[] = {
     { true, true, 270.72f, 22.68f, { 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f } },
     { false, false, 672.f, 432.f, { 0.792f, 0.698f, -kBig }, { 0.793f, 0.699f, kBig } },
     { false, true, 585.6f, 108.f, { 0.9097f, 0.9097f, 0.9097f }, { 0.9099f, 0.9099f, 0.9099f } },
+    { false, true, 576.f, 23.76f, { 0.9999f, 0.9999f, 0.9999f }, { kBig, kBig, kBig } },
+    { false, true, 576.f, 23.76f, { 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f } },
 };
 
 const char* const kTextInputs[] = { "COLOR0", "SV_IsFrontFace0", "SV_Position0", "TEXCOORD0", "TEXCOORD10_centroid0",

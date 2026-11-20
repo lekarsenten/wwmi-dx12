@@ -16,6 +16,7 @@ struct ShapekeyToggles {
     bool publish_cs_u0 = true;
     bool publish_shader_state = true;
     bool shader_hash_alias = true;
+    bool game_batches = true; // A22: a mod's DX11 batch numbers answered with the game's (sk_batch_fix.h)
 };
 extern ShapekeyToggles g_sk_toggles;
 

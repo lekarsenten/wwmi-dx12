@@ -9,6 +9,7 @@
 #include "../addon/settings.h"
 #include "../textures/tex_toggles.h"
 #include "../migoto/port_toggles.h"
+#include "../shapekeys/sk_toggles.h"
 #include "../textures/tex_gc.h"
 #include "../textures/mod_texture_store.h"
 #include "../mods/mod_registry.h"
@@ -434,12 +435,12 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
 
     std::fprintf(f, "MEMORY              now          at the start   highest while measured\n");
     const PerfMemory& m0 = r.mem_start;
-    std::fprintf(f, "  Video memory     %6.2f GB    %6.2f GB      %6.2f GB    of %.2f GB available (%.0f%%)\n",
+    std::fprintf(f, "  Video memory     %6.2f GiB   %6.2f GiB     %6.2f GiB   of %.2f GiB available (%.0f%%)\n",
         mem_.vram_used / kGB, r.have_mem_start ? m0.vram_used / kGB : 0.0, mem_peak_.vram_used / kGB,
         mem_.vram_budget / kGB, mem_.vram_budget ? 100.0 * (double)mem_.vram_used / (double)mem_.vram_budget : 0.0);
-    std::fprintf(f, "  Shared memory    %6.2f GB    %6.2f GB      %6.2f GB    system memory the graphics card uses\n",
+    std::fprintf(f, "  Shared memory    %6.2f GiB   %6.2f GiB     %6.2f GiB   system memory the graphics card uses\n",
         mem_.shared_used / kGB, r.have_mem_start ? m0.shared_used / kGB : 0.0, mem_peak_.shared_used / kGB);
-    std::fprintf(f, "  Game memory      %6.2f GB    %6.2f GB      %6.2f GB    in use %.2f GB\n",
+    std::fprintf(f, "  Game memory      %6.2f GiB   %6.2f GiB     %6.2f GiB   in use %.2f GiB\n",
         mem_.game_private / kGB, r.have_mem_start ? m0.game_private / kGB : 0.0, mem_peak_.game_private / kGB,
         mem_.game_working_set / kGB);
     std::fprintf(f, "\n");
@@ -450,19 +451,24 @@ void PerfMonitor::WriteReport(FILE* f, double seconds) const
     std::fprintf(f, "  A2 Debug log: %s\n", OnOff(r.debug_was));
     std::fprintf(f, "  A4 Decensor: %s\n", OnOff(g_settings.decensor));
     std::fprintf(f, "  A5 Hide UID: %s\n", OnOff(g_settings.hide_uid));
+    std::fprintf(f, "  A6 Hide character outlines: %s\n", OnOff(g_settings.hide_char_outlines));
     std::fprintf(f, "  A12 Mod textures in the background: %s\n", OnOff(g_settings.tex_deferred));
     std::fprintf(f, "  A13 Look-alike texture matches: %s\n", OnOff(g_settings.texlod_resemblance));
     std::fprintf(f, "  A14 Texture match cache: %s\n", OnOff(g_settings.texlod_cache));
     std::fprintf(f, "  A16 Mod buffers in video memory: %s\n", OnOff(MigotoPort::g_buffers_in_vram));
     std::fprintf(f, "  A19 Mod texture budget: %s\n", TexBudgetName(g_settings.tex_mod_budget));
     std::fprintf(f, "  A20 Mod textures follow the game's distance sizes: %s\n", OnOff(g_settings.tex_distance));
+    std::fprintf(f, "  A22 Shape keys, this game's batch sizes: %s\n", OnOff(g_sk_toggles.game_batches));
+    std::fprintf(f, "  A23 Texture filters: %s\n", OnOff(g_tex_toggles.dhash_filters));
     {
         const TexGc::Reading& vr = g_tex_gc.Now();
-        if (vr.valid)
-            std::fprintf(f,
-                "      video memory %.0f of %.0f MB in use, the game's %.0f MB, mod textures %.0f of %.0f MB allowed%s\n",
-                (double)vr.used / 1048576.0, (double)vr.budget / 1048576.0, (double)vr.game_now / 1048576.0,
-                (double)vr.mods / 1048576.0, (double)vr.room / 1048576.0, g_tex_gc.Tight() ? " (short)" : "");
+        if (vr.valid) {
+            std::string budget_line;
+            std::string parts_line;
+            TexGc::Lines(vr, budget_line, parts_line);
+            std::fprintf(f, "      VRAM, GiB: %s; %s%s\n", budget_line.c_str(), parts_line.c_str(),
+                g_tex_gc.Tight() ? " (short)" : "");
+        }
     }
     std::fprintf(f, "\n");
 

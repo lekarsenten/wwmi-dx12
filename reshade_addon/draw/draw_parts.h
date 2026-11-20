@@ -12,10 +12,12 @@
 struct ResInfo;
 namespace PortApi {
 class DrawListScope;
+class EngineScope;
 }
 
-// [ShaderOverride*] by VS / PS / GS hash, and the post lists; true = the ini's handling=skip (draw_claim.cpp).
-bool RunDrawShaderOverrides(const DrawArgs& da);
+// [ShaderOverride*] by VS / PS / GS hash, and the post lists; true = the ini's handling=skip (draw_claim.cpp). A
+// matched override takes the engine lock into `hold`: the caller keeps it through the draw's section and post lists.
+bool RunDrawShaderOverrides(const DrawArgs& da, std::optional<PortApi::EngineScope>& hold);
 // A small unskinned draw whose vertex buffer hashes to a variable-only section runs it, as DX11's
 // `checktextureoverride = vb0` would; true = the section skips the draw (draw_claim.cpp).
 bool RunSmallMeshOverrides(const DrawArgs& da);

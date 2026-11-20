@@ -57,6 +57,10 @@ static void PublishDrawShaders(reshade::api::command_list* cmd_list, uint64_t vs
     const uint64_t ps = AliasShaderHash(ps_hash);
     PortApi::SetBoundShader('v', AliasShaderHash(vs_hash));
     PortApi::SetBoundShader('p', ps);
+    {
+        const DxilSrvRegs pr = g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p');
+        PortApi::SetPixelShaderTextures(ps, pr.lo, pr.hi, pr.parsed && !pr.unbounded);
+    }
     if (!g_rfx_toggles.patch || !ps || PortApi::ShaderRegexLinked(ps) ||
         !PortApi::ShaderRegexGroupLoaded(kRfxNamespace, kRfxRegexGroup))
         return;

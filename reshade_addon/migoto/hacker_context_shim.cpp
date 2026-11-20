@@ -4,7 +4,11 @@
 #include "HackerInputLayout.h"
 #include "dx12_input_layout.h"
 #include "dx12_pipeline.h"
+#include "dx12_wrap.h"
+#include "port_api_internal.h"
 #include "../core/log.h"
+#include <set>
+#include <utility>
 
 void HackerContext::Bind3DMigotoResources()
 {
@@ -20,6 +24,32 @@ void HackerContext::Bind3DMigotoResources()
     ctx->PSSetShaderResources(slot, 1, &srv);
     ctx->CSSetShaderResources(slot, 1, &srv);
     logger::write("PORT: IniParams bound at t%u on all six stages (view %p)", slot, (void*)srv);
+}
+
+unsigned HackerContext::GetCallNumber() const
+{
+    return PortApi::CallNumber();
+}
+
+InitialTexturesSnapshot& HackerContext::GetInitialTexturesSnapshot()
+{
+    static InitialTexturesSnapshot* snapshot = new InitialTexturesSnapshot();
+    return *snapshot;
+}
+
+HRESULT HackerContext::ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash)
+{
+    outHash = 0;
+    MigotoPort::WrapResource* w = MigotoPort::AsWrapResource(texture);
+    if (!w || !w->dx12) return E_INVALIDARG;
+    const bool known = PortApi::TextureDHash(w->dx12, mipLevel, (unsigned)srvFormat, &outHash);
+#ifdef WWMI_DEBUG
+    static std::set<std::pair<ID3D12Resource*, uint64_t>> seen;
+    if (seen.insert({ w->dx12, outHash }).second)
+        logger::report("A23 FILTER: dHash of res=%p mip %u view fmt %u asked by a [Filter]: %016llx%s", (void*)w->dx12,
+            mipLevel, (unsigned)srvFormat, (unsigned long long)outHash, known ? "" : " (none kept)");
+#endif
+    return known ? S_OK : E_FAIL;
 }
 
 void HackerContext::InitIniParams()

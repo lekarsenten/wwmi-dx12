@@ -114,6 +114,8 @@ public:
     bool relevant = false; // the typed observer hears of it at all
     bool cached_ok = false; // `cached` stands; else classified per run with the state
     const float* sel_var = nullptr;
+    float* assign_var = nullptr; // the variable an assignment the assign hook tags writes
+    int assign_tag = -1;
     bool sel_always = false;
     bool sel_watched = false;
     unsigned sel_watch_gen = 0;
@@ -133,10 +135,13 @@ public:
         is_if = dynamic_cast<IfCommand*>(ic) != nullptr;
         is_run = dynamic_cast<RunExplicitCommandList*>(ic) != nullptr;
         if (VariableAssignment* va = dynamic_cast<VariableAssignment*>(ic)) {
-            if (va->var)
+            if (va->var) {
                 sel_var = &va->var->fval;
-            else
+                assign_tag = g_command_observer.AssignTag(va->var->name);
+                if (assign_tag >= 0) assign_var = &va->var->fval;
+            } else {
                 sel_always = true;
+            }
         } else if (StoreCommand* sc = dynamic_cast<StoreCommand*>(ic)) {
             if (sc->var)
                 sel_var = &sc->var->fval;
@@ -265,6 +270,22 @@ void CommandObserver::SetRunExplicitHook(bool (*fn)(CommandListCommand*, ::Comma
 bool CommandObserver::RunExplicit(CommandListCommand* inner, ::CommandListState* state)
 {
     return run_explicit_hook_ && run_explicit_hook_(inner, state);
+}
+
+void CommandObserver::SetAssignHook(int (*classify)(const std::wstring&), void (*assigned)(int, float*))
+{
+    assign_classify_ = classify;
+    assigned_ = assigned;
+}
+
+int CommandObserver::AssignTag(const std::wstring& name)
+{
+    return assign_classify_ ? assign_classify_(name) : -1;
+}
+
+void CommandObserver::Assigned(int tag, float* var)
+{
+    if (assigned_) assigned_(tag, var);
 }
 
 void CommandObserver::Wrap(CommandList* list)
@@ -433,6 +454,7 @@ void ObservedCommand::run(CommandListState* state)
         if (bound.resource) bound.resource->Release();
         if (bound.view) bound.view->Release();
     }
+    if (assign_var) g_command_observer.Assigned(assign_tag, assign_var);
     if (trace) t_trace = trace;
     t_cur_ini_line = outer;
     if (sel_always)

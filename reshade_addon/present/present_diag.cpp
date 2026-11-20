@@ -159,8 +159,8 @@ void PresentDiag::Heartbeat(uint32_t texinj_last)
                 GlobalMemoryStatusEx(&ms);
                 logger::report(
                     "PIPESTAT f=%u since the last: %llu pipeline(s) created, %.1f ms in our hook (slowest %.2f ms); "
-                    "%llu destroyed, %.1f ms | patch totals: %u patched, %u not, %u variant(s) | RAM free %.1f GB, "
-                    "commit %.1f of %.1f GB",
+                    "%llu destroyed, %.1f ms | patch totals: %u patched, %u not, %u variant(s) | RAM free %.1f GiB, "
+                    "commit %.1f of %.1f GiB",
                     g_frame_id, (unsigned long long)ph.created, ph.created_us / 1000.0, ph.created_max_us / 1000.0,
                     (unsigned long long)ph.destroyed, ph.destroyed_us / 1000.0, cs.ps_patched, cs.ps_failed,
                     cs.variants, ms.ullAvailPhys / 1073741824.0,

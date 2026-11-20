@@ -14,8 +14,8 @@
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\IbVbHash.cso" To="wwmi_dx12\IbVbHash.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\BufCopy.cso" To="wwmi_dx12\BufCopy.cso" />
     <WwmiPackageFile Include="$(WwmiRoot)shaders_cso\Bc7Half.cso" To="wwmi_dx12\Bc7Half.cso" />
-    <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.lodcache" To="wwmi_dx12\cache\seed-$(WwmiVersion).lodcache" />
-    <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.texlook" To="wwmi_dx12\cache\seed-$(WwmiVersion).texlook" />
+    <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.lodcache" To="wwmi_dx12\texture_matches\lods.lodcache" />
+    <WwmiPackageFile Include="$(WwmiRoot)package\wwmi_dx12_seed.texlook" To="wwmi_dx12\texture_matches\looks.texlook" />
     <WwmiPackageFile Include="$(WwmiRoot)LICENSE" To="wwmi_dx12\LICENSE" />
     <WwmiPackageFile Include="$(WwmiRoot)THIRD-PARTY-NOTICES.md" To="wwmi_dx12\THIRD-PARTY-NOTICES.md" />
     <WwmiPackageFile Include="$(WwmiRoot)third_party\3Dmigoto\COPYING.txt" To="wwmi_dx12\licenses\3Dmigoto-COPYING.txt" />

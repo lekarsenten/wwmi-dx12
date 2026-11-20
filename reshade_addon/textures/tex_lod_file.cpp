@@ -1,5 +1,6 @@
 // The LOD cache's file: read at load, seeds taken, written when quiet. See tex_lod.h.
 #include "tex_lod_internal.h"
+#include "shipped_matches.h"
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -251,9 +252,17 @@ void TexLodCache::RewriteCache()
                 seed.first.c_str(), GetLastError());
     }
     imported_.clear();
+    if (!shipped_taken_.empty()) {
+        if (g_shipped_matches.MarkTaken(cache_dir_, shipped_taken_))
+            logger::write("TexLod: %S is in the cache now", shipped_taken_.c_str());
+        else
+            logger::write("TexLod: %S is in the cache now, but cannot be marked so -- it is taken again next start",
+                shipped_taken_.c_str());
+        shipped_taken_.clear();
+    }
 }
 
-void TexLodCache::ImportSeed(const std::wstring& path, const wchar_t* name)
+void TexLodCache::ImportSeed(const std::wstring& path)
 {
     Records seed;
     std::set<uint32_t> seed_degen;
@@ -315,13 +324,6 @@ void TexLodCache::ImportSeed(const std::wstring& path, const wchar_t* name)
         degenerate_.insert(low);
         ++disagree;
     }
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t when[32];
-    swprintf_s(when, L"%04u%02u%02u-%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    imported_.erase(std::remove_if(imported_.begin(), imported_.end(), [&](const auto& f) { return f.first == path; }),
-        imported_.end());
-    imported_.emplace_back(path, cache_dir_ + L"\\DISABLED_" + when + L"_" + name);
     MarkDirty();
     logger::write("TexLod: seed %S -- %zu proven low(s): %zu new, %zu proved a look-alike, %zu gave a mip level, "
                   "%zu moved to the higher of one texture, %zu kept as we had them; degenerate: %zu from its list, "
@@ -358,9 +360,26 @@ void TexLodCache::LoadAll()
                 if (_wcsicmp(sf.cFileName, L"lod_tex_cache.lodcache") == 0 ||
                     _wcsnicmp(sf.cFileName, L"DISABLED_", 9) == 0)
                     continue;
-                ImportSeed(cache_dir_ + L"\\" + sf.cFileName, sf.cFileName);
+                const std::wstring path = cache_dir_ + L"\\" + sf.cFileName;
+                ImportSeed(path);
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                wchar_t when[32];
+                swprintf_s(when, L"%04u%02u%02u-%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                    st.wSecond);
+                imported_.erase(std::remove_if(imported_.begin(), imported_.end(),
+                                    [&](const auto& f) { return f.first == path; }),
+                    imported_.end());
+                imported_.emplace_back(path, cache_dir_ + L"\\DISABLED_" + when + L"_" + sf.cFileName);
             } while (FindNextFileW(hs, &sf));
             FindClose(hs);
+        }
+        if (shipped_taken_.empty()) {
+            const std::wstring shipped = g_shipped_matches.ToTake(cache_dir_, L"lods.lodcache", CachePath());
+            if (!shipped.empty()) {
+                ImportSeed(shipped);
+                shipped_taken_ = shipped;
+            }
         }
     }
     PublishDegenerate();

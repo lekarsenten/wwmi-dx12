@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <unordered_map>
 #include "rfx_dxil.h"
 
 namespace {
@@ -933,6 +935,234 @@ bool PatchText(Module& m, const RfxDxilSpec& spec, RfxDxilResult& out)
     return true;
 }
 
+// The disassembly of a DXIL container.
+bool DisassembleText(
+    IDxcLibrary* lib, IDxcCompiler* comp, const void* code, size_t size, std::string& text, std::string& why)
+{
+    Com<IDxcBlobEncoding> src;
+    if (FAILED(lib->CreateBlobWithEncodingOnHeapCopy(code, (UINT32)size, 0, &src))) {
+        why = "blob";
+        return false;
+    }
+    Com<IDxcBlobEncoding> dis;
+    if (FAILED(comp->Disassemble(src.p, &dis)) || !dis) {
+        why = "disassemble failed (not a DXIL container?)";
+        return false;
+    }
+    text = BlobText(dis.p);
+    return true;
+}
+
+// `text` assembled to a container, validated and signed.
+bool AssembleSigned(IDxcLibrary* lib, IDxcAssembler* as, IDxcValidator* val, const std::string& text,
+    std::vector<uint8_t>& code, std::string& why)
+{
+    Com<IDxcBlobEncoding> txt;
+    if (FAILED(lib->CreateBlobWithEncodingOnHeapCopy(text.data(), (UINT32)text.size(), CP_UTF8, &txt))) {
+        why = "blob";
+        return false;
+    }
+    Com<IDxcOperationResult> ar;
+    HRESULT st = E_FAIL;
+    if (FAILED(as->AssembleToContainer(txt.p, &ar)) || !ar || FAILED(ar->GetStatus(&st)) || FAILED(st)) {
+        why = "assemble: " + ErrText(ar.p);
+        return false;
+    }
+    Com<IDxcBlob> cont;
+    ar->GetResult(&cont);
+    if (!cont) {
+        why = "assemble: no container";
+        return false;
+    }
+    Com<IDxcOperationResult> vr;
+    HRESULT vst = E_FAIL;
+    if (FAILED(val->Validate(cont.p, DxcValidatorFlags_InPlaceEdit, &vr)) || !vr || FAILED(vr->GetStatus(&vst)) ||
+        FAILED(vst)) {
+        why = "validate: " + ErrText(vr.p);
+        return false;
+    }
+    code.assign(
+        (const uint8_t*)cont->GetBufferPointer(), (const uint8_t*)cont->GetBufferPointer() + cont->GetBufferSize());
+    return true;
+}
+
+// A signature element's id, by semantic name and the index of its first row; -1 when the list has none.
+long long SigElement(const Module& m, int list_node, const char* name, long long index)
+{
+    for (const auto& el_ref : Operands(m.Node(list_node))) {
+        const auto f = Operands(m.Node(NodeRef(el_ref)));
+        long long id = 0;
+        long long first = 0;
+        if (f.size() < 5 || f[1] != std::string("!\"") + name + "\"" || !IntOf(f[0], id)) continue;
+        const auto idx = Operands(m.Node(NodeRef(f[4])));
+        if (!idx.empty() && IntOf(idx[0], first) && first == index) return id;
+    }
+    return -1;
+}
+
+// Every `%name` a right-hand side reads.
+std::vector<std::string> ValueNames(const std::string& rhs)
+{
+    std::vector<std::string> out;
+    for (size_t i = rhs.find('%'); i != std::string::npos; i = rhs.find('%', i + 1)) {
+        size_t j = i + 1;
+        while (j < rhs.size() && (std::isalnum((unsigned char)rhs[j]) || rhs[j] == '_' || rhs[j] == '.')) ++j;
+        if (j > i + 1) out.push_back(rhs.substr(i, j - i));
+    }
+    return out;
+}
+
+struct IrValue {
+    size_t at; // where its right-hand side begins in the module text
+    std::string rhs;
+    std::vector<std::string> names;
+    std::vector<int> uses; // the definitions it reads, by index
+};
+
+// The outline's push: on the slices of SV_Position and VELOCITY_PREV_POS, the operand of every add that joins a value
+// reading the normal input (ATTRIBUTE2) to one reading the position input (ATTRIBUTE0) and not the normal becomes 0.
+bool ZeroOffset(Module& m, RfxDxilResult& out)
+{
+    std::string& why = out.why;
+    const size_t ep = m.t.find("\n!dx.entryPoints = !{!");
+    if (ep == std::string::npos) {
+        why = "no !dx.entryPoints";
+        return false;
+    }
+    const auto eops = Operands(m.Node(atoi(m.t.c_str() + ep + 22)));
+    const size_t at = eops.empty() ? std::string::npos : eops[0].find('@');
+    if (eops.size() < 3 || at == std::string::npos) {
+        why = "entry point names no function";
+        return false;
+    }
+    const std::string fn = eops[0].substr(at);
+    const auto sigs = Operands(m.Node(NodeRef(eops[2])));
+    if (sigs.size() < 2) {
+        why = "entry point has no signatures";
+        return false;
+    }
+    const long long normal = SigElement(m, NodeRef(sigs[0]), "ATTRIBUTE", 2);
+    const long long position = SigElement(m, NodeRef(sigs[0]), "ATTRIBUTE", 0);
+    const long long sv_pos = SigElement(m, NodeRef(sigs[1]), "SV_Position", 0);
+    const long long prev_pos = SigElement(m, NodeRef(sigs[1]), "VELOCITY_PREV_POS", 0);
+    if (normal < 0 || position < 0 || sv_pos < 0) {
+        why = "no ATTRIBUTE2 or ATTRIBUTE0 input, or no SV_Position output";
+        return false;
+    }
+    const size_t def = m.t.find("\ndefine void " + fn + "(");
+    const size_t body = def == std::string::npos ? def : m.t.find('\n', def + 1);
+    const size_t end = def == std::string::npos ? def : m.t.find("\n}\n", def);
+    if (body == std::string::npos || end == std::string::npos) {
+        why = "no body for " + fn;
+        return false;
+    }
+
+    std::vector<IrValue> vals;
+    std::unordered_map<std::string, int> index;
+    std::vector<std::pair<long long, std::string>> stores;
+    const std::string store = "@dx.op.storeOutput.f32(i32 5, i32 ";
+    for (size_t b = body + 1; b < end;) {
+        size_t e = m.t.find('\n', b);
+        if (e == std::string::npos || e > end) e = end;
+        const size_t s = m.t.find_first_not_of(' ', b);
+        const size_t eq = s < e && m.t[s] == '%' ? m.t.find(" = ", s) : std::string::npos;
+        const size_t call = s < e ? m.t.find(store, s) : std::string::npos;
+        if (eq != std::string::npos && eq < e) {
+            IrValue v;
+            v.at = eq + 3;
+            v.rhs = m.t.substr(v.at, e - v.at);
+            v.names = ValueNames(v.rhs);
+            index[m.t.substr(s, eq - s)] = (int)vals.size();
+            vals.push_back(std::move(v));
+        } else if (call != std::string::npos && call < e) {
+            unsigned element = 0;
+            unsigned comp = 0;
+            char value[64] = {};
+            if (sscanf_s(m.t.c_str() + call + store.size(), "%u, i32 0, i8 %u, float %63[^)]", &element, &comp, value,
+                    (unsigned)sizeof value) == 3)
+                stores.emplace_back((long long)element, value);
+        }
+        b = e + 1;
+    }
+    for (IrValue& v : vals)
+        for (const std::string& n : v.names)
+            if (const auto it = index.find(n); it != index.end()) v.uses.push_back(it->second);
+
+    auto reads_input = [&](long long input) {
+        const std::string load = "@dx.op.loadInput.f32(i32 4, i32 " + std::to_string(input) + ",";
+        std::vector<char> dep(vals.size(), 0);
+        for (size_t i = 0; i < vals.size(); ++i) {
+            if (vals[i].rhs.find(load) != std::string::npos) {
+                dep[i] = 1;
+                continue;
+            }
+            for (const int u : vals[i].uses)
+                if (dep[u]) {
+                    dep[i] = 1;
+                    break;
+                }
+        }
+        return dep;
+    };
+    const std::vector<char> dn = reads_input(normal);
+    const std::vector<char> dp = reads_input(position);
+    std::map<size_t, size_t> edits; // operand position in the text -> its length
+    auto zero = [&](long long element, unsigned& count) {
+        std::vector<char> in(vals.size(), 0);
+        std::vector<int> stack;
+        for (const auto& st : stores)
+            if (st.first == element)
+                if (const auto it = index.find(st.second); it != index.end()) stack.push_back(it->second);
+        while (!stack.empty()) {
+            const int v = stack.back();
+            stack.pop_back();
+            if (in[v]) continue;
+            in[v] = 1;
+            for (const int u : vals[v].uses) stack.push_back(u);
+        }
+        for (size_t i = 0; i < vals.size(); ++i) {
+            const std::string& r = vals[i].rhs;
+            const bool add = r.compare(0, 5, "fadd ") == 0;
+            if (!in[i] || (!add && r.compare(0, 5, "fsub ") != 0)) continue;
+            const size_t a0 = r.find("float ");
+            const size_t a1 = a0 == std::string::npos ? a0 : r.find(',', a0);
+            const size_t b0 = a1 == std::string::npos ? a1 : r.find_first_not_of(' ', a1 + 1);
+            if (b0 == std::string::npos) continue;
+            const size_t b1 = (std::min)((std::min)(r.find(',', b0), r.find(' ', b0)), r.size());
+            const auto ia = index.find(r.substr(a0 + 6, a1 - a0 - 6));
+            const auto ib = index.find(r.substr(b0, b1 - b0));
+            const bool na = ia != index.end() && dn[ia->second];
+            const bool nb = ib != index.end() && dn[ib->second];
+            const bool pa = ia != index.end() && dp[ia->second] && !na;
+            const bool pb = ib != index.end() && dp[ib->second] && !nb;
+            if (na && pb) {
+                if (!add) {
+                    why = "an offset is subtracted from: " + r;
+                    return false;
+                }
+                edits[vals[i].at + a0 + 6] = a1 - a0 - 6;
+                ++count;
+            } else if (nb && pa) {
+                edits[vals[i].at + b0] = b1 - b0;
+                ++count;
+            }
+        }
+        return true;
+    };
+    unsigned on_pos = 0;
+    unsigned on_prev = 0;
+    if (!zero(sv_pos, on_pos)) return false;
+    if (prev_pos >= 0 && !zero(prev_pos, on_prev)) return false;
+    if (on_pos < 3) {
+        why = "SV_Position joins the normal to the position in " + std::to_string(on_pos) + " adds, fewer than 3";
+        return false;
+    }
+    for (auto it = edits.rbegin(); it != edits.rend(); ++it) m.t.replace(it->first, it->second, "0.000000e+00");
+    why = "zeroed " + std::to_string(on_pos) + " offset adds on SV_Position and " + std::to_string(on_prev) +
+        " on VELOCITY_PREV_POS";
+    return true;
+}
+
 } // namespace
 
 bool RfxDxilInit(const wchar_t* dll_dir, std::string& why)
@@ -988,18 +1218,10 @@ bool RfxDxilPatch(const void* ps, size_t ps_size, const RfxDxilSpec& spec, RfxDx
         return false;
     }
 
-    Com<IDxcBlobEncoding> src;
-    if (FAILED(lib->CreateBlobWithEncodingOnHeapCopy(ps, (UINT32)ps_size, 0, &src))) {
-        out.why = "blob";
-        return false;
-    }
-    Com<IDxcBlobEncoding> dis;
-    if (FAILED(comp->Disassemble(src.p, &dis)) || !dis) {
-        out.why = "disassemble failed (not a DXIL container?)";
-        return false;
-    }
+    std::string dis;
+    if (!DisassembleText(lib.p, comp.p, ps, ps_size, dis, out.why)) return false;
     Module m;
-    m.t = "\n" + BlobText(dis.p); // leading newline: every search is for "\n<start of line>"
+    m.t = "\n" + dis; // leading newline: every search is for "\n<start of line>"
     out.ll_before = m.t;
     if (!PatchText(m, spec, out)) {
         out.why = "patch: " + out.why;
@@ -1008,34 +1230,83 @@ bool RfxDxilPatch(const void* ps, size_t ps_size, const RfxDxilSpec& spec, RfxDx
     }
     const std::string resolved = out.why;
     out.ll_after = m.t;
-
-    Com<IDxcBlobEncoding> txt;
-    if (FAILED(lib->CreateBlobWithEncodingOnHeapCopy(m.t.data(), (UINT32)m.t.size(), CP_UTF8, &txt))) {
-        out.why = "blob";
-        return false;
-    }
-    Com<IDxcOperationResult> ar;
-    HRESULT st = E_FAIL;
-    if (FAILED(as->AssembleToContainer(txt.p, &ar)) || !ar || FAILED(ar->GetStatus(&st)) || FAILED(st)) {
-        out.why = "assemble: " + ErrText(ar.p);
-        return false;
-    }
-    Com<IDxcBlob> cont;
-    ar->GetResult(&cont);
-    if (!cont) {
-        out.why = "assemble: no container";
-        return false;
-    }
-    Com<IDxcOperationResult> vr;
-    HRESULT vst = E_FAIL;
-    if (FAILED(val->Validate(cont.p, DxcValidatorFlags_InPlaceEdit, &vr)) || !vr || FAILED(vr->GetStatus(&vst)) ||
-        FAILED(vst)) {
-        out.why = "validate: " + ErrText(vr.p);
-        return false;
-    }
-    out.code.assign(
-        (const uint8_t*)cont->GetBufferPointer(), (const uint8_t*)cont->GetBufferPointer() + cont->GetBufferSize());
+    if (!AssembleSigned(lib.p, as.p, val.p, m.t, out.code, out.why)) return false;
     out.why = resolved;
     out.settled = true;
+    return true;
+}
+
+bool RfxDxilZeroOffset(const void* vs, size_t vs_size, RfxDxilResult& out)
+{
+    std::lock_guard<std::mutex> l(g_mtx);
+    if (!g_init_ok) {
+        out.why = "not initialised: " + g_init_why;
+        return false;
+    }
+    if (!vs || vs_size < 32) {
+        out.why = "no shader bytes";
+        return false;
+    }
+    Com<IDxcLibrary> lib;
+    Com<IDxcCompiler> comp;
+    Com<IDxcAssembler> as;
+    Com<IDxcValidator> val;
+    if (FAILED(g_dxc_create(CLSID_DxcLibrary, __uuidof(IDxcLibrary), (void**)&lib)) ||
+        FAILED(g_dxc_create(CLSID_DxcCompiler, __uuidof(IDxcCompiler), (void**)&comp)) ||
+        FAILED(g_dxc_create(CLSID_DxcAssembler, __uuidof(IDxcAssembler), (void**)&as)) ||
+        FAILED(g_dxil_create(CLSID_DxcValidator, __uuidof(IDxcValidator), (void**)&val))) {
+        out.why = "DxcCreateInstance failed";
+        return false;
+    }
+    std::string dis;
+    if (!DisassembleText(lib.p, comp.p, vs, vs_size, dis, out.why)) return false;
+    Module m;
+    m.t = "\n" + dis;
+    out.ll_before = m.t;
+    if (!ZeroOffset(m, out)) {
+        out.why = "offset: " + out.why;
+        out.settled = true;
+        return false;
+    }
+    const std::string resolved = out.why;
+    out.ll_after = m.t;
+    if (!AssembleSigned(lib.p, as.p, val.p, m.t, out.code, out.why)) return false;
+    out.why = resolved;
+    out.settled = true;
+    return true;
+}
+
+bool RfxDxilLiteralStores(
+    const void* ps, size_t ps_size, std::set<std::pair<uint32_t, std::string>>& out, std::string& why)
+{
+    std::lock_guard<std::mutex> l(g_mtx);
+    if (!g_init_ok) {
+        why = "not initialised: " + g_init_why;
+        return false;
+    }
+    if (!ps || ps_size < 32) {
+        why = "no shader bytes";
+        return false;
+    }
+    Com<IDxcLibrary> lib;
+    Com<IDxcCompiler> comp;
+    if (FAILED(g_dxc_create(CLSID_DxcLibrary, __uuidof(IDxcLibrary), (void**)&lib)) ||
+        FAILED(g_dxc_create(CLSID_DxcCompiler, __uuidof(IDxcCompiler), (void**)&comp))) {
+        why = "DxcCreateInstance failed";
+        return false;
+    }
+    std::string t;
+    if (!DisassembleText(lib.p, comp.p, ps, ps_size, t, why)) return false;
+    const std::string call = "@dx.op.storeOutput.f32(i32 5, i32 ";
+    for (size_t at = t.find(call); at != std::string::npos; at = t.find(call, at + call.size())) {
+        unsigned element = 0;
+        unsigned component = 0;
+        char literal[40] = {};
+        if (sscanf_s(t.c_str() + at + call.size(), "%u, i32 0, i8 %u, float %39[^)]", &element, &component, literal,
+                (unsigned)sizeof literal) != 3)
+            continue;
+        if (literal[0] == '%' || component > 3) continue;
+        out.emplace(element << 2 | component, literal);
+    }
     return true;
 }

@@ -17,15 +17,18 @@
 #include "instrumentation/watchdogs.h"
 #include "instrumentation/debug_pipe.h"
 #include "rabbitfx/rfx_patch.h" // RfxPatchWorker::Stop
+#include "hud/outline_hide.h"
 #include "textures/tex_hooks.h"
 #include "textures/tex_look_worker.h"
 #include "textures/tex_look.h"
 #include "textures/tex_crawl.h"
+#include "textures/tex_dhash_table.h"
 #include "textures/tex_defer.h"
 #include "textures/tex_gc.h"
 #include "textures/tex_replace.h"
 #include "migoto/dx12_wrap.h" // BackBufferForget
 #include "migoto/port_toggles.h" // g_buffers_in_vram
+#include "shapekeys/sk_toggles.h" // g_sk_toggles.game_batches (A22)
 #include "instrumentation/removal_pin.h"
 #include "instrumentation/hot_path.h"
 #include "instrumentation/game_draw_record.h"
@@ -68,6 +71,7 @@ static void on_destroy_device(device*)
 {
     g_watchdogs.Stop();
     g_rfx_patch.Stop(); // it creates PSOs on this device
+    g_outline_hide.Stop();
     g_descriptors.UnwatchAll();
     g_tex_look_worker.Stop();
     g_tex_crawl.FlushIfQuiet(0);
@@ -93,6 +97,7 @@ static bool on_draw_guarded(command_list* cmd_list, uint32_t vertex_count)
 {
     WWMI_GUARD_BEGIN("on_draw")
     g_tex_draw_watch.NoteNonIndexed(cmd_list, vertex_count);
+    g_section_textures.NoteNamedRefTextures(cmd_list);
     return false;
     WWMI_GUARD_END(false)
 }
@@ -165,7 +170,8 @@ static bool on_draw_indexed_guarded(command_list* cmd_list, uint32_t index_count
     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
     WWMI_GUARD_BEGIN("on_draw_indexed")
-    return on_draw_indexed_body(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
+    return on_draw_indexed_body(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance) ||
+        HideOutlineDraw(cmd_list);
     WWMI_GUARD_END(false) // false = let the game draw its own geometry for this call
 }
 
@@ -253,9 +259,11 @@ static void SetupDirectories()
             FindClose(h);
         }
         const bool lod = DeleteFileW((cache_dir + L"\\lod_tex_cache.lodcache").c_str()) != 0;
+        const bool look = DeleteFileW((cache_dir + L"\\tex_look.bin").c_str()) != 0;
         g_settings.Save(L"clear_cache", false);
-        ::logger::write("Config: clear_cache=1 -- removed %u cached shader patch(es) and %s texture match cache",
-            shaders, lod ? "the" : "no");
+        ::logger::write("Config: clear_cache=1 -- removed %u cached shader patch(es), %s texture match cache, %s "
+                        "texture look cache; the shipped texture matches are taken again",
+            shaders, lod ? "the" : "no", look ? "the" : "no");
     }
     g_addon.wwmi_dir = wwmi_dir_buf;
     g_mod_textures.Reload(); // deferred -- executes on first Tick() after device init
@@ -489,11 +497,16 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
             g_addon.reshade_api, (unsigned)RESHADE_API_VERSION);
 
     MigotoPort::g_buffers_in_vram = g_settings.Int(L"buffers_in_vram", 1) != 0;
+    g_sk_toggles.game_batches = g_settings.Int(L"shapekey_game_batches", 1) != 0;
+    g_tex_toggles.dhash_filters = g_settings.Int(L"texture_filters", 1) != 0;
+    PortApi::SetTextureDHash(&TexDHashLookup, &TexDHashMips);
     ::logger::write(
-        "Config: decensor=%d hide_uid=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d tex_mod_budget=%s tex_distance=%d",
-        (int)g_settings.decensor, (int)g_settings.hide_uid, (int)g_settings.texlod_resemblance,
-        (int)g_settings.texlod_cache, (int)MigotoPort::g_buffers_in_vram, TexBudgetName(g_settings.tex_mod_budget),
-        (int)g_settings.tex_distance);
+        "Config: decensor=%d hide_uid=%d hide_char_outlines=%d lod_resemblance=%d lod_cache=%d buffers_in_vram=%d "
+        "tex_mod_budget=%s tex_distance=%d shapekey_game_batches=%d texture_filters=%d",
+        (int)g_settings.decensor, (int)g_settings.hide_uid, (int)g_settings.hide_char_outlines,
+        (int)g_settings.texlod_resemblance, (int)g_settings.texlod_cache, (int)MigotoPort::g_buffers_in_vram,
+        TexBudgetName(g_settings.tex_mod_budget), (int)g_settings.tex_distance, (int)g_sk_toggles.game_batches,
+        (int)g_tex_toggles.dhash_filters);
     g_tex_defer.Start();
     if (g_settings.dx12_debug_layer) EnableDebugLayer();
     ::logger::write("Config: debug=%d (diagnostics %s, log level %d)", (int)g_debug, g_debug ? "ON" : "off",
@@ -515,6 +528,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
     g_watchdogs.Stop(); // no thread of this DLL may outlive its mapping
     DebugPipe::Shutdown();
     g_rfx_patch.Stop();
+    g_outline_hide.Stop();
     g_descriptors.UnwatchAll(); // a live heap's release must not call into this DLL once it is unmapped
     g_tex_look_worker.Stop();
     g_tex_crawl.FlushIfQuiet(0);

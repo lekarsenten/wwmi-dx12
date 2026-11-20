@@ -79,6 +79,7 @@ static double g_last_parse_ms = 0.0;
 static void NotifyParse(std::chrono::steady_clock::time_point parse_start)
 {
     if (!G->gConfigInitialized && G->gSkipEarlyIncludesLoad) return;
+    FiltersParsed();
     g_last_parse_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - parse_start).count();
     if (g_parse_observer) g_parse_observer(g_parse_observer_user);

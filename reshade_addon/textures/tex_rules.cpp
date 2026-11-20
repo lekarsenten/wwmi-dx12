@@ -22,7 +22,8 @@ struct TexRuleSet::PerSet : SetState {
     {
         rules = BuildTexRules();
         g_tex_lod.TargetsReady(
-            [](uint32_t h, void* user) { return static_cast<TexRules*>(user)->hash_to_rule.count(h) != 0; }, &rules);
+            [](uint32_t h, void* user) { return static_cast<TexRules*>(user)->hash_to_rule.count(h) != 0; },
+            [](uint32_t h, void*) { return PortApi::TextureHashHasSections(h); }, &rules);
         g_tex_replace.ClearForParse();
         g_tex_rules.ready_.store(true, std::memory_order_release);
     }

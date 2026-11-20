@@ -1,5 +1,6 @@
 // The look index: references, verdicts and places, persisted in tex_look.bin. See tex_look.h.
 #include "tex_look.h"
+#include "shipped_matches.h"
 #include "tex_lod.h"
 #include "../core/log.h"
 #include "../instrumentation/diag_gate.h"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cwchar>
+#include <deque>
 #include <mutex>
 #include <share.h>
 
@@ -21,6 +23,8 @@ constexpr uint32_t kAlgo = 1; // what a signature and a verdict mean; another va
 constexpr uint32_t kMagic = 0x4b4c5854; // "TXLK"
 constexpr uint32_t kMagicPlaces = 0x324c5854; // "TXL2": the same, then the places
 constexpr uint32_t kMagicMesh = 0x334c5854; // "TXL3": the same, then the mesh places
+constexpr uint32_t kTagFree = 0x464c5854; // "TXLF": after the mesh places, the references not a power of two a side
+constexpr uint32_t kTagPlaced = 0x504c5854; // "TXLP": after those, the ones at spots of their own, with the spots
 constexpr uint32_t kMixed = 0xffffffffu; // a place that showed two targets
 
 template <typename T> bool put(FILE* f, const T& v)
@@ -30,6 +34,22 @@ template <typename T> bool put(FILE* f, const T& v)
 template <typename T> bool get(FILE* f, T& v)
 {
     return fread(&v, sizeof v, 1, f) == 1;
+}
+
+// "<what> live N: x,y std S ..." -- each patch's highest channel std.
+std::string SpotsLine(const char* what, const LookSig& s)
+{
+    const LookStats st = ViewOf(s, s.pw, s.ph).st;
+    char b[64];
+    std::snprintf(b, sizeof b, "%s live %d:", what, LivePatches(st, s.nch));
+    std::string out = b;
+    for (int k = 0; k < kPatches; ++k) {
+        float top = 0;
+        for (uint32_t c = 0; c < s.nch; ++c) top = (std::max)(top, st.patch_std[k][c]);
+        std::snprintf(b, sizeof b, " %u,%u std %.1f", s.at[k].x, s.at[k].y, top);
+        out += b;
+    }
+    return out;
 }
 
 } // namespace
@@ -153,27 +173,87 @@ bool TexLook::Wants(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt, bool is
         const uint32_t high = TargetOf(hash, is_target);
         if (high)
             want = !Offered(hash) && Weaker(high, w, h);
+        else if (!PowerOfTwo(w, h) && !free_shapes_.count(ShapeOf(CodecOf(fmt), w, h)))
+            return false;
         else {
             auto v = verdicts_.find(hash);
             want = v == verdicts_.end() || v->second.kind == Kind::Ref ||
                 (v->second.kind == Kind::Match ? !g_tex_lod.Linked(hash) : v->second.gen != gen_);
+            if (!want && g_debug && v->second.kind == Kind::Match) {
+                const uint32_t to = g_tex_lod.Lookup(hash);
+                auto r = refs_.find(to);
+                if (r != refs_.end()) NoteSize(hash, w, h, to, r->second.sig.w, r->second.sig.h);
+            }
         }
     }
     if (!want) skipped_.fetch_add(1, std::memory_order_relaxed);
     return want;
 }
 
+std::vector<Spot> TexLook::SpotsFor(uint32_t hash, uint32_t w, uint32_t h, uint32_t fmt, bool is_target) const
+{
+    std::vector<Spot> out;
+    if (PowerOfTwo(w, h)) return out;
+    std::shared_lock l(mtx_);
+    if (TargetOf(hash, is_target)) return out;
+    auto it = free_shapes_.find(ShapeOf(CodecOf(fmt), w, h));
+    if (it == free_shapes_.end()) return out;
+    for (const ShapeSpots& set : it->second)
+        for (const Spot& p : set.at)
+            if (std::find(out.begin(), out.end(), p) == out.end()) out.push_back(p);
+    return out;
+}
+
+// Once per texture, debug builds: a look-alike at its reference's size is counted, one at another size named.
+void TexLook::NoteSize(uint32_t hash, uint32_t w, uint32_t h, uint32_t target, uint32_t ref_w, uint32_t ref_h)
+{
+    {
+        std::lock_guard l(sized_mtx_);
+        if (!sized_.insert(hash).second) return;
+    }
+    if (w == ref_w && h == ref_h) {
+        sized_same_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    sized_other_.fetch_add(1, std::memory_order_relaxed);
+    logger::report(
+        "TexLook: %08x %ux%u looks like %08x, whose reference is %ux%u -- another size", hash, w, h, target, ref_w, ref_h);
+}
+
+void TexLook::PutRef(uint32_t target, Ref&& r)
+{ // caller holds mtx_
+    Ref& slot = refs_[target];
+    if (!slot.sig.px.empty() && !PowerOfTwo(slot.sig.w, slot.sig.h)) {
+        auto it = free_shapes_.find(ShapeOf(slot.sig.codec, slot.sig.w, slot.sig.h));
+        if (it != free_shapes_.end()) {
+            std::vector<ShapeSpots>& sets = it->second;
+            auto s = std::find_if(sets.begin(), sets.end(), [&](const ShapeSpots& e) { return e.at == slot.sig.at; });
+            if (s != sets.end() && !--s->refs) sets.erase(s);
+            if (sets.empty()) free_shapes_.erase(it);
+        }
+    }
+    if (!PowerOfTwo(r.sig.w, r.sig.h)) {
+        std::vector<ShapeSpots>& sets = free_shapes_[ShapeOf(r.sig.codec, r.sig.w, r.sig.h)];
+        auto s = std::find_if(sets.begin(), sets.end(), [&](const ShapeSpots& e) { return e.at == r.sig.at; });
+        if (s == sets.end())
+            sets.push_back(ShapeSpots{ r.sig.at, 1 });
+        else
+            ++s->refs;
+    }
+    slot = std::move(r);
+}
+
 bool TexLook::KeepRef(uint32_t target, Ref&& r)
 { // caller holds mtx_
     auto it = refs_.find(target);
     if (it != refs_.end() && it->second.sig.pw * it->second.sig.ph >= r.sig.pw * r.sig.ph) return false;
-    refs_[target] = std::move(r);
+    PutRef(target, std::move(r));
     ++gen_;
     MarkDirty();
     return true;
 }
 
-bool TexLook::Offer(uint32_t source, uint32_t target, LookSig&& sig)
+TexLook::RefTaken TexLook::Offer(uint32_t source, uint32_t target, LookSig&& sig)
 {
     Ref r;
     r.sig = std::move(sig);
@@ -194,14 +274,40 @@ bool TexLook::Offer(uint32_t source, uint32_t target, LookSig&& sig)
     else if (g_debug && kept)
         logger::trace("TexLook: %08x %ux%u is now the reference of %08x%s", source, w, h, target,
             source == target ? " (itself)" : ", a proven lower mip of it");
-    return kept;
+    return flat ? RefTaken::Flat : kept ? RefTaken::Kept : RefTaken::AsDense;
 }
 
-void TexLook::Match(uint32_t hash, const LookSig& sig)
+// Each reference compares at its own spots: a texture not a power of two a side is decoded once per spot set the
+// references of its size use, and one whose spots the cut lacks (added after the upload) decides it again next time.
+void TexLook::Match(uint32_t hash, const TexLookCut& cut)
 {
-    const LookView cv = ViewOf(sig, sig.pw, sig.ph);
-    std::vector<std::pair<uint32_t, Score>> hits;
+    struct Cand {
+        LookSig sig;
+        LookView cv;
+    };
+    std::deque<Cand> cands; // references to them stay valid as more are added
+    const auto cand_at = [&](const Spots& at) -> const Cand* {
+        for (const Cand& c : cands)
+            if (c.sig.at == at) return &c;
+        Cand c;
+        if (!SigOf(cut, at, c.sig)) return nullptr;
+        c.cv = ViewOf(c.sig, c.sig.pw, c.sig.ph);
+        cands.push_back(std::move(c));
+        return &cands.back();
+    };
+    const bool own_size = !PowerOfTwo(cut.w, cut.h);
+    const uint64_t shape = ShapeOf(CodecOf(cut.fmt), cut.w, cut.h);
+    const Cand* def = own_size ? nullptr : cand_at(DefaultSpots(cut.w, cut.h));
+    if (!own_size && !def) return;
+    struct Hit {
+        uint32_t target = 0;
+        Score s;
+        uint32_t w = 0; // its reference's
+        uint32_t h = 0;
+    };
+    std::vector<Hit> hits;
     uint32_t gen = 0;
+    bool missed = false;
     uint32_t closest_t = 0;
     Score closest;
     {
@@ -209,58 +315,141 @@ void TexLook::Match(uint32_t hash, const LookSig& sig)
         gen = gen_;
         for (const auto& kv : refs_) {
             if (kv.first == hash) continue;
-            const Score s = Compare(sig, cv, kv.second);
+            const LookSig& rs = kv.second.sig;
+            const Cand* c = def;
+            if (own_size) {
+                if (ShapeOf(rs.codec, rs.w, rs.h) != shape) continue;
+                c = cand_at(rs.at);
+                if (!c) {
+                    missed = true;
+                    continue;
+                }
+            }
+            const Score s = Compare(c->sig, c->cv, kv.second);
             if (s.match())
-                hits.emplace_back(kv.first, s);
+                hits.push_back(Hit{ kv.first, s, rs.w, rs.h });
             else if (s.hist < closest.hist || (s.hist == closest.hist && s.ssim > closest.ssim)) {
                 closest = s;
                 closest_t = kv.first;
             }
         }
     }
+    if (cands.empty()) return;
+    decoded_.fetch_add(1, std::memory_order_relaxed);
     {
         std::unique_lock l(mtx_);
-        verdicts_[hash] = Verdict{ gen, hits.empty() ? Kind::NoMatch : Kind::Match };
+        verdicts_[hash] = Verdict{ missed ? 0u : gen, hits.empty() ? Kind::NoMatch : Kind::Match };
         MarkDirty();
     }
-    for (const auto& h : hits) {
-        if (g_tex_lod.LearnVisual(hash, h.first, h.second.ssim) && g_debug)
-            logger::trace("TexLook: %08x %ux%u looks like %08x (hist %.3f, ssim-min %.3f)", hash, sig.w, sig.h, h.first,
-                h.second.hist, h.second.ssim);
+    for (const Hit& h : hits) {
+        if (g_tex_lod.LearnVisual(hash, h.target, h.s.ssim) && g_debug)
+            logger::trace("TexLook: %08x %ux%u looks like %08x (hist %.3f, ssim-min %.3f)", hash, cut.w, cut.h, h.target,
+                h.s.hist, h.s.ssim);
     }
+    if (g_debug && !hits.empty()) NoteSize(hash, cut.w, cut.h, hits[0].target, hits[0].w, hits[0].h);
     if (hits.size() > 1)
         logger::info("TexLook: %08x %ux%u looks like %zu targets, e.g. %08x (ssim-min %.3f) and %08x (%.3f)", hash,
-            sig.w, sig.h, hits.size(), hits[0].first, hits[0].second.ssim, hits[1].first, hits[1].second.ssim);
+            cut.w, cut.h, hits.size(), hits[0].target, hits[0].s.ssim, hits[1].target, hits[1].s.ssim);
     if (!hits.empty())
         matched_.fetch_add(1, std::memory_order_relaxed);
     else if (closest_t && DiagOnce("TEXLOOK-NOMATCH", (int)hash))
         logger::trace(
             "TexLook: NO-MATCH %08x %ux%u | closest %08x hist %.3f ssim-min %.3f (need hist <= %.2f, ssim >= %.2f)",
-            hash, sig.w, sig.h, closest_t, closest.hist, closest.ssim, kHistMax, kSsimMin);
+            hash, cut.w, cut.h, closest_t, closest.hist, closest.ssim, kHistMax, kSsimMin);
 }
 
 void TexLook::OnCut(uint32_t hash, const TexLookCut& cut, bool is_target)
 {
-    LookSig sig;
-    if (!g_settings.texlod_cache || !SigOf(cut, sig)) return;
-    decoded_.fetch_add(1, std::memory_order_relaxed);
+    if (!g_settings.texlod_cache) return;
     uint32_t high = 0;
     {
         std::shared_lock l(mtx_);
         high = TargetOf(hash, is_target);
     }
-    if (high)
-        Offer(hash, high, std::move(sig));
-    else
-        Match(hash, sig);
+    if (!high) {
+        Match(hash, cut);
+        return;
+    }
+    LookSig sig;
+    if (!SigOf(cut, DefaultSpots(cut.w, cut.h), sig)) return;
+    decoded_.fetch_add(1, std::memory_order_relaxed);
+    Offer(hash, high, std::move(sig));
 }
 
-bool TexLook::TakeRef(uint32_t hash, uint32_t target, const TexLookCut& cut)
+TexLook::RefTaken TexLook::TakeRef(uint32_t hash, uint32_t target, const TexLookCut& cut)
 {
     LookSig sig;
-    if (!g_settings.texlod_cache || !hash || !target || g_tex_lod.Degenerate(hash) || !SigOf(cut, sig)) return false;
+    if (!g_settings.texlod_cache || !hash || !target || g_tex_lod.Degenerate(hash) ||
+        !SigOf(cut, DefaultSpots(cut.w, cut.h), sig))
+        return RefTaken::Unread;
     decoded_.fetch_add(1, std::memory_order_relaxed);
+    if (!PowerOfTwo(cut.w, cut.h)) {
+        std::string line = SpotsLine("default spots", sig);
+        Spots at;
+        LookSig busy;
+        if (LivePatches(ViewOf(sig, sig.pw, sig.ph).st, sig.nch) < kLiveMin && BusiestSpots(cut, at) &&
+            SigOf(cut, at, busy)) {
+            line += " | " + SpotsLine("busiest", busy);
+            sig = std::move(busy);
+        }
+        logger::report("TexLook: take %08x %ux%u, %s", hash, cut.w, cut.h, line.c_str());
+    }
     return Offer(hash, target, std::move(sig));
+}
+
+bool TexLook::Taken(uint32_t hash) const
+{
+    std::shared_lock l(mtx_);
+    return Offered(hash);
+}
+
+TexLook::RefGroup TexLook::GroupOf(const LookSig& s)
+{
+    if (PowerOfTwo(s.w, s.h)) return RefGroup::PowerOfTwo;
+    return s.at == DefaultSpots(s.w, s.h) ? RefGroup::FreeDefault : RefGroup::FreePlaced;
+}
+
+bool TexLook::ReadRefs(FILE* f, uint32_t n, bool seed, bool with_spots, size_t* taken)
+{ // caller holds mtx_
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t target = 0;
+        Ref r;
+        bool ok = get(f, target) && get(f, r.sig.codec) && get(f, r.sig.nch) && get(f, r.sig.w) && get(f, r.sig.h) &&
+            get(f, r.sig.pw) && get(f, r.sig.ph);
+        ok =
+            ok && r.sig.nch && r.sig.nch <= 4 && r.sig.pw && r.sig.pw <= kMaxCells && r.sig.ph && r.sig.ph <= kMaxCells;
+        if (!ok) return false;
+        r.sig.px.resize((size_t)kPatches * r.sig.pw * r.sig.ph * r.sig.nch);
+        if (fread(r.sig.px.data(), 1, r.sig.px.size(), f) != r.sig.px.size()) return false;
+        if (with_spots) {
+            for (Spot& p : r.sig.at)
+                if (!get(f, p.x) || !get(f, p.y)) return false;
+            if (PowerOfTwo(r.sig.w, r.sig.h) || !SpotsFit(r.sig.w, r.sig.h, r.sig.at)) return false;
+        } else
+            r.sig.at = DefaultSpots(r.sig.w, r.sig.h);
+        r.st = ViewOf(r.sig, r.sig.pw, r.sig.ph).st;
+        if (seed)
+            *taken += KeepRef(target, std::move(r));
+        else {
+            PutRef(target, std::move(r));
+            ++*taken;
+        }
+    }
+    return true;
+}
+
+bool TexLook::WriteRefs(FILE* f, RefGroup group) const
+{ // caller holds mtx_
+    bool ok = true;
+    for (const auto& kv : refs_) {
+        const LookSig& s = kv.second.sig;
+        if (GroupOf(s) != group) continue;
+        ok = ok && put(f, kv.first) && put(f, s.codec) && put(f, s.nch) && put(f, s.w) && put(f, s.h) && put(f, s.pw) &&
+            put(f, s.ph) && fwrite(s.px.data(), 1, s.px.size(), f) == s.px.size();
+        if (group == RefGroup::FreePlaced)
+            for (const Spot& p : s.at) ok = ok && put(f, p.x) && put(f, p.y);
+    }
+    return ok;
 }
 
 // The references (all a seed gives) and, from our own file, the verdicts. Caller holds mtx_.
@@ -281,26 +470,7 @@ size_t TexLook::Load(const std::wstring& file, bool seed)
         return 0;
     }
     size_t taken = 0;
-    bool ok = true;
-    for (uint32_t i = 0; ok && i < nrefs; ++i) {
-        uint32_t target = 0;
-        Ref r;
-        ok = get(f, target) && get(f, r.sig.codec) && get(f, r.sig.nch) && get(f, r.sig.w) && get(f, r.sig.h) &&
-            get(f, r.sig.pw) && get(f, r.sig.ph);
-        ok =
-            ok && r.sig.nch && r.sig.nch <= 4 && r.sig.pw && r.sig.pw <= kMaxCells && r.sig.ph && r.sig.ph <= kMaxCells;
-        if (!ok) break;
-        r.sig.px.resize((size_t)kPatches * r.sig.pw * r.sig.ph * r.sig.nch);
-        ok = fread(r.sig.px.data(), 1, r.sig.px.size(), f) == r.sig.px.size();
-        if (!ok) break;
-        r.st = ViewOf(r.sig, r.sig.pw, r.sig.ph).st;
-        if (seed)
-            taken += KeepRef(target, std::move(r));
-        else {
-            refs_[target] = std::move(r);
-            ++taken;
-        }
-    }
+    bool ok = ReadRefs(f, nrefs, seed, false, &taken);
     for (uint32_t i = 0; ok && i < nverdicts; ++i) {
         uint32_t hash = 0;
         Verdict v;
@@ -325,6 +495,13 @@ size_t TexLook::Load(const std::wstring& file, bool seed)
         ok = get(f, place) && get(f, target);
         if (ok && target) KeepPlace(mesh_places_, place, target);
     }
+    uint32_t tag = 0;
+    uint32_t nfree = 0;
+    uint32_t nplaced = 0;
+    if (ok && magic == kMagicMesh && get(f, tag) && tag == kTagFree) {
+        ok = get(f, nfree) && ReadRefs(f, nfree, seed, false, &taken);
+        if (ok && get(f, tag) && tag == kTagPlaced) ok = get(f, nplaced) && ReadRefs(f, nplaced, seed, true, &taken);
+    }
     if (!mesh_places_.empty()) has_mesh_.store(true, std::memory_order_relaxed);
     fclose(f);
     if (!seed) gen_ = (std::max)(gen_, gen);
@@ -342,19 +519,24 @@ void TexLook::Write()
         logger::write("TexLook: cannot write %S", tmp.c_str());
         return;
     }
-    bool ok = put(f, kMagicMesh) && put(f, kAlgo) && put(f, gen_) && put(f, (uint32_t)refs_.size()) &&
-        put(f, (uint32_t)verdicts_.size());
+    uint32_t nfree = 0;
+    uint32_t nplaced = 0;
     for (const auto& kv : refs_) {
-        const LookSig& s = kv.second.sig;
-        ok = ok && put(f, kv.first) && put(f, s.codec) && put(f, s.nch) && put(f, s.w) && put(f, s.h) && put(f, s.pw) &&
-            put(f, s.ph) && fwrite(s.px.data(), 1, s.px.size(), f) == s.px.size();
+        const RefGroup g = GroupOf(kv.second.sig);
+        nfree += g == RefGroup::FreeDefault;
+        nplaced += g == RefGroup::FreePlaced;
     }
+    bool ok = put(f, kMagicMesh) && put(f, kAlgo) && put(f, gen_) &&
+        put(f, (uint32_t)refs_.size() - nfree - nplaced) && put(f, (uint32_t)verdicts_.size()) &&
+        WriteRefs(f, RefGroup::PowerOfTwo);
     for (const auto& kv : verdicts_)
         ok = ok && put(f, kv.first) && put(f, kv.second.gen) && put(f, (uint8_t)kv.second.kind);
     ok = ok && put(f, (uint32_t)places_.size());
     for (const auto& kv : places_) ok = ok && put(f, kv.first) && put(f, kv.second);
     ok = ok && put(f, (uint32_t)mesh_places_.size());
     for (const auto& kv : mesh_places_) ok = ok && put(f, kv.first) && put(f, kv.second);
+    ok = ok && put(f, kTagFree) && put(f, nfree) && WriteRefs(f, RefGroup::FreeDefault);
+    ok = ok && put(f, kTagPlaced) && put(f, nplaced) && WriteRefs(f, RefGroup::FreePlaced);
     ok = fclose(f) == 0 && ok;
     if (!ok || !MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         logger::write("TexLook: cannot replace %S (err %lu)", p.c_str(), GetLastError());
@@ -378,6 +560,14 @@ void TexLook::Write()
                 seed.first.c_str(), GetLastError());
     }
     imported_.clear();
+    if (!shipped_taken_.empty()) {
+        if (g_shipped_matches.MarkTaken(dir_, shipped_taken_))
+            logger::write("TexLook: %S is in tex_look.bin now", shipped_taken_.c_str());
+        else
+            logger::write("TexLook: %S is in tex_look.bin now, but cannot be marked so -- it is taken again next start",
+                shipped_taken_.c_str());
+        shipped_taken_.clear();
+    }
 }
 
 void TexLook::Init(const std::wstring& cache_dir)
@@ -391,6 +581,15 @@ void TexLook::Init(const std::wstring& cache_dir)
         logger::write(
             "TexLook: %zu reference(s), %zu verdict(s), %zu place(s), %zu mesh place(s) from %S (algorithm v%u)", n,
             verdicts_.size(), places_.size(), mesh_places_.size(), Path().c_str(), kAlgo);
+    }
+    if (shipped_taken_.empty()) {
+        const std::wstring shipped = g_shipped_matches.ToTake(dir_, L"looks.texlook", Path());
+        if (!shipped.empty()) {
+            const size_t taken = Load(shipped, true);
+            shipped_taken_ = shipped;
+            MarkDirty();
+            logger::write("TexLook: %S -- %zu reference(s) new or denser than ours", shipped.c_str(), taken);
+        }
     }
     WIN32_FIND_DATAW sf;
     HANDLE hs = FindFirstFileW((dir_ + L"\\*.texlook").c_str(), &sf);
@@ -430,6 +629,9 @@ void TexLook::OnExit()
         "place",
         refs_.size(), verdicts_.size(), places_.size(), mesh_places_.size(), decoded_.load(), skipped_.load(),
         matched_.load(), refs_new_.load(), places_new_.load(), by_place_.load());
+    if (g_debug)
+        logger::write("TexLook: exit -- %u look-alike(s) seen at their reference's size, %u at another (named above)",
+            sized_same_.load(), sized_other_.load());
 }
 
 uint64_t TexLookPlaceOf(const wchar_t* ns, int comp, uint64_t ps)

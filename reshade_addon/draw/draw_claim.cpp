@@ -33,7 +33,7 @@
 
 using namespace reshade::api;
 
-bool RunDrawShaderOverrides(const DrawArgs& da)
+bool RunDrawShaderOverrides(const DrawArgs& da, std::optional<PortApi::EngineScope>& hold)
 {
     reshade::api::command_list* const cmd_list = da.cmd_list;
     const uint32_t index_count = da.index_count;
@@ -59,15 +59,18 @@ bool RunDrawShaderOverrides(const DrawArgs& da)
         const uint64_t vs_ini = AliasShaderHash(vs_hash);
         const uint64_t ps_ini = AliasShaderHash(draw_ps_h);
         const uint64_t gs_ini = AliasShaderHash(draw_gs_h);
-        std::optional<PortApi::EngineScope> published;
         std::optional<PortApi::DrawListScope> on_list;
         uint32_t srv_gen0 = 0;
         if (g_sk_toggles.publish_shader_state &&
             (PortApi::ShaderOverrideMatches(vs_ini) || PortApi::ShaderOverrideMatches(ps_ini) ||
                 PortApi::ShaderOverrideMatches(gs_ini))) {
-            published.emplace();
+            hold.emplace();
             PortApi::SetBoundShader('v', vs_ini);
             PortApi::SetBoundShader('p', ps_ini);
+            {
+                const DxilSrvRegs pr = g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p');
+                PortApi::SetPixelShaderTextures(ps_ini, pr.lo, pr.hi, pr.parsed && !pr.unbounded);
+            }
             PortApi::SetBoundShader('g', gs_ini);
             if (g_draw_toggles.port_draw_list) {
                 on_list.emplace(da.d3d12_cl, RestoreOverrideDraw, cmd_list);

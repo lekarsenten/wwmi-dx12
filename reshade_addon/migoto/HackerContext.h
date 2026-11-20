@@ -9,6 +9,7 @@ DEFINE_GUID(IID_HackerContext,
 
 class HackerDevice;
 class HackerInputLayout;
+struct InitialTexturesSnapshot;
 
 class HackerContext {
 public:
@@ -43,11 +44,15 @@ public:
     unsigned dispatch_number = 0;
     unsigned GetDrawNumber() const { return draw_number; }
     unsigned GetDispatchNumber() const { return dispatch_number; }
+    unsigned GetCallNumber() const;
     void     ResetCallCounters()
     {
         draw_number = 0;
         dispatch_number = 0;
     }
+
+    InitialTexturesSnapshot& GetInitialTexturesSnapshot();
+    HRESULT ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash);
 
     ID3D11Buffer* GetReadbackBuffer(UINT /*size*/) { return nullptr; }
 

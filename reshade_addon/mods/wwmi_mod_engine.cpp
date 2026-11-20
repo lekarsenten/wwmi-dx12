@@ -72,66 +72,6 @@ std::wstring TailOfFq(const std::wstring& fq)
     return last == std::wstring::npos ? fq : fq.substr(last + 1);
 }
 
-const wchar_t* AfterPsSlot(const wchar_t* p)
-{
-    if (_wcsnicmp(p, L"ps-t", 4) != 0) return nullptr;
-    const wchar_t* q = p + 4;
-    if (*q == L'[') {
-        while (*q && *q != L']') ++q;
-        return *q ? q + 1 : nullptr;
-    }
-    if (!iswdigit(*q)) return nullptr;
-    while (iswdigit(*q)) ++q;
-    return q;
-}
-
-bool NamesPsSlot(const wchar_t* s, bool metadata_only)
-{
-    if (!s) return false;
-    for (const wchar_t* p = s; *p; ++p) {
-        const wchar_t* q = AfterPsSlot(p);
-        if (!q) continue;
-        if (!metadata_only) return true;
-        while (*q == L' ') ++q;
-        if (q[0] == L'-' && q[1] == L'>') return true;
-    }
-    return false;
-}
-
-bool IsIniParam(const wchar_t* k)
-{
-    if (!k || !*k || !wcschr(L"xyzwXYZW", *k)) return false;
-    for (const wchar_t* p = k + 1; *p; ++p)
-        if (!iswdigit(*p)) return false;
-    return true;
-}
-
-bool QueriesPsSlot(const wchar_t* line)
-{
-    if (!line) return false;
-    while (*line == L' ' || *line == L'\t') ++line;
-    if (!_wcsnicmp(line, L"if ", 3) || !_wcsnicmp(line, L"elif ", 5) || !_wcsnicmp(line, L"else if ", 8))
-        return NamesPsSlot(line, false);
-    const wchar_t* eq = wcschr(line, L'=');
-    if (!eq) return NamesPsSlot(line, true);
-    const wchar_t* k = line;
-    for (;;) {
-        if (!_wcsnicmp(k, L"pre ", 4))
-            k += 4;
-        else if (!_wcsnicmp(k, L"post ", 5))
-            k += 5;
-        else if (!_wcsnicmp(k, L"local ", 6))
-            k += 6;
-        else
-            break;
-        while (*k == L' ') ++k;
-    }
-    std::wstring target(k, eq);
-    while (!target.empty() && (target.back() == L' ' || target.back() == L'\t')) target.pop_back();
-    if ((!target.empty() && target[0] == L'$') || IsIniParam(target.c_str())) return NamesPsSlot(eq + 1, false);
-    return NamesPsSlot(line, true);
-}
-
 struct KeyCtx {
     Component* comp;
     std::vector<SubDraw>* draws;
@@ -420,29 +360,13 @@ static int ReadModFrom(const std::wstring& ns, const std::unordered_map<std::wst
             }
     }
 
-    PortApi::ForEachSectionInNs(
-        ns_fq.c_str(),
-        [](const wchar_t* fq, void* user) {
-            bool* hit = (bool*)user;
-            if (*hit) return;
-            PortApi::ForEachSectionLine(
-                fq,
-                [](const wchar_t* line, void* u) {
-                    bool* h = (bool*)u;
-                    if (!*h) *h = QueriesPsSlot(line);
-                },
-                user);
-        },
-        &out.queries_ps_slots);
-
     // [Constants] globals, from their variable store rather than a re-read of the file.
     out.object_guid = (int)PortApi::GetVarNs(ns.c_str(), L"object_guid", 0.f);
     out.mesh_vertex_count = (uint32_t)PortApi::GetVarNs(ns.c_str(), L"mesh_vertex_count", 0.f);
 
-    logger::write("WwmiMod: ns='%ls' -> %zu comp(s), %zu resource(s), guid=%d verts=%u dir='%ls'%s%s", ns.c_str(),
+    logger::write("WwmiMod: ns='%ls' -> %zu comp(s), %zu resource(s), guid=%d verts=%u dir='%ls'%s", ns.c_str(),
         out.comps.size(), out.resources.size(), out.object_guid, out.mesh_vertex_count, out.dir.c_str(),
-        out.forward_map_file.empty() ? "" : " (has fwdmap)",
-        out.queries_ps_slots ? " (asks what the game bound in ps-tN: every read slot published)" : "");
+        out.forward_map_file.empty() ? "" : " (has fwdmap)");
     return (int)out.comps.size();
 }
 

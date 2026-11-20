@@ -216,7 +216,10 @@ void RunSkelCopyUpdates()
             bool merged = false;
             for (size_t i = 0; i < s.res.size(); ++i)
                 if (s.draw_written[i] && c.res[i].resource) merged = true;
-            if (!merged) continue;
+            if (!merged) {
+                c.vars = s.start;
+                continue;
+            }
             for (size_t i = 0; i < s.res.size(); ++i) Exchange(*s.res[i], c.res[i]);
             ExchangeVars(s, c);
             RunSectionByName(s.update_fq.c_str(), nullptr);

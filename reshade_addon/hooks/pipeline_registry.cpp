@@ -3,6 +3,7 @@
 #include "pipeline_registry.h"
 #include "command_list_registry.h"
 #include "../mods/shader_alias.h" // AliasShaderHashAlways -- shader identity is registered at creation
+#include "../hud/outline_hide.h"
 #include "../hud/uid_hide.h"
 #include "../core/dxil_cb.h" // DxilCbuffers -- the VS's declared cbuffer sizes, from the DXIL metadata
 #include "../addon/addon.h"
@@ -103,6 +104,8 @@ PipelineRegistry::Slot* PipelineRegistry::SlotOf(uint64_t key, bool create)
             n->chr.store(o.chr.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->chrg.store(o.chrg.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->vb6.store(o.vb6.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n->outline.store(o.outline.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            n->stand_in.store(o.stand_in.load(std::memory_order_relaxed), std::memory_order_relaxed);
             n->key.store(k, std::memory_order_release);
         }
         tab_.store(g, std::memory_order_release);
@@ -204,6 +207,35 @@ bool PipelineRegistry::ReadsStream6(uint64_t pso)
 {
     const Slot* s = SlotOf(pso, false);
     return s && s->vb6.load(std::memory_order_acquire);
+}
+
+bool PipelineRegistry::IsOutline(uint64_t pso)
+{
+    const Slot* s = SlotOf(pso, false);
+    return s && s->outline.load(std::memory_order_acquire);
+}
+
+void PipelineRegistry::SetOutline(uint64_t pso, uint64_t ps_hash)
+{
+    if (Slot* s = SlotOf(pso, false))
+        if (s->ps.load(std::memory_order_acquire) == ps_hash) s->outline.store(true, std::memory_order_release);
+}
+
+uint64_t PipelineRegistry::OutlineStandIn(device* dev, uint64_t pso)
+{
+    Slot* s = SlotOf(pso, false);
+    if (!s || !s->outline.load(std::memory_order_acquire)) return 0;
+    const uint64_t v = s->stand_in.load(std::memory_order_acquire);
+    if (v > 1) return v;
+    uint64_t exp = 0;
+    if (v == 0 && s->stand_in.compare_exchange_strong(exp, 1, std::memory_order_acq_rel))
+        g_outline_hide.QueueStandIn(dev, pso);
+    return 0;
+}
+
+void PipelineRegistry::SetOutlineStandIn(uint64_t pso, uint64_t stand_in)
+{
+    if (Slot* s = SlotOf(pso, false)) s->stand_in.store(stand_in ? stand_in : 1, std::memory_order_release);
 }
 
 uint64_t PipelineRegistry::PsReadMask(uint64_t pso)
@@ -310,7 +342,7 @@ bool on_create_pipeline(device*, pipeline_layout, uint32_t subobject_count, cons
 }
 
 void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t subobject_count,
-    const pipeline_subobject* subobjects, pipeline pipeline)
+    const pipeline_subobject* subobjects, pipeline pipeline, uint64_t stand_in_for)
 {
     HookTimer timed(init_n_, init_us_, &init_max_us_);
     uint64_t vs_hash = 0;
@@ -324,6 +356,8 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
     const void* cs_code = nullptr;
     size_t cs_size = 0;
     bool reads_vb6 = false;
+    const input_element* input_layout = nullptr;
+    uint32_t input_count = 0;
     for (uint32_t i = 0; i < subobject_count; ++i) {
         if (subobjects[i].type == pipeline_subobject_type::vertex_shader) {
             auto shader = static_cast<const shader_desc*>(subobjects[i].data);
@@ -356,6 +390,8 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
         if (subobjects[i].type == pipeline_subobject_type::input_layout) {
             auto elems = static_cast<const input_element*>(subobjects[i].data);
             if (elems && subobjects[i].count) {
+                input_layout = elems;
+                input_count = subobjects[i].count;
                 std::vector<MigotoPort::InputElement> in(subobjects[i].count);
                 for (uint32_t k = 0; k < subobjects[i].count; ++k) {
                     in[k] = { elems[k].semantic, elems[k].semantic_index, (unsigned)elems[k].format,
@@ -365,6 +401,12 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
                 MigotoPort::RecordInputLayout(pipeline.handle, in.data(), subobjects[i].count);
             }
         }
+    }
+    if (stand_in_for) {
+        uint64_t src_ps = 0;
+        uint64_t src_gs = 0;
+        BoundHashes(stand_in_for, &vs_hash, &src_ps, &src_gs);
+        if (!vs_hash) return;
     }
     auto register_both = [](uint64_t h) {
         if (!h) return;
@@ -376,7 +418,7 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
     register_both(ps_hash);
     register_both(gs_hash);
     register_both(cs_hash);
-    if (vs_code) g_shader_capture.Note(vs_hash, vs_code, vs_size, "vs");
+    if (vs_code && !stand_in_for) g_shader_capture.Note(vs_hash, vs_code, vs_size, "vs");
     if (ps_code) g_shader_capture.Note(ps_hash, ps_code, ps_size, "ps");
     if (cs_code) g_shader_capture.Note(cs_hash, cs_code, cs_size, "cs");
     if (g_debug && vs_hash) { // log every distinct VS input layout (capped) -- incl. the depth VS
@@ -438,6 +480,8 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
             s->chr.store(false, std::memory_order_release);
             s->chrg.store(0, std::memory_order_release);
             s->vb6.store(reads_vb6, std::memory_order_release);
+            s->outline.store(false, std::memory_order_release);
+            s->stand_in.store(0, std::memory_order_release);
             if (vs_hash) s->vc.store(vs_hash, std::memory_order_release);
             if (cs_hash) s->vc.store(cs_hash, std::memory_order_release);
             if (ps_hash) s->ps.store(ps_hash, std::memory_order_release);
@@ -504,9 +548,11 @@ void PipelineRegistry::Register(device* dev, pipeline_layout layout, uint32_t su
             MarkCharacterPs(s, "decensored in an earlier session -- decensored from its creation");
             if (g_settings.decensor) DecensorVariant(dev, pipeline.handle);
         }
+    if (!stand_in_for && ps_hash && OutlineHide::Candidate(input_layout, input_count, ps_code, ps_size))
+        g_outline_hide.Queue(pipeline.handle, ps_hash, ps_code, ps_size);
 
     // Shader-replacement bytes (allocated in on_create_pipeline) are now safe to free -- the pipeline is built.
-    if (!s_replace_keep.empty()) s_replace_keep.clear();
+    if (!stand_in_for && !s_replace_keep.empty()) s_replace_keep.clear();
 }
 
 void PipelineRegistry::Forget(device* device, pipeline pipeline)

@@ -38,7 +38,11 @@ public:
         uint64_t room = 0; // available less a band (2.5% of the budget): short ends below it
         uint64_t raise_room =
             0; // the room by game: what raises may fill, so a raise is not short at the game's next peak
+        uint64_t headroom = 0; // the margin (5% of the budget) and the band: room ends this far below the budget
+        uint64_t card = 0; // the adapter's own memory
     };
+    // The card, the budget, what is vacant or how far over the headroom; then the parts. GiB, rounded so they add up.
+    static void Lines(const Reading& r, std::string& budget_line, std::string& parts_line);
     void Tick(); // present thread, every frame
     void Stop();
     bool Due() const; // a collection would act now

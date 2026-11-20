@@ -45,6 +45,12 @@ void DeferTexture(CustomResource* r);
 // ... and whether the background loader still has it.
 bool DeferredPending(CustomResource* r);
 
+// [Filter] matching (port_publish.cpp): this thread's game draw, and the add-on's dHash of a game texture's mip.
+unsigned CallNumber();
+bool TextureDHash(ID3D12Resource* res, unsigned mip, unsigned view_format, uint64_t* out);
+// After a parse of the mod tree, under the engine lock: whether it loaded a [Filter].
+void FiltersParsed();
+
 // Every variable's value, the ini params and each custom shader's runs this frame, put back after a run that is to
 // leave none of its writes (port_vars.cpp). Caller holds the engine lock across both.
 struct EngineValues {

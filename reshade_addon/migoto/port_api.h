@@ -106,6 +106,19 @@ bool ShaderOverrideMatches(uint64_t shader_hash);
 void ShaderOverrideSection(uint64_t shader_hash, wchar_t* out, size_t out_chars);
 
 void SetBoundShader(char stage, uint64_t ini_hash);
+// The texture registers the pixel shader of that hash reads (t0..t127), for their per-draw texture snapshot and
+// ps->srv_* queries; not `known`: t0..t8. Every bound pixel shader needs it: theirs asserts on one without.
+void SetPixelShaderTextures(uint64_t ini_hash, uint64_t lo, uint64_t hi, bool known);
+// A new game draw: their per-draw texture snapshot ([Filter] matching) is taken once per call number.
+void NextDrawCall();
+// [Filter] match_dhash: the dHash of a game texture's mip as XXMI computes it; `out` null asks only whether it is known.
+using TextureDHashFn = bool (*)(ID3D12Resource* res, unsigned mip, unsigned view_format, uint64_t* out);
+// The mips of a game texture whose dHash is known, bit m for mip m.
+using TextureDHashMipsFn = unsigned (*)(ID3D12Resource* res);
+void SetTextureDHash(TextureDHashFn fn, TextureDHashMipsFn mips);
+// Whether a [Filter] may ask for a game texture's dHash: until the mods are parsed, and from the first parse that
+// loaded a [Filter] on. Any thread.
+bool TextureDHashesWanted();
 
 float BoundShaderFilter(char stage, uint64_t* out_hash, int* out_have_handle, int* out_in_mshaders);
 

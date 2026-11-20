@@ -11,7 +11,9 @@
 // into an offline harness, so a patch can be proved against a dumped shader without the game.
 #pragma once
 #include <cstdint>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 // A box of the render target in pixels, and the vertex colour range a pixel inside it is discarded for.
@@ -68,3 +70,13 @@ struct RfxDxilResult {
 bool RfxDxilInit(const wchar_t* dll_dir, std::string& why);
 
 bool RfxDxilPatch(const void* ps, size_t ps_size, const RfxDxilSpec& spec, RfxDxilResult& out);
+
+// A character outline vertex shader with its material offset left out of SV_Position and VELOCITY_PREV_POS, so the
+// shell lies on the mesh: every add on those outputs that joins a value reading the normal (ATTRIBUTE2) to one reading
+// the position (ATTRIBUTE0) and not the normal gets 0 for the normal's side. Fails when SV_Position has fewer than 3.
+bool RfxDxilZeroOffset(const void* vs, size_t vs_size, RfxDxilResult& out);
+
+// Every output component a pixel shader stores as a literal: (output element << 2 | component, the literal as the
+// disassembler writes it, e.g. "0.000000e+00"). False when the shader could not be disassembled.
+bool RfxDxilLiteralStores(
+    const void* ps, size_t ps_size, std::set<std::pair<uint32_t, std::string>>& out, std::string& why);

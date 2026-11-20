@@ -16,6 +16,7 @@ void AddonSettings::Load(const std::wstring& path)
     dx12_debug_layer = Int(L"dx12_debug_layer", 0) != 0;
     decensor = Int(L"decensor", 0) != 0;
     hide_uid = Int(L"hide_uid", 0) != 0;
+    hide_char_outlines = Int(L"hide_char_outlines", 0) != 0;
 #ifdef WWMI_DEBUG
     hide_outline = Int(L"hide_outline", 0) != 0;
 #endif

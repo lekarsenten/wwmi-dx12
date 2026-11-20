@@ -14,6 +14,7 @@ struct TexToggles {
     bool mip_exact = true;
     bool upload_gpu = false; // D16: every texture upload hashed from a GPU copy, checked against the processor's read
     bool dump_degenerates = false; // D15: each degenerate LOD low as <dump dir>\degenerates\<hash>.dds
+    bool dhash_filters = true; // A23: game textures' dHashes kept, for mods' [Filter] sections (tex_dhash_table.h)
 };
 extern TexToggles g_tex_toggles;
 

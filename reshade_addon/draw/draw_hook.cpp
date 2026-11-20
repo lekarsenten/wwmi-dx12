@@ -19,6 +19,9 @@
 #include "../migoto/frame_analysis_driver.h"
 #include "../migoto/port_api.h"
 #include "../hooks/cmd_bind_hooks.h"
+#include "../hooks/pipeline_registry.h"
+#include "../hud/outline_hide.h"
+#include "../addon/settings.h"
 #include "../mods/mod_set.h"
 
 DrawToggles g_draw_toggles;
@@ -30,6 +33,16 @@ thread_local uint8_t t_x23_cast = 0;
 thread_local uint8_t t_x23_hidden = 0;
 thread_local uint32_t t_x23_injected = 0;
 thread_local uint8_t t_x23_merges = 0;
+
+bool HideOutlineDraw(command_list* cmd_list)
+{
+    const bool drop = g_settings.hide_char_outlines && !g_addon.disabled && !g_addon.faulted &&
+        g_pipelines.IsOutline(g_command_lists.Gfx(cmd_list).gfx_pso);
+#ifdef WWMI_DEBUG
+    if (drop) ++g_outline_hide.dropped;
+#endif
+    return drop;
+}
 
 bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
     int32_t vertex_offset, uint32_t first_instance)
@@ -47,6 +60,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
 
     auto* d3d12_cl = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
     if (!d3d12_cl) return false;
+    PortApi::NextDrawCall();
     const CmdRT draw_rt = g_command_lists.Rt(cmd_list); // stable for this draw: only the game's bind hook writes it
     DrawContext ctx{ DrawArgs{ cmd_list, d3d12_cl, index_count, instance_count, first_index, vertex_offset,
                          first_instance, vs_hash, draw_rt },
@@ -56,6 +70,7 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
     if (g_debug) g_shader_capture.DiffNote(cmd_list, vs_hash, index_count);
     g_section_textures.NoteMeshPlaces(args);
     g_section_textures.NoteRefTextures(args);
+    g_section_textures.NoteNamedRefTextures(cmd_list);
     g_section_textures.CarryPsReads(args);
     g_tex_draw_watch.Note(args);
     g_cb_rows.NoteDraw(cmd_list);
@@ -76,10 +91,11 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
         }
     }
 
+    std::optional<PortApi::EngineScope> override_hold;
     struct PostAfterDraw {
         ~PostAfterDraw() { PortApi::RunPendingPost(); }
     } post_after_draw;
-    if (RunDrawShaderOverrides(args)) return true;
+    if (RunDrawShaderOverrides(args, override_hold)) return true;
     if (RunSmallMeshOverrides(args)) return true;
 
     if (const std::optional<bool> r = ClaimDraw(ctx)) return *r;

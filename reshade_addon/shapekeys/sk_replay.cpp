@@ -306,6 +306,10 @@ void ShapekeyReplay::RunLists(const std::wstring& ns, ID3D12Resource* inst, int 
             MigotoPort::ResetEmittedDispatch();
             {
                 PROF(PROF_SK_Run);
+                GameBatch game_batch;
+                const bool have_batch = g_sk_toggles.game_batches &&
+                    store_.GetGameBatch(ns, inst, lists[i].cs, lists[i].tgy, &game_batch);
+                const SkBatchPass batch_pass(have_batch ? &game_batch : nullptr, lists[i].tgy, ns);
                 PortApi::RunResolvedCommandList(lists[i].list, &di);
             }
             uint32_t em_x = 0;

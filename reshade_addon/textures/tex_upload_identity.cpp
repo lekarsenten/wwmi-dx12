@@ -99,6 +99,18 @@ void DumpIfDegenerate(
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\%08x.dds", dir.c_str(), hash);
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+    if (!TexWriteDds(path, tight, L, fmt)) {
+        logger::write("DEGENERATE-DUMP %08x: cannot write %S", hash, path);
+        return;
+    }
+    if (sub)
+        logger::write("DEGENERATE-DUMP %08x %ux%u fmt=%u: mip %u of %08x -> %S", hash, L.w, L.h, fmt, sub, of, path);
+    else
+        logger::write("DEGENERATE-DUMP %08x %ux%u fmt=%u: a resident's mip0 -> %S", hash, L.w, L.h, fmt, path);
+}
+
+bool TexWriteDds(const wchar_t* path, const std::vector<uint8_t>& tight, const TexAssetLayout& L, uint32_t fmt)
+{
     uint32_t dxgi = fmt;
     switch (dxgi) {
     case 27:
@@ -130,17 +142,11 @@ void DumpIfDegenerate(
     hdr[33] = 3;
     hdr[35] = 1;
     FILE* f = nullptr;
-    if (_wfopen_s(&f, path, L"wb") != 0 || !f) {
-        logger::write("DEGENERATE-DUMP %08x: cannot write %S", hash, path);
-        return;
-    }
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) return false;
     fwrite(hdr, sizeof hdr, 1, f);
     fwrite(tight.data(), 1, tight.size(), f);
     fclose(f);
-    if (sub)
-        logger::write("DEGENERATE-DUMP %08x %ux%u fmt=%u: mip %u of %08x -> %S", hash, L.w, L.h, fmt, sub, of, path);
-    else
-        logger::write("DEGENERATE-DUMP %08x %ux%u fmt=%u: a resident's mip0 -> %S", hash, L.w, L.h, fmt, path);
+    return true;
 }
 
 void TexUploadIdentity::HashFromUpload(ID3D12Resource* dest, const uint8_t* src, size_t src_row_pitch)

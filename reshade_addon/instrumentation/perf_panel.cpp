@@ -106,14 +106,14 @@ static void DrawPerformanceSummary()
             ImGui::TextDisabled("Add-on on the graphics card: no reading yet");
     }
     if (g_perf.HaveMemory()) {
-        constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+        constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
         const PerfMemory& m = g_perf.MemoryNow();
         const PerfMemory& pk = g_perf.MemoryPeak();
         ImGui::TextColored(MemoryColour(m.vram_used, m.vram_budget),
-            "Video memory: %.1f of %.1f GB (%.0f%%), highest %.1f GB", m.vram_used / GB, m.vram_budget / GB,
-            m.vram_budget ? 100.0 * (double)m.vram_used / (double)m.vram_budget : 0.0, pk.vram_used / GB);
-        ImGui::Text("Shared memory (system memory the graphics card uses): %.1f GB", m.shared_used / GB);
-        ImGui::Text("Game memory: %.1f GB", m.game_private / GB);
+            "Video memory: %.1f of %.1f GiB (%.0f%%), highest %.1f GiB", m.vram_used / GiB, m.vram_budget / GiB,
+            m.vram_budget ? 100.0 * (double)m.vram_used / (double)m.vram_budget : 0.0, pk.vram_used / GiB);
+        ImGui::Text("Shared memory (system memory the graphics card uses): %.1f GiB", m.shared_used / GiB);
+        ImGui::Text("Game memory: %.1f GiB", m.game_private / GiB);
     }
 }
 

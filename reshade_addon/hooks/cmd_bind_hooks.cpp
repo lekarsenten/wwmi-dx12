@@ -4,6 +4,7 @@
 #include "command_list_registry.h"
 #include "../instrumentation/diag_gate.h"
 #include "pipeline_registry.h" // the PSO -> shader-hash table on_bind_pipeline stamps from
+#include "../hud/outline_hide.h"
 #include "../hud/uid_hide.h"
 #include "../addon/addon.h"
 #include "../addon/settings.h"
@@ -28,10 +29,26 @@ void on_bind_pipeline(command_list* cmd_list, pipeline_stage type, pipeline pipe
         st.gfx_pso = pipeline.handle;
         st.gfx_set = 0;
         if (ps && !g_addon.disabled) {
-            uint64_t v = g_settings.hide_uid
-                ? g_pipelines.UidVariant(cmd_list->get_device(), pipeline.handle, g_uid_hide.Target())
-                : 0;
-            if (!v && DecensorOn()) v = g_pipelines.DecensorVariant(cmd_list->get_device(), pipeline.handle);
+            uint64_t pso = pipeline.handle;
+            if (g_settings.hide_char_outlines) {
+                g_outline_hide.ReadNoted();
+                const uint64_t s = g_pipelines.OutlineStandIn(cmd_list->get_device(), pso);
+                if (s) {
+                    reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())
+                        ->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(s));
+                    st.gfx_pso = s;
+                    pso = s;
+                }
+#ifdef WWMI_DEBUG
+                if (s)
+                    ++g_outline_hide.bound_stand_in;
+                else if (g_pipelines.IsOutline(pipeline.handle))
+                    ++g_outline_hide.bound_source;
+#endif
+            }
+            uint64_t v =
+                g_settings.hide_uid ? g_pipelines.UidVariant(cmd_list->get_device(), pso, g_uid_hide.Target()) : 0;
+            if (!v && DecensorOn()) v = g_pipelines.DecensorVariant(cmd_list->get_device(), pso);
             if (v) {
                 reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native())
                     ->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(v));

@@ -13,3 +13,6 @@ extern thread_local uint8_t t_x23_merges; // SkeletonMerger runs the draw's sect
 // True means we drew the mod in the game's place and its own draw must be suppressed.
 bool on_draw_indexed_body(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count,
     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance);
+// A6: the bound pipeline draws a character's outline and has no stand-in (OutlineHide), so the game's own draw is to be
+// dropped, after the mods' sections for it have run (as 3DMigoto's handling = skip).
+bool HideOutlineDraw(reshade::api::command_list* cmd_list);

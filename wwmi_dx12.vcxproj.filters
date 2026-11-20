@@ -214,6 +214,12 @@
     <ClCompile Include="reshade_addon\textures\tex_look_worker.cpp">
       <Filter>textures</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_dhash.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_dhash_table.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\textures\tex_hooks.cpp">
       <Filter>textures</Filter>
     </ClCompile>
@@ -230,6 +236,9 @@
       <Filter>textures</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\textures\tex_look_index.cpp">
+      <Filter>textures</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\shipped_matches.cpp">
       <Filter>textures</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\rabbitfx\pso_clone.cpp">
@@ -283,8 +292,8 @@
     <ClCompile Include="reshade_addon\textures\tex_crawl.cpp">
       <Filter>textures</Filter>
     </ClCompile>
-    <ClCompile Include="reshade_addon\textures\tex_ref_take.cpp">
-      <Filter>textures</Filter>
+    <ClCompile Include="reshade_addon\hud\outline_hide.cpp">
+      <Filter>hud</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\hud\uid_hide.cpp">
       <Filter>hud</Filter>
@@ -322,6 +331,9 @@
     <ClCompile Include="reshade_addon\shapekeys\sk_store.cpp">
       <Filter>shapekeys</Filter>
     </ClCompile>
+    <ClCompile Include="reshade_addon\shapekeys\sk_batch_fix.cpp">
+      <Filter>shapekeys</Filter>
+    </ClCompile>
     <ClCompile Include="reshade_addon\shapekeys\sk_replay.cpp">
       <Filter>shapekeys</Filter>
     </ClCompile>
@@ -354,6 +366,9 @@
     </ClCompile>
     <ClCompile Include="reshade_addon\instrumentation\opacity_watch.cpp">
       <Filter>instrumentation</Filter>
+    </ClCompile>
+    <ClCompile Include="reshade_addon\textures\tex_ref_take.cpp">
+      <Filter>textures</Filter>
     </ClCompile>
     <ClCompile Include="reshade_addon\textures\tex_pipe_alias.cpp">
       <Filter>textures</Filter>
@@ -428,6 +443,9 @@
   <ItemGroup>
     <ClInclude Include="reshade_addon\addon_common.h" />
     <ClInclude Include="reshade_addon\build_stamp.h" />
+    <ClInclude Include="reshade_addon\mods\shader_pairs_seed.h">
+      <Filter>mods</Filter>
+    </ClInclude>
     <ClInclude Include="reshade_addon\rt\pt_skin.h">
       <Filter>rt</Filter>
     </ClInclude>

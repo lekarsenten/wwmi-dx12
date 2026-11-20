@@ -11,6 +11,7 @@
 #include "tex_slot_log.h"
 #include "tex_lineage.h"
 #include "tex_crawl.h"
+#include "tex_dhash_table.h"
 #include "../mods/ib_hash.h" // ForgetRange: a whole-buffer copy replaces the mesh hashes inside it
 #include "../mods/mod_set.h"
 #include "../instrumentation/removal_pin.h"
@@ -31,13 +32,19 @@ void TexOnDestroyed(uint64_t res)
     g_tex_readback.Forget(reinterpret_cast<ID3D12Resource*>(res));
     if (g_debug) g_tex_slot_log.Forget(res);
     g_tex_identity.ForgetModSrv(res);
+    g_tex_dhash.Forget(res);
 }
 
 bool on_update_texture_region(
-    device*, const subresource_data& data, resource dest, uint32_t dest_subresource, const subresource_box*)
+    device*, const subresource_data& data, resource dest, uint32_t dest_subresource, const subresource_box* box)
 {
     if (g_addon.disabled) return false;
     ModSetScope set_scope(nullptr);
+    if (dest.handle != 0 && !box)
+        g_tex_dhash.FromData(
+            reinterpret_cast<ID3D12Resource*>(dest.handle), dest_subresource, (const uint8_t*)data.data, data.row_pitch);
+    else
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
     if (dest_subresource == 0 && dest.handle != 0) // mip0 only
         g_tex_upload.HashFromUpload(
             reinterpret_cast<ID3D12Resource*>(dest.handle), (const uint8_t*)data.data, data.row_pitch);
@@ -70,6 +77,10 @@ bool on_copy_texture_region(command_list* cl, resource source, uint32_t src_sub,
 {
     PROF(PROF_CopyTexRegion);
     if (g_addon.disabled) return false;
+    if (source.handle && dest.handle && !src_box && !dst_box)
+        g_tex_dhash.Copy(source.handle, src_sub, dest.handle, dest_subresource);
+    else
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
     if (g_tex_toggles.disable || !g_tex_rules.Ready()) return false;
     ModSetScope set_scope(cl);
     if (!source.handle || !dest.handle || !cl) return false;
@@ -159,6 +170,7 @@ bool on_copy_resource(command_list* cl, resource source, resource dest)
             IbHash::ForgetRange(va, d->GetDesc().Width);
             return false;
         }
+        if (source.handle) g_tex_dhash.CopyAll(source.handle, dest.handle);
     }
     if (g_tex_rules.Ready() && source.handle && dest.handle) { // lineage for whole-resource copies too
         ModSetScope set_scope(cl);
@@ -185,9 +197,14 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
     auto* dst = reinterpret_cast<ID3D12Resource*>(dest.handle);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
     TexAssetLayout L;
-    if (!TexAssetLayoutOf(dd, dest_subresource, L) || !L.floor) return false;
+    if (!TexAssetLayoutOf(dd, dest_subresource, L)) return false;
     // a partial upload (an atlas region) is not the texture, and its source holds only the region
-    if (dst_box && (dst_box->left || dst_box->top || dst_box->right != L.w || dst_box->bottom != L.h)) return false;
+    const bool whole = !dst_box || (!dst_box->left && !dst_box->top && dst_box->right == L.w && dst_box->bottom == L.h);
+    if (whole && source.handle)
+        g_tex_dhash.FromUpload(reinterpret_cast<ID3D12Resource*>(source.handle), source_offset, dst, dest_subresource, L);
+    else
+        g_tex_dhash.Unknown(dest.handle, dest_subresource);
+    if (!L.floor || !whole) return false;
 
     if (source.handle == 0) return false;
     if (dest_subresource != 0 && !g_tex_toggles.mip_exact) return false;
